@@ -89,7 +89,23 @@ public:
     /// Stage the primary's activations `h_primary` ([n_tok][n_embd] floats, the MoE input `h`) and routing
     /// `ids_primary` ([n_tok * k] ints) into the helper.  Both live on the PRIMARY device; the copies are P2P.
     /// Rejects (false + `err`) a window larger than cap_entries().  Enqueued on the helper's stream.
+    ///
+    /// SPLIT IN TWO, so that several helpers can prepare at the SAME time (see the peer's plan in q36_engine.cu).
+    /// `prepare_begin` does everything that does NOT need the host to know anything: the residency walk, the
+    /// staging copies, the uploads and the four row-plan kernels - all enqueued on the helper's own stream, so
+    /// the helpers' transfers run on their own links CONCURRENTLY instead of one after another.  `prepare_end`
+    /// waits for that stream and reads back the two numbers the host needs (the owned-row count and the widest
+    /// expert).  Calling begin() on every helper and then end() on every helper turns three serial waits into
+    /// three overlapping ones.
+    ///
+    /// `prepare()` is the two of them back to back, for a caller that prepares one helper at a time.
     bool prepare(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok, std::string& err);
+    /// The first half: everything that can be enqueued without the host learning anything.  Returns false only on a
+    /// refusal (a window too large, a copy that failed); a false here means the helper was not prepared at all.
+    bool prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok, std::string& err);
+    /// The second half: wait for the helper's stream and read the owned-row count and the widest expert back.
+    /// Must follow a successful prepare_begin() for the same layer on the same helper.
+    bool prepare_end(std::string& err);
 
     /// Compute this helper's owned entries of the window prepare() staged, on the helper, and write their rows
     /// into the PRIMARY's `eparts` starting at `eparts_row_base` (the run order documented above).
