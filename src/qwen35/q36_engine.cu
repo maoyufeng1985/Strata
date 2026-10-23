@@ -3965,9 +3965,21 @@ struct Engine {
         // numbered the entries with, so a helper's run lands exactly where prow2 says its entries' rows are.
         peer_wait_n = 0;
         peer_wait_li = (int64_t) li;
+        // THE HELPERS PREPARE AT THE SAME TIME.  prepare_begin() only ENQUEUES the window copy and the row plan on
+        // the helper's own stream, and prepare_end() is the wait.  Doing all the begins first and all the ends
+        // after means the three helpers' window copies run on their three PCIe links CONCURRENTLY, instead of one
+        // helper's whole prepare (copy, upload, row plan, wait) finishing before the next one starts.  The three
+        // links are separate PHB paths to the CPU (nvidia-smi topo -m on 192.168.1.98), so the copies really do
+        // overlap; the host's three waits then all land on work that is already in flight.
+        // What this does NOT change: the row contract, the ownership witnesses below, the number of bytes, or what
+        // each helper computes.  It is the ORDER of the host's waits, nothing else.
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
-            if (!peers[(size_t) r]->prepare((int64_t) li, hdev, idsdev, (int64_t) T, err)) return false;
+            if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err)) return false;
+        }
+        for (int r = 0; r < 3; ++r) {
+            if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
+            if (!peers[(size_t) r]->prepare_end(err)) return false;
             if (!peers[(size_t) r]->launch((int64_t) li, epartsd, base[(size_t) r], err)) return false;
             // Second witness of the ownership invariant, from the executor's side and at one integer's cost: rows()
             // is what the helper's OWN live row plan counted this call (built from its cache's slot_ptr()); rows[r]

@@ -223,6 +223,16 @@ struct PeerPrefill36::Impl {
     bool prepared = false;
     int64_t n_owned = 0, max_rows = 0;
     int64_t rows = 0, launches = 0;
+    // The two numbers prepare_begin()'s row plan brings back.  They live here, not on the stack, because the read is
+    // ENQUEUED in prepare_begin() and COLLECTED in prepare_end() - the two halves are separate calls so that several
+    // helpers can have their transfers in flight at the same time.
+    // The BUFFER is PINNED, and that is not a detail: a cudaMemcpyAsync into pageable host memory is a SYNCHRONOUS
+    // copy (the driver stages it), so with a pageable target the read would block the host right there and the split
+    // would buy nothing.  Pinned, the read rides the helper's stream like every other copy and prepare_begin()
+    // returns without waiting.
+    int32_t* h_plan = nullptr;   // [2] pinned: the owned-row count and the widest expert
+    // The window's token count, kept for prepare_end()'s bound check (the row count cannot exceed n_tok * k).
+    int64_t prep_n_tok = 0;
 
     // STRATA_Q36_PROMPT_TIMING=1 (opt-in, measurement only - see q36_engine.cu's probe): the host-side serial cost
     // prepare() adds, accumulated across the calls the engine made this run.  Written only under the gate, read via the
@@ -477,6 +487,16 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
             return false;
         }
     }
+    // The row plan's two numbers, PINNED, on both routes: they are the target of a device-to-host copy that has to
+    // ride the helper's stream (a pageable target would turn that copy into a synchronous one and undo the split of
+    // prepare() into begin and end).  Eight bytes, allocated with the primary current like the rest of the staging.
+    {
+        On onp(m.primary);
+        if (!ck(cudaHostAlloc((void**) &m.h_plan, 2 * sizeof(int32_t), cudaHostAllocDefault), "pinned row plan", err)) {
+            close();
+            return false;
+        }
+    }
     // The products' identity row map, built once: the gate+up product writes row r for activation row r, so `dst`
     // row == bounds row and the SwiGLU/down chain keeps one index space.  An all-zero buffer (what cudaMalloc gives)
     // would send every row to row 0, so this is filled before anything can read it, on the same stream.
@@ -518,12 +538,13 @@ void PeerPrefill36::close() {
     // after the PRIMARY has settled (wait() issued its H2D on a stream this class only ever sees as an argument, so
     // the one handle it can drain is the device's).  Both routes clear the pointers, so a close() of a link box leaves
     // nothing to confuse the next open().
-    if (m.primary >= 0 && (m.h_x != nullptr || m.h_ids != nullptr || m.h_out != nullptr)) {
+    if (m.primary >= 0 && (m.h_x != nullptr || m.h_ids != nullptr || m.h_out != nullptr || m.h_plan != nullptr)) {
         On onp(m.primary);
         cudaDeviceSynchronize();
         if (m.h_x != nullptr) cudaFreeHost(m.h_x);
         if (m.h_ids != nullptr) cudaFreeHost(m.h_ids);
         if (m.h_out != nullptr) cudaFreeHost(m.h_out);
+        if (m.h_plan != nullptr) cudaFreeHost(m.h_plan);
         cudaGetLastError();
     }
     m.device = -1;
@@ -532,6 +553,7 @@ void PeerPrefill36::close() {
     m.h_x = nullptr;
     m.h_ids = nullptr;
     m.h_out = nullptr;
+    m.h_plan = nullptr;
     m.pending_eparts = nullptr;
     m.pending_base = 0;
     m.pending_n = 0;
@@ -564,8 +586,8 @@ bool PeerPrefill36::owns(int64_t layer, int32_t expert) const {
 
 int64_t PeerPrefill36::cap_entries() const { return impl_->cap; }
 
-bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok,
-                            std::string& err) {
+bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok,
+                                   std::string& err) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: prepare() on a closed executor"; return false; }
     if (h_primary == nullptr || ids_primary == nullptr) { err = "q36 peer prefill: null activations or routing"; return false; }
@@ -579,6 +601,11 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
     m.prepared = false;
     const int n_ent = (int) (n_tok * m.k);
     const int64_t ne = m.n_expert;
+    m.prep_n_tok = n_tok;   // prepare_end()'s bound check needs the window's token count
+    // The row plan's two numbers start at zero: a layer this helper holds nothing of returns early below WITHOUT
+    // reading them back, and prepare_end() must still see the zero rather than the previous layer's values.
+    m.h_plan[0] = 0;
+    m.h_plan[1] = 0;
 
     // ---- the layer's residency, and the expert order the products will consume, from the cache itself (host side,
     // no CUDA call): which experts this helper holds, where each blob lies, and the arithmetic runs that the MMQ
@@ -703,8 +730,9 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
             return false;
     }
     if (m.n_pos == 0) {   // nothing resident for this layer: no entry can be owned, and no kernel has work to do
-        m.prepared = true;
-        if (prompt_timing()) ++m.prep_calls;   // the D2H above (if !p2p) was still a timed call
+        // The row plan has nothing to plan and the stream has nothing queued, so prepare_end() will find the row
+        // count at its zero and mark the helper prepared.  The D2H above (if !p2p) was still a timed call, but the
+        // call itself is counted by prepare_end(), which every prepared layer goes through.
         return true;
     }
     if (!ck(cudaMemcpyAsync(m.d_pos, m.pos_host.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
@@ -720,25 +748,42 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
                                                             m.d_cur, m.d_src, m.d_map);
     if (!ck(cudaGetLastError(), "row plan kernels", err)) return false;
 
-    // THE ONE NUMBER THE HOST NEEDS.  MMQ's launches are sized on the host (rows, the launch grid), so the row count
+    // THE TWO NUMBERS THE HOST NEEDS.  MMQ's launches are sized on the host (rows, the launch grid), so the row count
     // and the widest expert come back - 8 bytes, after work that is one window copy (peer, or staged through host)
     // and four small kernels.  Doing it here rather than in launch() is what keeps the hot call free of host
     // synchronisation.
-    int32_t h_owned = 0, h_max = 0;
-    // STRATA_Q36_PROMPT_TIMING=1: the row-plan sync.  This is the ONLY place prepare() synchronises the helper's
-    // stream (bring the row count + widest expert back to the host, the two numbers MMQ's launch geometry needs).
-    // It overlaps the primary's MMQ launch on the linked route, but it is the one host-blocking point on the whole
-    // host route, so the probe counts it and the remainder the forward total leaves over it is the primary's time.
-    const auto t_sync = prompt_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (!ck(cudaMemcpyAsync(&h_owned, m.d_bounds + m.n_pos, sizeof(int32_t), cudaMemcpyDeviceToHost, m.stream),
+    //
+    // The READ is ENQUEUED here and COLLECTED in prepare_end().  Nothing waits in between: that is the point of the
+    // split.  Several helpers can have their window copy and their row plan in flight at the same time - each on its
+    // own stream and its own PCIe link - so the host's wait for one helper's rows no longer has to wait for the
+    // others' transfers to be issued first.
+    m.h_plan[0] = 0;
+    m.h_plan[1] = 0;
+    if (!ck(cudaMemcpyAsync(&m.h_plan[0], m.d_bounds + m.n_pos, sizeof(int32_t), cudaMemcpyDeviceToHost, m.stream),
             "read owned rows", err) ||
-        !ck(cudaMemcpyAsync(&h_max, m.d_maxr, sizeof(int32_t), cudaMemcpyDeviceToHost, m.stream), "read widest expert",
-            err) ||
-        !ck(cudaStreamSynchronize(m.stream), "row plan", err))
+        !ck(cudaMemcpyAsync(&m.h_plan[1], m.d_maxr, sizeof(int32_t), cudaMemcpyDeviceToHost, m.stream),
+            "read widest expert", err))
+        return false;
+    // STRATA_Q36_PROMPT_TIMING=1: the row-plan sync moved to prepare_end(); the two D2H reads above are the ones it
+    // waits for.  The d2h timer above still counts the staging copies.
+    return true;
+}
+
+bool PeerPrefill36::prepare_end(std::string& err) {
+    Impl& m = *impl_;
+    // THE ONE HOST-BLOCKING POINT ON THE HOST ROUTE: wait for this helper's stream, which now carries the window
+    // copy, the row plan and the two reads.  The host needed the row count and the widest expert to size the
+    // launches, and that is all this wait is for.
+    // STRATA_Q36_PROMPT_TIMING=1: the row-plan sync.  It overlaps the primary's MMQ launch on the linked route, but
+    // it is the one host-blocking point on the whole host route, so the probe counts it and the remainder the forward
+    // total leaves over it is the primary's time.
+    const auto t_sync = prompt_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (!ck(cudaStreamSynchronize(m.stream), "row plan", err))
         return false;
     if (prompt_timing())
         m.prep_sync_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sync).count();
-    if (h_owned < 0 || h_owned > n_ent || h_max < 0) {
+    const int32_t h_owned = m.h_plan[0], h_max = m.h_plan[1];
+    if (h_owned < 0 || h_owned > (int) (m.prep_n_tok * m.k) || h_max < 0) {
         err = "q36 peer prefill: the row plan produced an impossible entry count";
         return false;
     }
@@ -749,6 +794,12 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
     // so a per-call mean is the sums over this many calls.  Off the gate nothing here runs (the two timers never move).
     if (prompt_timing()) ++m.prep_calls;
     return true;
+}
+
+bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok,
+                            std::string& err) {
+    if (!prepare_begin(layer, h_primary, ids_primary, n_tok, err)) return false;
+    return prepare_end(err);
 }
 
 bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_row_base, std::string& err) {
