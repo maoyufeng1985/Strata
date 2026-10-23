@@ -2163,6 +2163,14 @@ struct Engine {
         pp_span_n = 0; pp_forward_ms = 0;
         pp_peer_plan_ms = pp_sync3022_ms = pp_wait_ms = 0;
         pp_peer_plan_n = pp_sync3022_n = pp_wait_n = 0;
+        pp_plan_book_ms = pp_plan_prep_ms = pp_plan_wait_ms = 0;
+        pp_plan_book_n = pp_plan_prep_n = pp_plan_wait_n = 0;
+        for (int r = 0; r < 3; ++r) {
+            pp_maxr_dev[(size_t) r].clear();
+            pp_maxr_host[(size_t) r].clear();
+        }
+        pp_maxr_mismatch = 0;
+        pp_rows_mismatch = 0;
     }
     /// One boundary on st, only under the gate (so the default path gains no statement).
     void ev_mark(int i) {
@@ -3847,6 +3855,23 @@ struct Engine {
     int32_t* peer_prow2 = nullptr;   // [n_ent] device: entry -> eparts row (moe_end's `prow`)
     std::vector<int32_t> peer_prow2_h;   // [n_ent] host side of the same plan
     std::vector<uint8_t> peer_row_seen;  // [n_ent] the duplicate-row check's scratch (kept to avoid a per-layer alloc)
+    // The window's per-EXPERT entry counts, on the host.  The routing is already on the host (h_peer_ids), so this is
+    // one increment per entry and no CUDA call; what it buys is the host's own count of each helper's WIDEST EXPERT -
+    // the number MMQ sizes the launch grid on - to cross-check against the device's own count of the same thing.
+    std::vector<int32_t> peer_ecnt;
+    // STRATA_Q36_PROMPT_TIMING=1: WHAT THE PLAN'S HOST WALL IS MADE OF.  peer_plan()'s wall is the part of the forward
+    // where the GPU has nothing queued, so it is the part a change to the plan can shorten.  It is timed in three:
+    // the host's own bookkeeping, the prepare_begin() calls (which only ENQUEUE), and the prepare_end()+launch() calls
+    // (which WAIT for the helpers).  The third is the wait: it says how much of the plan a change to that wait could
+    // save - which is a measurement, not an estimate.
+    double pp_plan_book_ms = 0, pp_plan_prep_ms = 0, pp_plan_wait_ms = 0;
+    long long pp_plan_book_n = 0, pp_plan_prep_n = 0, pp_plan_wait_n = 0;
+    // STRATA_Q36_PROMPT_TIMING=1: the two numbers the plan's own comparison produced, per layer and per helper: the
+    // device's widest expert and the host's count of the same thing.  The report prints how many different values the
+    // device's took across the layers (is the launch grid's shape the same every layer?) and how many layers the two
+    // disagreed on.
+    std::vector<int32_t> pp_maxr_dev[3], pp_maxr_host[3];
+    long long pp_maxr_mismatch = 0, pp_rows_mismatch = 0;
     // The two numbers peer_plan() leaves behind for the local MMQ of the layer it just planned: the rows the primary
     // computes, and the sorted-row -> eparts-row table.  Read through a `peer_here ?` ternary at the use sites, so a
     // layer without a plan - and every layer of a run with the flag off - takes the value it always took.
@@ -3922,6 +3947,12 @@ struct Engine {
         const auto& g = m->g;
         const int Kp = (int) m->top_k, ne = (int) g.n_expert;
         const int64_t n_ent = (int64_t) T * Kp;
+        // STRATA_Q36_PROMPT_TIMING=1: the plan's host wall, in three parts - the host's own bookkeeping, the
+        // prepare_begin() calls (which only ENQUEUE the helpers' transfers and row plans) and the
+        // prepare_end()+launch() calls (which WAIT for the helpers).  The wait is the part a change to the helpers'
+        // wait could shorten, and the GPU has nothing queued while the plan runs, so the plan's whole wall sits on
+        // the forward's critical path.
+        const auto t_plan0 = prompt_timing() ? Clock::now() : Clock::time_point{};
         // The plan's host buffers are sized for the largest window this engine can hand a chunk (tmax tokens x top_k
         // entries).  A bigger window is not something the chunk loop produces, but reading past the buffer would be
         // silent, so it is refused rather than assumed away.  peer_window_fits() keeps this from being reached: the
@@ -3962,6 +3993,26 @@ struct Engine {
         // (layer, ids[entry]) - the same test PeerPrefill36::owns() makes, read here from the master table so the
         // two cannot drift.
         int64_t rows[3] = {0, 0, 0}, n_local = 0;
+        // STRATA_Q36_PROMPT_TIMING=1: THE HOST'S OWN COUNT of the window's entries per expert, and of each helper's
+        // widest expert.  The routing is here (h_peer_ids) and the ownership table is here (`own`), so this costs one
+        // increment per entry and no CUDA call.  What it buys is a SECOND, independent answer for the two numbers the
+        // helpers' row plan brings back: the owned-row count and the widest expert (the launch grid's column bound).
+        //
+        // WHY THE TWO COUNTS MUST AGREE, exactly: ownership is PER EXPERT (an expert's entries all belong to the same
+        // helper), so the number of entries routed to expert e is the same number whoever counts it - the helper's
+        // device-side count of its own expert e, and this histogram's count of e.  And the device's scan ranges over
+        // exactly the experts this helper holds, which the ownership cross-check above has just proved to be this
+        // table's `own[e] == r`.  So the two maxima are maxima over the same set of the same numbers.
+        int64_t host_maxr[3] = {0, 0, 0};
+        if (prompt_timing()) {
+            std::fill(peer_ecnt.begin(), peer_ecnt.end(), 0);
+            for (int64_t e = 0; e < n_ent; ++e) ++peer_ecnt[(size_t) h_peer_ids[e]];
+            for (int32_t e = 0; e < ne; ++e) {
+                const uint8_t o = own[(size_t) e];
+                if (o == kPeerNone) continue;
+                host_maxr[(size_t) o] = std::max(host_maxr[(size_t) o], (int64_t) peer_ecnt[(size_t) e]);
+            }
+        }
         for (int64_t e = 0; e < n_ent; ++e) {
             const uint8_t o = own[(size_t) h_peer_ids[e]];
             if (o == kPeerNone) ++n_local;
@@ -4043,15 +4094,46 @@ struct Engine {
                 if (prompt_timing()) { peer_stage_ms += ms_since(t_st); ++peer_stage_n; }
             }
         }
+        // STRATA_Q36_PROMPT_TIMING=1: the plan's host wall, in three parts.  `book` is the host's own bookkeeping
+        // above, `prep` the prepare_begin() calls (which only ENQUEUE the helpers' transfers and row plans) and
+        // `wait` the prepare_end()+launch() calls (which WAIT for the helpers).  The wait is the part a change to
+        // the helpers' wait could shorten, and the GPU has nothing queued while the plan runs, so the plan's whole
+        // wall is on the forward's critical path.
+        const auto t_book = prompt_timing() ? Clock::now() : Clock::time_point{};
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
             if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err, peer_stage_x,
                                                   peer_stage_ids))
                 return false;
         }
+        const auto t_prep = prompt_timing() ? Clock::now() : Clock::time_point{};
+        if (prompt_timing()) {
+            pp_plan_book_ms += ms_since(t_plan0) - ms_since(t_book);   // the host's own bookkeeping
+            ++pp_plan_book_n;
+            pp_plan_prep_ms += ms_since(t_book) - ms_since(t_prep);   // the prepare_begin() calls
+            ++pp_plan_prep_n;
+        }
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
             if (!peers[(size_t) r]->prepare_end(err)) return false;
+            // STRATA_Q36_PROMPT_TIMING=1: THE THIRD WITNESS, or rather the two numbers the second one covers.  The
+            // device's row plan counted its own owned rows and its own widest expert; the host counted the same two
+            // from the routing it already had.  The rows are the number that decides where the helper's rows land;
+            // the widest expert is the number that sizes its launch grid.  A disagreement between the two counts
+            // would mean the plan and the run disagree about the window, so it is REPORTED here, with both numbers.
+            if (prompt_timing()) {
+                const int64_t dev_maxr = peers[(size_t) r]->last_max_rows();
+                if (dev_maxr != host_maxr[(size_t) r]) {
+                    ++pp_maxr_mismatch;
+                    if (pp_maxr_mismatch <= 8)
+                        std::fprintf(stderr,
+                                     "strata-q36: layer %lld helper CUDA%d: the row plan's widest expert holds %lld "
+                                     "rows, the routing counted on the host says %lld\n",
+                                     (long long) li, r + 1, (long long) dev_maxr, (long long) host_maxr[(size_t) r]);
+                }
+                pp_maxr_dev[(size_t) r].push_back((int32_t) dev_maxr);
+                pp_maxr_host[(size_t) r].push_back((int32_t) host_maxr[(size_t) r]);
+            }
             if (!peers[(size_t) r]->launch((int64_t) li, epartsd, base[(size_t) r], err)) return false;
             // Second witness of the ownership invariant, from the executor's side and at one integer's cost: rows()
             // is what the helper's OWN live row plan counted this call (built from its cache's slot_ptr()); rows[r]
@@ -4071,6 +4153,7 @@ struct Engine {
             peer_wait_rows[peer_wait_n] = rows[(size_t) r];
             ++peer_wait_n;
         }
+        if (prompt_timing()) { pp_plan_wait_ms += ms_since(t_prep); ++pp_plan_wait_n; }
         return true;
     }
     /// peer_plan()'s failure policy, in one place: print the reason and end the run.  There is nothing to fall back
@@ -4173,6 +4256,7 @@ struct Engine {
         peer_prow2 = dalloc_t<int32_t>((size_t) tmax * m.top_k);
         peer_prow2_h.resize((size_t) tmax * m.top_k);
         peer_row_seen.resize((size_t) tmax * m.top_k);
+        peer_ecnt.assign((size_t) ne, 0);
         CK(cudaHostAlloc((void**) &h_peer_ids, (size_t) tmax * m.top_k * 4, cudaHostAllocDefault));
         int n_served = 0;
         for (auto b : peer_any) n_served += b != 0;
@@ -6838,6 +6922,37 @@ int strata::qwen35::run(int argc, char** argv) {
                              r_pp_prep_d2h * pl, r_pp_prep_sync * pl, r_pp_stage * pl, r_pp_plan * pl, r_pp_sync3022 * pl,
                              r_pp_ppwait * pl,
                              r_pp_forward * pl, spsum * pl, gres * pl);
+            }
+            // STRATA_Q36_PROMPT_TIMING=1: WHERE THE PLAN'S HOST WALL WENT, and WHAT THE WIDEST EXPERT DID.
+            //
+            // The plan's three parts, per layer: `book` is the host's own bookkeeping, `prep` the prepare_begin()
+            // calls (which only enqueue the helpers' transfers and row plans) and `wait` the prepare_end()+launch()
+            // calls (which WAIT for the helpers).  The wait is the part a change to the helpers' wait could shorten;
+            // the GPU has nothing queued while the plan runs, so the plan's whole wall sits on the forward's critical
+            // path.
+            //
+            // The widest expert is the number MMQ sizes its launch grid on (its `ncols_max`).  The report says how
+            // many DIFFERENT values it took across the layers - is the grid's shape the same every layer? - and how
+            // many layers the host's own count of it disagreed with the device's.
+            if (prompt_timing_on && r_pp_layers > 0) {
+                const double pl = 1.0 / (double) r_pp_layers;
+                std::fprintf(stderr,
+                             "strata-q36 PHASE3 bench %d prompt: the plan's host wall per layer: bookkeeping=%.3f "
+                             "prepare=%.3f wait=%.3f | ",
+                             rep, E.pp_plan_book_ms * pl, E.pp_plan_prep_ms * pl, E.pp_plan_wait_ms * pl);
+                for (int r = 0; r < 3; ++r) {
+                    if (E.pp_maxr_dev[(size_t) r].empty()) continue;
+                    std::vector<int32_t> vals = E.pp_maxr_dev[(size_t) r];
+                    std::sort(vals.begin(), vals.end());
+                    vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+                    std::fprintf(stderr,
+                                 "helper CUDA%d's widest expert held %lld..%lld rows over %lld layers, %lld distinct "
+                                 "value(s); ",
+                                 r + 1, (long long) vals.front(), (long long) vals.back(),
+                                 (long long) E.pp_maxr_dev[(size_t) r].size(), (long long) vals.size());
+                }
+                std::fprintf(stderr, "the host's count disagreed with the device's on %lld layer(s)\n",
+                             E.pp_maxr_mismatch);
             }
             // STRATA_Q36_PEER_F16=1: what the packed up leg measured.  The largest magnitude in the rows says how
             // close they came to fp16's limit (65504); the largest relative error of the round trip says how much

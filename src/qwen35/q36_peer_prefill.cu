@@ -1081,6 +1081,11 @@ bool PeerPrefill36::wait(cudaStream_t st_primary, void* fp16_stage, std::string&
 int64_t PeerPrefill36::rows() const { return impl_->rows; }
 int64_t PeerPrefill36::launches() const { return impl_->launches; }
 
+// The widest expert of the last PREPARED layer's row plan - the number MMQ sizes its launch grid on (its
+// `ncols_max`).  It is set in prepare_end() from the DEVICE's own scan, so this is the device's answer, which the
+// engine cross-checks against the same number counted on the host.
+int64_t PeerPrefill36::last_max_rows() const { return impl_->max_rows; }
+
 double PeerPrefill36::last_prepare_d2h_ms() const { return impl_->prep_d2h_ms; }
 // STRATA_Q36_PEER_F16=1: what the packing measured - the largest magnitude in the rows and the largest
 // relative error of the fp16 round trip.  The second one is the answer to "can fp16 carry these rows";

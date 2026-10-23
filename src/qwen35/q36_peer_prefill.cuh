@@ -136,6 +136,12 @@ public:
     int64_t rows() const;
     int64_t launches() const;
 
+    /// The widest expert of the last PREPARED layer's row plan - the launch grid's column bound (MMQ's
+    /// `ncols_max`).  Zero before any prepare().  The engine reads it to cross-check the same number it
+    /// counts on the host: two independently derived answers for the same quantity, so a drift between them
+    /// is a named failure instead of a wrong launch geometry.
+    int64_t last_max_rows() const;
+
     /// STRATA_Q36_PROMPT_TIMING=1 (opt-in, measurement only - see q36_engine.cu's probe): the host-route serial cost
     /// prepare() incurs, the cost the prompt-timing probe suspects of eating the prompt's unattributed time.  Each is
     /// the wall time of one prepare() call's blocking work: the two device-to-host staging copies (activation + routing,
