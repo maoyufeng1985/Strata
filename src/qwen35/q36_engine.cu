@@ -1916,6 +1916,21 @@ struct Engine {
         }();
         return on;
     }
+    /// STRATA_Q36_PROMPT_TIMING=1: the throwaway prompt-chunk measurement gate.  Same exact-'1' parse helper_timing()
+    /// uses, and the same one reader for the whole probe, so a flag-off run reads the env once and does no clock or
+    /// event work.  Today the only probe (helper_timing) measures the DECODE single token and drops every prompt
+    /// forward whose gseg_ring has n>1 tiles (gp_drain, below): the 8 shared events would be overwritten by the last
+    /// layer before they are read.  THIS one is a second, independent probe for the prompt path (T > kGemmT, the MMQ
+    /// branch): it records four boundary events PER LAYER and drains once per forward, so it can attribute a whole
+    /// chunk to parts the decode probe cannot.  Off by default: with the flag unset none of the statements it arms
+    /// execute and the default path is byte-identical to before.
+    static bool prompt_timing() {
+        static const bool on = [] {
+            const char* pt = std::getenv("STRATA_Q36_PROMPT_TIMING");
+            return pt && pt[0] == '1' && pt[1] == '\0';
+        }();
+        return on;
+    }
     /// Whether state index li's layer is offered to a helper (the entries the helper holds leave the local path).
     bool helper_layer(size_t li) const {
         // only main-model layers carry a helper slot: the MTP block (li == m->layers.size()) stays local
@@ -2041,6 +2056,80 @@ struct Engine {
     double gp_embed_ms = 0, gp_head_ms = 0;   // outside every layer: the embed + first norm / the output head
     long long gp_other_n = 0;
     double gp_last_total_ms = 0;  // the last drain's total: gspan + embed + head
+
+    // ---- STRATA_Q36_PROMPT_TIMING=1: the prompt-chunk per-layer probe. ----
+    // A prompt forward runs the MMQ branch in EVERY main layer of one chunk, so the 8 shared events of the decode
+    // probe cannot survive 40 layers of records (gp_drain drops any forward whose ring has n>1 tile for exactly
+    // that reason).  This probe instead carries EIGHT boundary events per MMQ layer (layer entry P0, the GDN /
+    // attention branch end P0b, after the route kernels P0c, after the route D2H sync P0d, after the peer plan
+    // P1, after the helper wait is issued P1b, before moe_end P2, after moe_end P3) plus a forward-start and
+    // forward-end, records them all on the primary stream, and drains them ONCE per forward with a single
+    // cudaEventSynchronize on the last event - so it adds ONE sync per forward, not per layer.  Every new
+    // statement below is under prompt_timing().  With the flag off none of this exists at runtime:
+    // pp_gpu_timing is false, so ev_pp() records nothing and pp_drain() is never called.
+    bool pp_gpu_timing = false;          // prompt_timing() and the per-layer events exist (see open_engine)
+    int pp_nlayers = 0;                  // how many event slots per layer (8), set from g.n_layers at open
+    cudaEvent_t* pp_ev = nullptr;        // [2 + 8*n_layers]: index 0 = forward start, 1 = forward end,
+                                         // then 8 events per layer (P0, P0b, P0c, P0d, P1, P1b, P2, P3) in layer order
+    int pp_layer = 0;                    // how many MMQ layers recorded so far in this forward
+    bool pp_open = false;                // the events of this forward are still being recorded (do not read them yet)
+    // The eight GPU spans, summed and counted across every layer AND every chunk of the prompt.  Units are ms; the
+    // means are the sums divided by the layer count the forward reported.  P0b/P0c/P0d/P1 split the old P1-P0 so
+    // the GDN / attention mixer, the router + route kernels, and the route D2H + sync each get their own boundary;
+    // P1b / P2 split the old P2-P1 into the primary's own MMQ launches and the wait for the helpers' rows.
+    double pp_mixer_ms = 0, pp_router_route_ms = 0, pp_route_d2h_ms = 0, pp_ev_plan_ms = 0;
+    double pp_primary_work_ms = 0, pp_helper_wait_ms = 0, pp_combine_ms = 0, pp_post_ms = 0;
+    long long pp_span_n = 0;             // how many layers' worth of span we summed (layers * chunks)
+    double pp_forward_ms = 0;            // the whole forward, forward-end - forward-start
+    // engine-side host wall-clock totals: the helpers' own prepare() timings are read directly from the helpers
+    // at report time (their accumulators live in PeerPrefill36), not stored here.
+    double pp_peer_plan_ms = 0, pp_sync3022_ms = 0, pp_wait_ms = 0;
+    long long pp_peer_plan_n = 0, pp_sync3022_n = 0, pp_wait_n = 0;
+    /// cudaEventElapsedTime between two boundaries into the accumulator, and the pair's span into the tile.
+    void pp_push(double& span, int a, int b) {
+        float ms = 0;
+        CK(cudaEventElapsedTime(&ms, pp_ev[a], pp_ev[b]));
+        span += (double) ms;
+    }
+    /// The one cudaEventSynchronize per forward (the DRAIN): everything ahead of the forward-end event is known
+    /// complete, so the elapsed times are read here and folded into the accumulators that span layers and chunks.
+    void pp_drain() {
+        if (!pp_open || pp_nlayers == 0) return;
+        pp_open = false;
+        // The only synchronization this probe adds: once, on the forward-end event, after every layer's eight
+        // records and the forward-end record are queued.  Reading forward-end first forces the whole forward complete.
+        CK(cudaEventSynchronize(pp_ev[1]));   // the ONLY synchronization this probe adds
+        // Forward total: forward-end minus forward-start.
+        pp_push(pp_forward_ms, 0, 1);
+        // pp_layer holds how many MMQ layers recorded all eight events in this forward (non-MMQ layers did not
+        // advance it), so the loop below visits only those slots.  The last MMQ layer's "post" span runs to the
+        // forward-end event (index 1) since there is no next layer's P0 to bound it on that side.
+        const int L = pp_layer;
+        for (int l = 0; l < L; ++l) {
+            const int base = 2 + 8 * l;    // P0, P0b, P0c, P0d, P1, P1b, P2, P3 for this layer
+            const int next = (l + 1 < L) ? 2 + 8 * (l + 1) : 1;   // next MMQ layer's P0, or forward-end for the last
+            // each GPU span is read from the eight boundaries recorded for this layer: P0b-P0 splits the old
+            // P1-P0 (mixer / router+route / route-D2H), P1b-P1 & P2-P1b split the old P2-P1 (primary work / wait).
+            // P1b is recorded BEFORE the helper wait node, so P2-P1b is the helper's stall + the up-leg H2D and
+            // P1b-P1 is the primary's own work - see the note at P1b's record site.
+            pp_push(pp_mixer_ms,        base + 0, base + 1);   // P0b - P0  : the GDN / attention mixer (projections, conv, SSM / attention)
+            pp_push(pp_router_route_ms, base + 1, base + 2);   // P0c - P0b : the router and the route kernels
+            pp_push(pp_route_d2h_ms,    base + 2, base + 3);   // P0d - P0c : the route D2H + the blocking sync
+            pp_push(pp_ev_plan_ms,      base + 3, base + 4);   // P1  - P0d : the peer plan's host work
+            pp_push(pp_primary_work_ms, base + 4, base + 5);   // P1b - P1  : the primary's own MMQ + shared-expert launches
+            pp_push(pp_helper_wait_ms,  base + 5, base + 6);   // P2  - P1b : the wait for the helpers' rows + the up-leg H2D
+            pp_push(pp_combine_ms,      base + 6, base + 7);   // P3  - P2  : the combine (moe_end)
+            pp_push(pp_post_ms,         base + 7, next);       // (next layer's P0) - P3 : post-combine gap
+            ++pp_span_n;
+        }
+    }
+    void pp_reset() {
+        pp_mixer_ms = pp_router_route_ms = pp_route_d2h_ms = pp_ev_plan_ms = 0;
+        pp_primary_work_ms = pp_helper_wait_ms = pp_combine_ms = pp_post_ms = 0;
+        pp_span_n = 0; pp_forward_ms = 0;
+        pp_peer_plan_ms = pp_sync3022_ms = pp_wait_ms = 0;
+        pp_peer_plan_n = pp_sync3022_n = pp_wait_n = 0;
+    }
     /// One boundary on st, only under the gate (so the default path gains no statement).
     void ev_mark(int i) {
         if (gpu_timing && gpu_timing_open) CK(cudaEventRecord(ev_seg_ev[i], st));
@@ -2796,6 +2885,18 @@ struct Engine {
         // forward() for the LAST layer only, so exactly one tile per forward is ever queued.
         if (gpu_timing && gpu_open_this_forward && !gpu_timing_hold) { gpu_timing_open = true; }
         ev_mark(kSegAttnEsm);
+        // STRATA_Q36_PROMPT_TIMING=1: P0, the start of this layer's span, only for the MMQ branch of a prompt chunk.
+        // Recorded on the primary stream next to the existing ev_mark(kSegAttnEsm) so it lines up with the attention
+        // work that follows.  The condition matches mmq_rows exactly (the same branch this probe measures), so a
+        // non-MMQ layer (hybrid rows, decode, verify) records nothing and the per-layer mean is clean.  Computed only
+        // under the gate so the flag-off path gains no expression it did not have before.  The seven later boundaries
+        // (P0b/P0c/P0d/P1/P1b/P2/P3) record into the same 8-slot row this P0 opens, and every one of them is gated
+        // by the same mmq_here, so a layer either records all eight slots or none and pp_layer advances once.
+        if (pp_gpu_timing && pp_open) {
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            if (mmq_here)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 0], st));   // P0
+        }
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
             float* hc_b = verify ? v_hc[li] : hc;
@@ -2933,6 +3034,17 @@ struct Engine {
             }
             mm(L.wo, att, y, T);
         }
+        // STRATA_Q36_PROMPT_TIMING=1: P0b, right where both the GDN branch and the attention branch have issued
+        // everything (the if/else above closes here; add_rms_post and the router follow).  Span P0b-P0 is the layer's
+        // mixer work - the GDN or attention branch, its projections and the conv - the piece of the old P1-P0 span
+        // the finer boundaries now measure on its own.  Same gate as P0 (the mmq_here condition, recomputed, since
+        // mmq_rows is not defined yet), so only MMQ layers record and pp_layer advances consistently with P0c / P0d
+        // / P1 / P1b / P2 / P3, all of which follow in this layer.
+        if (pp_gpu_timing && pp_open) {
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            if (mmq_here)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 1], st));   // P0b
+        }
         add_rms_post(L, T);
         ev_mark(kSegRouter);   // E1: attention and SSM are behind us; the router follows
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
@@ -3013,6 +3125,12 @@ struct Engine {
             k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt, owned);
             k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
             k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv, owned);
+            // STRATA_Q36_PROMPT_TIMING=1: P0c, after the router and every route kernel have been issued on st and
+            // before the route D2H below.  Span P0c-P0b is the router + the route kernels; the D2H and the blocking
+            // sync that follows are the next span (P0d-P0c).  Inside the MMQ branch (this else-if), so the same layer
+            // that recorded P0/P0b records this too; the gate agrees with P0d/P1 and pp_layer stays aligned.
+            if (pp_gpu_timing && pp_open && mmq_rows)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 2], st));   // P0c
             CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
             // The peer plan needs the entries' expert ids on the host, and this layer already brings one word back
             // (rmax) and then blocks: the ids ride in the SAME D2H pump and land before the same sync, so the plan
@@ -3020,7 +3138,19 @@ struct Engine {
             // on a served layer, so a default / unserved layer copies exactly the bytes it always did.
             if (peer_here) CK(cudaMemcpyAsync(h_peer_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
+            // STRATA_Q36_PROMPT_TIMING=1: host wall around the per-layer cudaStreamSynchronize at the route D2H.
+            // This is the sync every prompt MMQ layer already has (it brings rmax back so the MMQ sizes are known),
+            // not a new one.  The probe just times it so the cost is explicit rather than hidden in the "attn+plan"
+            // span.  The probe's one sync is elsewhere (pp_drain, once per forward).
+            const auto t_s3022 = prompt_timing() ? Clock::now() : Clock::time_point{};
             CK(cudaStreamSynchronize(st));
+            if (prompt_timing()) { pp_sync3022_ms += ms_since(t_s3022); ++pp_sync3022_n; }
+            // STRATA_Q36_PROMPT_TIMING=1: P0d, right after the route D2H's blocking sync and before the peer plan.
+            // Span P0d-P0c is the D2H copy plus the sync it waited on; P1-P0d is the peer plan's host work.  The
+            // stream is idle here (just synchronized), so the record costs no measurable time; gated like P0c, so
+            // pp_layer advances once per MMQ layer, the same as P0.
+            if (pp_gpu_timing && pp_open && mmq_rows)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 3], st));   // P0d
             if (lhy(li))
                 for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
             const int64_t maxr = hpin[10];
@@ -3030,7 +3160,21 @@ struct Engine {
             // helpers' arithmetic overlaps everything from here to the wait before moe_end.  A failure ends the run:
             // the plan is the one place a peer bug can silently corrupt logits, and a wrong answer is worse than a
             // failed run.
-            if (peer_here) peer_plan_or_exit(li, T, h, ids, eparts);
+            if (peer_here) {
+                // STRATA_Q36_PROMPT_TIMING=1: host wall around peer_plan_or_exit, the host loop over the helpers
+                // (including the ownership cross-check that rows() must agree with the master table).  One of the
+                // four host-side costs the probe exposes alongside the GPU event spans.  The wall time is host work;
+                // the event spans above it cover GPU-side work that overlaps it.
+                const auto t_plan = prompt_timing() ? Clock::now() : Clock::time_point{};
+                peer_plan_or_exit(li, T, h, ids, eparts);
+                if (prompt_timing()) { pp_peer_plan_ms += ms_since(t_plan); ++pp_peer_plan_n; }
+            }
+            // STRATA_Q36_PROMPT_TIMING=1: P1, after the peer plan and the helpers' launches, and the primary's own
+            // MMQ launches are about to be issued.  Span P1-P0d is the peer plan's host work on the GPU timeline;
+            // P0b/P0c/P0d split what the old P1-P0 span covered.  Gated by mmq_rows (== the local mmq_here at the
+            // top of layer) like P0/P2/P3, so only MMQ layers advance pp_layer and the slots line up in pp_drain.
+            if (pp_gpu_timing && pp_open && mmq_rows)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 4], st));   // P1
             // The two numbers the local MMQ reads, each one exactly what the plain path used when the flag is off
             // (`n_local` is n_ent, `lid` the identity table) - so the six statements below are the six they were.
             const int64_t n_local = peer_here ? peer_n : n_ent;
@@ -3094,14 +3238,59 @@ struct Engine {
         // STRATA_Q36_HELPER_ASYNC: deferred helper completion into eparts, after this layer's own work
         // (local grouped, shared expert, CPU pool) and before moe_end.  Flag-off / sync path: no-op.
         moe_helpers_wait(li);
+        // STRATA_Q36_PROMPT_TIMING=1: P1b, right BEFORE peer_prefill_wait() and after the primary's own MMQ and
+        // shared-expert launches.  The position matters and it is the whole point of this boundary.  What
+        // peer_prefill_wait() does is issue a cudaStreamWaitEvent(st, m.ev) - a WAIT NODE INSERTED INTO st's queue.
+        // An event recorded on st AFTER that node gets its timestamp only once the wait is satisfied (the record
+        // cannot complete before the work ahead of it), so a P1b placed after the wait would carry the helper's
+        // waiting time itself: P1b-P1 would be max(the primary's own work, the helper's remaining time) and P2-P1b
+        // would be ~0.  With P1b BEFORE the wait the queue reads
+        //     [the primary's MMQ + shared expert][P1b][wait(m.ev)][the up-leg H2D][P2][moe_end]
+        // and the two spans are clean: P1b-P1 is the primary's own work, P2-P1b is the wait for the helpers' rows to
+        // land plus that H2D.  On a layer with no helper there is no wait node, so P2-P1b is ~0, which is right.
+        // Same gate as P2/P3 (mmq_here, since mmq_rows is out of scope after the branch), so only MMQ layers record
+        // and pp_layer advances once, the same as P0/P0b/P0c/P0d/P1.
+        if (pp_gpu_timing && pp_open) {
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            if (mmq_here)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 5], st));   // P1b
+        }
         // STRATA_Q36_PREFILL_PEERS: the helper launches peer_plan() issued must have written their eparts rows before
         // the combine reads them.  No-op unless a peer layer was planned for this layer; lands in the same place the
         // existing deferred helper wait does.  Flag-off: nothing here runs at all.
-        if (peer_wait_n != 0) peer_prefill_wait();
+        if (peer_wait_n != 0) {
+            // STRATA_Q36_PROMPT_TIMING=1: host wall around peer_prefill_wait (one of the four host-side costs the
+            // probe exposes, in addition to the P2/P3 event spans above it).  The wall time is what the host spent;
+            // the event spans cover GPU-side work that may overlap it.
+            const auto t_w = prompt_timing() ? Clock::now() : Clock::time_point{};
+            peer_prefill_wait();
+            if (prompt_timing()) { pp_wait_ms += ms_since(t_w); ++pp_wait_n; }
+        }
         ev_mark(kSegMerge);     // E6: the CPU pool's merge is issued; moe_helpers_wait's merge follows
+        // STRATA_Q36_PROMPT_TIMING=1: P2, right before moe_end (after the merge and the helper wait).  Span P2-P1b is
+        // the wait for the helpers' rows to land plus the up-leg H2D; P1b-P1 is the primary's own MMQ + shared-expert
+        // launches.  On a layer with no helpers the wait is empty, so P2 still sits here.  Gated by the same MMQ
+        // condition as P0/P1/P3, so only MMQ layers advance pp_layer and the event slots line up in pp_drain().
+        if (pp_gpu_timing && pp_open) {
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            if (mmq_here)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 6], st));   // P2
+        }
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
         moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
         ev_mark(kSegComb);      // E7: this layer's tile is complete
+        // STRATA_Q36_PROMPT_TIMING=1: P3, after the combine has been issued on the primary stream.  Span P3-P2 is the
+        // combine itself (moe_end), which is the time the combine kernel launch takes on the stream.  The next layer's
+        // P0 (or the forward-end event) minus this P3 is the post-combine gap (host bookkeeping between layers).  Only
+        // for MMQ layers: non-MMQ layers did not record P0 and would leave an unpaired event.  The layer counter
+        // advances here so the next layer's events write to the right slot.
+        if (pp_gpu_timing && pp_open) {
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            if (mmq_here) {
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 7], st));   // P3
+                ++pp_layer;
+            }
+        }
         if (gpu_timing_open && !gpu_timing_hold) gseg_ring.push_back(Gseg{});
         gpu_timing_open = false;
     }
@@ -3127,6 +3316,19 @@ struct Engine {
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(x, d_img, d_map, N);   // a picture's cells take its rows
         k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
+        // STRATA_Q36_PROMPT_TIMING=1: open a prompt-chunk record.  Unlike the decode probe (which arms one layer),
+        // this one records EIGHT events per MMQ layer, so it is open for the whole chunk.  forward-start is written
+        // before the first layer; forward-end and the single drain come after the last layer.  Only for prompt chunks
+        // on the EAGER path (T > kGemmT && use_mmq && !graph_mode): decode steps (T==1) take the other probe and
+        // would add an unwanted sync here if we armed them, and a graph-captured multi-row batch (run_rows -> forward
+        // with graph_mode true) must never run pp_drain's cudaEventSynchronize inside the capture.  The prompt path
+        // (process) always calls with graph_mode false.  With the flag off pp_gpu_timing is false, so nothing here
+        // runs and the default path is unchanged.
+        if (pp_gpu_timing && T > kGemmT && use_mmq && !graph_mode) {
+            pp_open = true;
+            pp_layer = 0;
+            CK(cudaEventRecord(pp_ev[0], st));   // forward-start
+        }
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
             // STRATA_Q36_HELPER_TIMING=1: arm ONLY the last layer to carry the tile.  The probe's 8 events are
@@ -3138,6 +3340,17 @@ struct Engine {
                   last ? hmain : h);
         }
         gpu_open_this_forward = false;
+        // STRATA_Q36_PROMPT_TIMING=1: close the record and drain ONCE.  The forward-end event is recorded, then a
+        // single cudaEventSynchronize (the only one this probe adds) lets pp_drain() read every layer's eight spans.
+        // The accumulators span layers AND chunks (a prompt longer than tmax is several process() chunks), so nothing
+        // is cleared here - the bench harness resets them between prompt passes with pp_reset().  Same eager-path
+        // guard as the open above: decode forwards and graph-captured batch forwards stay clear of this probe.
+        if (pp_gpu_timing && T > kGemmT && use_mmq && !graph_mode) {
+            CK(cudaEventRecord(pp_ev[1], st));   // forward-end
+            pp_drain();
+            pp_layer = 0;   // the next chunk renumbers from the start of the same slot range; the span accumulators
+                            // keep what this chunk added, pp_span_n (not pp_layer) is the running layer count
+        }
         if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
         // STRATA_Q36_HELPER_TIMING=1: the one armed layer has recorded its tile, so this is the ONE place the probe
         // drains and reads elapsed times.  It syncs the last event once per forward, not per layer.
@@ -4612,6 +4825,7 @@ struct Engine {
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: the GPU-segment accumulators reset with the host ones, or bench
                       // pass 1 would leak into pass 2 and into the AGG aggregate.
+        pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason, for the prompt-chunk accumulators
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
@@ -4636,6 +4850,7 @@ struct Engine {
         hy_cpu_ms = 0;
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: same reason as in warmup()
+        pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason
         row_ids.clear();
         reset();
     }
@@ -4870,6 +5085,24 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             for (int k = 0; k < Engine::kGsegN; ++k)
                 CK(cudaEventCreate(&E.ev_seg_ev[k]));
             E.gpu_timing = true;
+        }
+    }
+    // STRATA_Q36_PROMPT_TIMING=1: the per-layer prompt-chunk events, created only under that gate, so a flag-off run
+    // allocates nothing it did not before.  NOTE: no cudaEventDisableTiming - these are the events cudaEventElapsedTime
+    // reads, and a no-timing event has no timestamp.  The decode probe's reason verbatim, applied to this probe's own
+    // array.  One forward needs 2 (forward start/end) + 8 per main layer (P0, P0b, P0c, P0d, P1, P1b, P2, P3), and
+    // the events are created on the primary device (the engine's session device) just like ev_seg_ev above them.
+    E.pp_nlayers = (int) g.n_layers;
+    E.pp_gpu_timing = false;
+    E.pp_ev = nullptr;
+    {
+        const char* pt = std::getenv("STRATA_Q36_PROMPT_TIMING");
+        if (pt && pt[0] == '1' && pt[1] == '\0') {
+            const int n = 2 + 8 * E.pp_nlayers;
+            E.pp_ev = new cudaEvent_t[n];
+            for (int k = 0; k < n; ++k)
+                CK(cudaEventCreate(&E.pp_ev[k]));
+            E.pp_gpu_timing = true;
         }
     }
     if (staging) {
@@ -6268,22 +6501,85 @@ int strata::qwen35::run(int argc, char** argv) {
         // STRATA_Q36_HELPER_TIMING=1: Phase-3 tg-only RemoteExperts host-time deltas (throwaway measurement).
         const char* ht = std::getenv("STRATA_Q36_HELPER_TIMING");
         const bool helper_timing = ht && ht[0] == '1' && ht[1] == '\0';
+        const char* pt = std::getenv("STRATA_Q36_PROMPT_TIMING");
+        const bool prompt_timing_on = pt && pt[0] == '1' && pt[1] == '\0';
         // Per pass (r_begin/r_wait/r_ovh) and the 3-pass aggregate (d_*), so every printed tg tok/s sits next to
         // its OWN per-token numbers: the wall clock quoted from a run is one pass (the steady one), and averaging
         // ms/token over the warm-up passes biases the comparison against it.
         double d_begin[3] = {}, d_wait[3] = {}, d_ovh[3] = {};
         double d_pre = 0, d_spin = 0;
         long long n_pre = 0, n_spin = 0;
+        // STRATA_Q36_PROMPT_TIMING=1: the prompt-chunk probe's per-pass and 3-pass-aggregate accumulators.  The GPU
+        // spans are EIGHT per-layer segments summed across every layer AND every chunk (process() breaks a long
+        // prompt into chunks of tmax each); the host totals are the five wall-clock pieces the probe measures on the
+        // engine and the helpers.  pp_forward is the whole forward's GPU time (forward-end - forward-start).  The
+        // units are ms, so the per-layer mean is the sum over spans divided by the layer count (pp_span_n).  The GPU
+        // spans and the host wall segments are reported SEPARATELY: the host segments overlap the GPU spans and each
+        // other, so they are NOT additive and no single "unattributed" number is printed (a future reader sees the
+        // GPU span sum and the forward total, and a gpu_residual = forward - GPU-spans that should be ~0).
+        double d_pp_mixer = 0, d_pp_rr = 0, d_pp_rd2h = 0, d_pp_eplan = 0;
+        double d_pp_pwork = 0, d_pp_hwait = 0, d_pp_combine = 0, d_pp_post = 0;
+        double d_pp_forward = 0, d_pp_prep_d2h = 0, d_pp_prep_sync = 0;
+        double d_pp_plan = 0, d_pp_sync3022 = 0, d_pp_ppwait = 0;
+        long long d_pp_layers = 0;
         // STRATA_Q36_HELPER_TIMING=1: the primary GPU's own per-token segment totals, same per-pass + aggregate
         // treatment as the host counters above.  gseg_ms[j] is segment (E_j, E_j+1) in ms for the whole pass.
         double d_gseg[Engine::kGsegN] = {}, d_span = 0, d_resid = 0, d_emb = 0, d_head = 0;
         long long d_gn = 0, d_dropped = 0;
         for (int rep = 0; rep < 3; ++rep) {
             E.reset();
+            // STRATA_Q36_PROMPT_TIMING=1: take the baseline (engine-side + helper-side) before this pass,
+            // the same pattern the helper-timing uses: the post-pass reading minus this baseline is the pass's
+            // contribution, so the per-pass report is self-contained and the aggregate is their sum.  Engine
+            // accumulators are reset by pp_reset() below; the helper-side ones are read twice and differenced.
+            double ppb_mixer = 0, ppb_rr = 0, ppb_rd2h = 0, ppb_eplan = 0;
+            double ppb_pwork = 0, ppb_hwait = 0, ppb_combine = 0, ppb_post = 0;
+            double ppb_forward = 0, ppb_prep_d2h = 0, ppb_prep_sync = 0;
+            double ppb_plan = 0, ppb_sync3022 = 0, ppb_ppwait = 0;
+            long long ppb_layers = 0;
+            if (prompt_timing_on) {
+                E.pp_reset();
+                for (int r = 0; r < 3; ++r) {
+                    if (!E.peer_on[(size_t) r]) continue;
+                    ppb_prep_d2h += E.peers[(size_t) r]->last_prepare_d2h_ms();
+                    ppb_prep_sync += E.peers[(size_t) r]->last_prepare_sync_ms();
+                }
+            }
             const auto t0 = Clock::now();
             E.process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
             CK(cudaStreamSynchronize(E.st));
             const double pp_ms = ms_since(t0);
+            // STRATA_Q36_PROMPT_TIMING=1: read the prompt-chunk spans right after the prompt (before the greedy
+            // step), same way the helper-timing prebegin/route-spin are read at t1: the greedy steps' forwards
+            // are decode, not prompt, so they would add zero — but scoping at the measurement boundary is cleaner.
+            double r_pp_mixer = 0, r_pp_rr = 0, r_pp_rd2h = 0, r_pp_eplan = 0;
+            double r_pp_pwork = 0, r_pp_hwait = 0, r_pp_combine = 0, r_pp_post = 0;
+            double r_pp_forward = 0, r_pp_prep_d2h = 0, r_pp_prep_sync = 0;
+            double r_pp_plan = 0, r_pp_sync3022 = 0, r_pp_ppwait = 0;
+            long long r_pp_layers = 0;
+            if (prompt_timing_on) {
+                r_pp_mixer = E.pp_mixer_ms - ppb_mixer;
+                r_pp_rr = E.pp_router_route_ms - ppb_rr;
+                r_pp_rd2h = E.pp_route_d2h_ms - ppb_rd2h;
+                r_pp_eplan = E.pp_ev_plan_ms - ppb_eplan;
+                r_pp_pwork = E.pp_primary_work_ms - ppb_pwork;
+                r_pp_hwait = E.pp_helper_wait_ms - ppb_hwait;
+                r_pp_combine = E.pp_combine_ms - ppb_combine;
+                r_pp_post = E.pp_post_ms - ppb_post;
+                r_pp_forward = E.pp_forward_ms - ppb_forward;
+                double pd2h = 0, psync = 0;
+                for (int r = 0; r < 3; ++r) {
+                    if (!E.peer_on[(size_t) r]) continue;
+                    pd2h += E.peers[(size_t) r]->last_prepare_d2h_ms();
+                    psync += E.peers[(size_t) r]->last_prepare_sync_ms();
+                }
+                r_pp_prep_d2h = pd2h - ppb_prep_d2h;
+                r_pp_prep_sync = psync - ppb_prep_sync;
+                r_pp_plan = E.pp_peer_plan_ms - ppb_plan;
+                r_pp_sync3022 = E.pp_sync3022_ms - ppb_sync3022;
+                r_pp_ppwait = E.pp_wait_ms - ppb_ppwait;
+                r_pp_layers = E.pp_span_n - ppb_layers;
+            }
             double begin0[3] = {}, wait0[3] = {}, ovh0[3] = {};
             double pre0 = 0, spin0 = 0;
             long long pn0 = 0, sn0 = 0;
@@ -6344,6 +6640,26 @@ int strata::qwen35::run(int argc, char** argv) {
                 r_gn = E.gspan_n - gn0;        d_gn += r_gn;
                 r_drop = E.gseg_dropped - drop0; d_dropped += r_drop;
             }
+            // STRATA_Q36_PROMPT_TIMING=1: fold this pass's prompt spans into the 3-pass aggregate, the same
+            // d_*-pattern the helper-timing probe uses.  Each d_pp_* is the total across all three bench passes;
+            // the AGG line prints them divided by the total layer count.
+            if (prompt_timing_on) {
+                d_pp_mixer += r_pp_mixer;
+                d_pp_rr += r_pp_rr;
+                d_pp_rd2h += r_pp_rd2h;
+                d_pp_eplan += r_pp_eplan;
+                d_pp_pwork += r_pp_pwork;
+                d_pp_hwait += r_pp_hwait;
+                d_pp_combine += r_pp_combine;
+                d_pp_post += r_pp_post;
+                d_pp_forward += r_pp_forward;
+                d_pp_prep_d2h += r_pp_prep_d2h;
+                d_pp_prep_sync += r_pp_prep_sync;
+                d_pp_plan += r_pp_plan;
+                d_pp_sync3022 += r_pp_sync3022;
+                d_pp_ppwait += r_pp_ppwait;
+                d_pp_layers += r_pp_layers;
+            }
             std::printf("bench %d: pp%d %.1f tok/s, tg%d %.1f tok/s\n", rep, (int) toks.size(),
                         (double) toks.size() / (pp_ms / 1000.0), bench_tg,
                         bench_tg > 0 ? (double) bench_tg / (tg_ms / 1000.0) : 0.0);
@@ -6374,6 +6690,44 @@ int strata::qwen35::run(int argc, char** argv) {
                 std::fprintf(stderr, " | tile=%.3f segsum=%.3f resid=%.3f (per ms/tok)\n",
                              r_span / (double) bench_tg, segsum / (double) bench_tg, r_resid / (double) bench_tg);
             }
+            // STRATA_Q36_PROMPT_TIMING=1: the prompt-chunk probe's per-bench-pass line.  One line, like the existing
+            // PHASE3 lines, on stderr.  The EIGHT GPU spans (summed over layers AND chunks, the per-layer mean is
+            // the sum over that pass's layers) are printed as their own list, then the five host-side wall-clock
+            // totals are printed as a SEPARATE list labelled HOST WALL because they overlap the GPU spans and each
+            // other (prep_sync is inside peer_plan; the host blocks overlap the GPU's mixer / router span while the
+            // host is busy and the GPU works) - so they are NOT additive and no "unattributed" number is printed.
+            // The forward total and the GPU span sum are printed separately, and a gpu_residual = forward total -
+            // (sum of the GPU spans) closes the GPU timeline: it should be ~0 (the spans tile the whole forward,
+            // first P0 to forward-end).  A prompt that fills its chunk is the MMQ branch's story, so a prompt
+            // shorter than tmax still runs one chunk of it; the spans are per layer, the forward total covers the
+            // whole prompt.
+            // EVERY NUMBER ON THIS LINE IS IN THE SAME UNIT: milliseconds per layer.  The eight GPU spans, the
+            // forward total, the span sum, the residual and the host wall segments are all divided by the layer
+            // count, so they can be read against each other directly.  (The raw totals are recoverable: multiply
+            // by the printed layer count.)  Printing the totals next to per-layer means would mix two units on
+            // one line - which is what the first version of this probe did, and it cost a reader a multiplication.
+            // Guard on r_pp_layers > 0: the all-hybrid prompt case records a forward-start/end but no
+            // per-layer spans (pp_span_n == 0), so an unguarded gpu_residual = forward - 0 would print the
+            // whole forward time as a "residual".  Skip the line when no MMQ layer was measured.
+            if (prompt_timing_on && r_pp_layers > 0) {
+                const double spsum = r_pp_mixer + r_pp_rr + r_pp_rd2h + r_pp_eplan + r_pp_pwork + r_pp_hwait +
+                                     r_pp_combine + r_pp_post;
+                const double gres = r_pp_forward - spsum;
+                const double pl = 1.0 / (double) r_pp_layers;
+                std::fprintf(stderr,
+                             "strata-q36 PHASE3 bench %d prompt: layers=%lld (all values in ms per layer) | "
+                             "mixer=%.3f router_route=%.3f route_d2h=%.3f plan=%.3f primary_work=%.3f "
+                             "helper_wait=%.3f combine=%.3f post_combine=%.3f | "
+                             "HOST WALL (overlaps the GPU spans, not additive) prep_d2h=%.3f prep_sync=%.3f "
+                             "peer_plan=%.3f sync3022=%.3f ppwait=%.3f | "
+                             "forward=%.3f gpu_spansum=%.3f gpu_residual=%.3f\n",
+                             rep, r_pp_layers,
+                             r_pp_mixer * pl, r_pp_rr * pl, r_pp_rd2h * pl, r_pp_eplan * pl,
+                             r_pp_pwork * pl, r_pp_hwait * pl, r_pp_combine * pl, r_pp_post * pl,
+                             r_pp_prep_d2h * pl, r_pp_prep_sync * pl, r_pp_plan * pl, r_pp_sync3022 * pl,
+                             r_pp_ppwait * pl,
+                             r_pp_forward * pl, spsum * pl, gres * pl);
+            }
             std::fflush(stdout);
         }
         if (helper_timing && bench_tg > 0) {
@@ -6400,6 +6754,32 @@ int strata::qwen35::run(int argc, char** argv) {
                              d_span / (double) tokens, segsum / (double) tokens, d_resid / (double) tokens,
                              d_emb / (double) tokens, d_head / (double) tokens);
             }
+        }
+        // STRATA_Q36_PROMPT_TIMING=1: the 3-pass aggregate, the same way the helper-timing AGG line does it.  Per-layer
+        // means are the sums across all three passes divided by the total layer count (d_pp_layers, which is the sum
+        // of pp_span_n across the three passes).  Same format as the per-pass line: the eight GPU spans first, then
+        // the HOST WALL list, then the forward total, the GPU span sum and gpu_residual.
+        // Same r_pp_layers > 0 guard as the per-pass line above: the 3-pass aggregate is meaningless
+        // when no MMQ layer was measured (all-hybrid prompt).  Skipping the line avoids a bogus
+        // gpu_residual = d_pp_forward - 0.
+        if (prompt_timing_on && d_pp_layers > 0) {
+            const double spsum = d_pp_mixer + d_pp_rr + d_pp_rd2h + d_pp_eplan + d_pp_pwork + d_pp_hwait +
+                                 d_pp_combine + d_pp_post;
+            const double gres = d_pp_forward - spsum;
+            const double pl = 1.0 / (double) d_pp_layers;
+            std::fprintf(stderr,
+                         "strata-q36 PHASE3 AGG benches 0-2 prompt: layers=%lld (all values in ms per layer) | "
+                         "mixer=%.3f router_route=%.3f route_d2h=%.3f plan=%.3f primary_work=%.3f "
+                         "helper_wait=%.3f combine=%.3f post_combine=%.3f | "
+                         "HOST WALL (overlaps the GPU spans, not additive) prep_d2h=%.3f prep_sync=%.3f "
+                         "peer_plan=%.3f sync3022=%.3f ppwait=%.3f | "
+                         "forward=%.3f gpu_spansum=%.3f gpu_residual=%.3f\n",
+                         d_pp_layers,
+                         d_pp_mixer * pl, d_pp_rr * pl, d_pp_rd2h * pl, d_pp_eplan * pl,
+                         d_pp_pwork * pl, d_pp_hwait * pl, d_pp_combine * pl, d_pp_post * pl,
+                         d_pp_prep_d2h * pl, d_pp_prep_sync * pl, d_pp_plan * pl, d_pp_sync3022 * pl,
+                         d_pp_ppwait * pl,
+                         d_pp_forward * pl, spsum * pl, gres * pl);
         }
         return 0;
     }
