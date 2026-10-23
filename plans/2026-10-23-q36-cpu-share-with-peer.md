@@ -155,7 +155,7 @@ helper 传统路径要求 `T <= MAXT=8` 所以 prompt 阶段不参与。在 P4 �
 
 读码核到一条决定性事实（§13.4 同步修正）：
 
-**P4 里主卡在 served 层上���个专家都不算（`n_local = 0`）。**
+**P4 里主卡在 served 层上一个专家都不算（`n_local = 0`）。**
 - 3 张 helper 按 `expert % 3` 持走了**每层每一个**专家（banner 3440+3400+3400 = 10240 = 40×256）。
 - `open_helpers()` 传 **empty_primary** cache（0 槽）→ `RemoteExperts::open()` 的
   `primary.slot_of(...) < 0` 判据**恒真** → helper 可以持有主卡也常驻的专家
