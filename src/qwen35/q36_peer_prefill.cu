@@ -34,6 +34,8 @@
 #include <utility>
 #include <vector>
 
+#include <cuda_fp16.h>
+
 namespace strata::qwen35 {
 namespace {
 
@@ -48,6 +50,20 @@ inline unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b -
 static bool prompt_timing() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_Q36_PROMPT_TIMING");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
+/// STRATA_Q36_PEER_F16=1: the UP LEG (the helper's rows on their way back to the primary) travels as fp16 instead
+/// of fp32.  The rows are packed to half on the helper, copied as half, and unpacked back to float on the primary, so
+/// `eparts` stays fp32 and the row contract is untouched - only the bytes on the wire change.  Half is enough for
+/// the transport because the values are then summed with the routing weights: the extra error is ~5e-4 relative,
+/// while the values themselves are order 1.  OFF by default: with the variable unset not one byte and not one kernel
+/// changes, so a default run is byte-identical to a run without this feature.
+static bool peer_f16() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_Q36_PEER_F16");
         return v && v[0] == '1' && v[1] == '\0';
     }();
     return on;
@@ -147,6 +163,41 @@ __global__ void k_peer_scatter(const int32_t* __restrict__ ids, const uint8_t* _
     dst[r] = rank[e];
 }
 
+/// STRATA_Q36_PEER_F16=1: the up leg's packing.  `src` (fp32) becomes `dst` (fp16), element for element: the row
+/// count, the row order and every row's meaning are untouched - only the width of an element changes.
+///
+/// It also MEASURES the largest magnitude it saw, into `max_abs` (one unsigned slot, the float's own bit pattern,
+/// so an integer max is a float max for the non-negative values).  That number is what says whether fp16 can carry
+/// these rows at all: fp16 tops out at 65504, and a row that went past it would arrive as an infinity and spread.
+/// Measuring it costs one atomic per element and turns "the values are probably small" into a fact.
+///
+/// A value that does not fit is CLAMPED, not silently turned into an infinity: the transport has to deliver
+/// something finite, and the clamp is visible in the measured maximum.
+__global__ void k_pack_f16(const float* __restrict__ src, __half* __restrict__ dst, int64_t n,
+                            unsigned int* __restrict__ max_abs, unsigned int* __restrict__ max_rel) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = src[i];
+    const float a = v < 0.0f ? -v : v;
+    // The bit pattern of a non-negative float compares as an integer exactly like the float does.
+    unsigned int bits;
+    std::memcpy(&bits, &a, sizeof bits);
+    atomicMax(max_abs, bits);
+    const float lim = 65504.0f;   // the largest finite fp16
+    const float c = a > lim ? (v < 0.0f ? -lim : lim) : v;
+    const __half h = __float2half(c);
+    dst[i] = h;
+    // HOW MUCH THE PACKING COSTS, measured rather than assumed: the largest RELATIVE error of the round trip.
+    // A relative error is non-negative, so its bit pattern compares as an integer the same way the magnitude's
+    // does.  This is the number that says whether fp16 can carry these rows - not the tail of the logits.
+    const float back = __half2float(h);
+    const float babs = back < 0.0f ? -back : back;
+    const float rel = a > 0.0f ? (babs - a) / a : 0.0f;
+    unsigned int rbits;
+    std::memcpy(&rbits, &rel, sizeof rbits);
+    atomicMax(max_rel, rbits);
+}
+
 }  // namespace
 
 struct PeerPrefill36::Impl {
@@ -168,11 +219,22 @@ struct PeerPrefill36::Impl {
     float* h_x = nullptr;        // [cap][n_embd] the primary's activations, on their way down
     int32_t* h_ids = nullptr;    // [cap]          the primary's routing
     float* h_out = nullptr;      // [cap][n_embd] this helper's run, on its way back
+    // STRATA_Q36_PEER_F16=1: the same run as fp16.  d_out16 is the packed image on the helper, h_out16 the pinned
+    // staging the D2H writes.  Both exist only when the flag is on, so a default run allocates exactly what it did.
+    __half* d_out16 = nullptr;   // [cap][n_embd] the packed run, on the helper
+    __half* h_out16 = nullptr;   // [cap][n_embd] the packed run, on its way back
+    unsigned int* d_f16max = nullptr;   // [1] the largest magnitude the packing kernel saw
+    unsigned int* h_f16max = nullptr;   // [1] its pinned copy, read back once per layer
+    unsigned int* d_f16rel = nullptr;   // [1] the largest RELATIVE error of the fp16 round trip
+    unsigned int* h_f16rel = nullptr;   // [1] its pinned copy
     // What a host-route launch() left in h_out, and where it belongs.  It is remembered rather than uploaded at once
     // because wait() is the only method the caller hands the PRIMARY's stream to, and the upload has to be ordered
     // against the primary's own work there.
     float* pending_eparts = nullptr;
     int64_t pending_base = 0, pending_n = 0;
+    // STRATA_Q36_PEER_F16=1: whether the rows waiting to go back are the packed ones.  The up leg's shape is decided
+    // in launch() (which route the rows took) and read back here.
+    bool pending_f16 = false;
 
     // everything below is allocated on `device`
     float* d_x = nullptr;      // [cap][n_embd] the staged activations
@@ -468,6 +530,19 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
         close();
         return false;
     }
+    // STRATA_Q36_PEER_F16=1: the fp16 up leg's buffers.  Allocated ONLY when the flag is on, so a default run's
+    // allocation list is exactly the one above.  d_out16 is the packed image on the helper, d_f16max the slot the
+    // packing kernel measures the largest magnitude into (one unsigned int).
+    if (peer_f16()) {
+        const bool fok =
+            ck(cudaMalloc((void**) &m.d_out16, nf * (size_t) n_embd * sizeof(__half)), "packed result run", err) &&
+            ck(cudaMalloc((void**) &m.d_f16max, sizeof(unsigned int)), "packed magnitude", err) &&
+            ck(cudaMalloc((void**) &m.d_f16rel, sizeof(unsigned int)), "packed relative error", err);
+        if (!fok) {
+            close();
+            return false;
+        }
+    }
     // THE HOST ROUTE'S STAGING, and only on that route: a box with a working link allocates nothing here, so its
     // allocation list is exactly what it was.  Pinned, because every copy that touches these buffers is a
     // cudaMemcpyAsync on a stream - a pageable buffer would make each one a synchronising copy.  Sized from the same
@@ -485,6 +560,22 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
         if (!hok) {   // a null staging buffer would turn every copy below into a silent no-op: refuse the helper
             close();
             return false;
+        }
+        // STRATA_Q36_PEER_F16=1: the pinned staging for the packed up leg, and the slot the packing kernel's
+        // measurement comes back through.  Only when the flag is on, so a default run's host allocations are the
+        // three above and nothing else.
+        if (peer_f16()) {
+            const bool fok =
+                ck(cudaHostAlloc((void**) &m.h_out16, nf * (size_t) n_embd * sizeof(__half), cudaHostAllocDefault),
+                   "pinned packed result rows", err) &&
+                ck(cudaHostAlloc((void**) &m.h_f16max, sizeof(unsigned int), cudaHostAllocDefault),
+                   "pinned packed magnitude", err) &&
+                ck(cudaHostAlloc((void**) &m.h_f16rel, sizeof(unsigned int), cudaHostAllocDefault),
+                   "pinned packed relative error", err);
+            if (!fok) {
+                close();
+                return false;
+            }
         }
     }
     // The row plan's two numbers, PINNED, on both routes: they are the target of a device-to-host copy that has to
@@ -527,7 +618,7 @@ void PeerPrefill36::close() {
         m.mctx.reset();   // its pool belongs to the helper: destroy it there
         void* frees[] = {m.d_x,  m.d_gu, m.d_h,       m.d_out, m.d_ys,   m.d_xq,     m.d_hq,
                          m.d_ids, m.d_ident, m.d_src, m.d_map, m.d_rank, m.d_pos, m.d_cnt,   m.d_cur,
-                         m.d_bounds, m.d_maxr, m.d_owned};
+                         m.d_bounds, m.d_maxr, m.d_owned, m.d_out16, m.d_f16max, m.d_f16rel};
         for (void* p : frees)
             if (p != nullptr) cudaFree(p);
         if (m.ev != nullptr) cudaEventDestroy(m.ev);
@@ -538,13 +629,17 @@ void PeerPrefill36::close() {
     // after the PRIMARY has settled (wait() issued its H2D on a stream this class only ever sees as an argument, so
     // the one handle it can drain is the device's).  Both routes clear the pointers, so a close() of a link box leaves
     // nothing to confuse the next open().
-    if (m.primary >= 0 && (m.h_x != nullptr || m.h_ids != nullptr || m.h_out != nullptr || m.h_plan != nullptr)) {
+    if (m.primary >= 0 && (m.h_x != nullptr || m.h_ids != nullptr || m.h_out != nullptr || m.h_plan != nullptr ||
+                           m.h_out16 != nullptr || m.h_f16max != nullptr)) {
         On onp(m.primary);
         cudaDeviceSynchronize();
         if (m.h_x != nullptr) cudaFreeHost(m.h_x);
         if (m.h_ids != nullptr) cudaFreeHost(m.h_ids);
         if (m.h_out != nullptr) cudaFreeHost(m.h_out);
         if (m.h_plan != nullptr) cudaFreeHost(m.h_plan);
+        if (m.h_out16 != nullptr) cudaFreeHost(m.h_out16);
+        if (m.h_f16max != nullptr) cudaFreeHost(m.h_f16max);
+        if (m.h_f16rel != nullptr) cudaFreeHost(m.h_f16rel);
         cudaGetLastError();
     }
     m.device = -1;
@@ -554,6 +649,9 @@ void PeerPrefill36::close() {
     m.h_ids = nullptr;
     m.h_out = nullptr;
     m.h_plan = nullptr;
+    m.h_out16 = nullptr;
+    m.h_f16max = nullptr;
+    m.h_f16rel = nullptr;
     m.pending_eparts = nullptr;
     m.pending_base = 0;
     m.pending_n = 0;
@@ -885,6 +983,30 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
         if (!ck(cudaMemcpyPeerAsync(eparts_primary + eparts_row_base * m.n_embd, m.primary, m.d_out, m.device,
                                     (size_t) n * (size_t) m.n_embd * sizeof(float), m.stream), "copy the run", err))
             return false;
+    } else if (peer_f16()) {
+        // STRATA_Q36_PEER_F16=1: the packed up leg.  The rows are packed to half on the helper (which also MEASURES
+        // the largest magnitude it saw, so the question "can fp16 carry these values" is answered by a number and
+        // not by an assumption), and the copy that follows moves half as many bytes.  The rows themselves are
+        // unchanged: same count, same order, same meaning - only the width of an element on the wire.
+        if (!ck(cudaMemsetAsync(m.d_f16max, 0, sizeof(unsigned int), m.stream), "clear packed magnitude", err) ||
+            !ck(cudaMemsetAsync(m.d_f16rel, 0, sizeof(unsigned int), m.stream), "clear packed relative error", err))
+            return false;
+        k_pack_f16<<<grid1(n * m.n_embd), kThreads, 0, m.stream>>>(m.d_out, m.d_out16, n * m.n_embd, m.d_f16max,
+                                                                m.d_f16rel);
+        if (!ck(cudaGetLastError(), "pack the run", err)) return false;
+        if (!ck(cudaMemcpyAsync(m.h_out16, m.d_out16, (size_t) n * (size_t) m.n_embd * sizeof(__half),
+                                cudaMemcpyDeviceToHost, m.stream), "copy the packed run to host staging", err))
+            return false;
+        // The measurement comes back with the same copy: 4 bytes next to the rows, read on the helper's stream.
+        if (!ck(cudaMemcpyAsync(m.h_f16max, m.d_f16max, sizeof(unsigned int), cudaMemcpyDeviceToHost, m.stream),
+                "read the packed magnitude", err) ||
+            !ck(cudaMemcpyAsync(m.h_f16rel, m.d_f16rel, sizeof(unsigned int), cudaMemcpyDeviceToHost, m.stream),
+                "read the packed relative error", err))
+            return false;
+        m.pending_eparts = eparts_primary;
+        m.pending_base = eparts_row_base;
+        m.pending_n = n;
+        m.pending_f16 = true;
     } else {
         if (!ck(cudaMemcpyAsync(m.h_out, m.d_out, (size_t) n * (size_t) m.n_embd * sizeof(float),
                                 cudaMemcpyDeviceToHost, m.stream), "copy the run to host staging", err))
@@ -892,11 +1014,13 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
         m.pending_eparts = eparts_primary;
         m.pending_base = eparts_row_base;
         m.pending_n = n;
+        // The rows on their way back are floats: pending_f16 is false already (it starts false and the packed route
+        // is the only one that sets it, and the flag cannot change under a running process).
     }
     return ck(cudaGetLastError(), "helper launches", err);
 }
 
-bool PeerPrefill36::wait(cudaStream_t st_primary, std::string& err) {
+bool PeerPrefill36::wait(cudaStream_t st_primary, void* fp16_stage, std::string& err) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: wait() on a closed executor"; return false; }
     if (st_primary == nullptr) { err = "q36 peer prefill: wait() without a primary stream"; return false; }
@@ -916,9 +1040,20 @@ bool PeerPrefill36::wait(cudaStream_t st_primary, std::string& err) {
         const int64_t n = m.pending_n;
         m.pending_n = 0;
         On onp(m.primary);   // `eparts` and the stream are the primary's: the copy runs on its device
-        if (!ck(cudaMemcpyAsync(m.pending_eparts + m.pending_base * m.n_embd, m.h_out,
-                                (size_t) n * (size_t) m.n_embd * sizeof(float), cudaMemcpyHostToDevice, st_primary),
-                "copy the run into eparts", err))
+        if (m.pending_f16) {
+            // STRATA_Q36_PEER_F16=1: the packed rows land in the PRIMARY's staging, NOT in eparts - the caller
+            // unpacks them into eparts on the same stream, so `eparts` still holds floats when the combine reads it.
+            // The staging is the caller's: it knows where the rows belong (the row base this helper was given).
+            if (fp16_stage == nullptr) {
+                err = "q36 peer prefill: the packed up leg needs a staging buffer on the primary";
+                return false;
+            }
+            if (!ck(cudaMemcpyAsync(fp16_stage, m.h_out16, (size_t) n * (size_t) m.n_embd * sizeof(__half),
+                                    cudaMemcpyHostToDevice, st_primary), "copy the packed run to the primary", err))
+                return false;
+        } else if (!ck(cudaMemcpyAsync(m.pending_eparts + m.pending_base * m.n_embd, m.h_out,
+                                       (size_t) n * (size_t) m.n_embd * sizeof(float), cudaMemcpyHostToDevice, st_primary),
+                       "copy the run into eparts", err))
             return false;
     }
     return ck(cudaGetLastError(), "helper completion", err);
@@ -928,6 +1063,23 @@ int64_t PeerPrefill36::rows() const { return impl_->rows; }
 int64_t PeerPrefill36::launches() const { return impl_->launches; }
 
 double PeerPrefill36::last_prepare_d2h_ms() const { return impl_->prep_d2h_ms; }
+// STRATA_Q36_PEER_F16=1: what the packing measured - the largest magnitude in the rows and the largest
+// relative error of the fp16 round trip.  The second one is the answer to "can fp16 carry these rows";
+// the first says whether anything came close to fp16's limit.
+double PeerPrefill36::last_f16_max_abs() const {
+    if (impl_->h_f16max == nullptr) return 0.0;
+    unsigned int bits = *impl_->h_f16max;
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return (double) f;
+}
+double PeerPrefill36::last_f16_max_rel() const {
+    if (impl_->h_f16rel == nullptr) return 0.0;
+    unsigned int bits = *impl_->h_f16rel;
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return (double) f;
+}
 double PeerPrefill36::last_prepare_sync_ms() const { return impl_->prep_sync_ms; }
 int64_t PeerPrefill36::last_prepare_calls() const { return impl_->prep_calls; }
 

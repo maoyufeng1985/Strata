@@ -114,7 +114,12 @@ public:
 
     /// Record the helper's completion and make the PRIMARY stream `st_primary` wait for it, so a kernel the caller
     /// issues on `st_primary` afterwards reads this helper's rows.  Nothing is copied to the host.
-    bool wait(cudaStream_t st_primary, std::string& err);
+    ///
+    /// STRATA_Q36_PEER_F16=1: `fp16_stage` is the PRIMARY's staging for the packed rows (a `__half*` with room for
+    /// this helper's rows).  When it is not null the rows travel as fp16 and land there; the caller unpacks them
+    /// back into `eparts` on the same stream.  When it is null the rows travel as fp32, straight into `eparts`, and
+    /// nothing about the route changes.
+    bool wait(cudaStream_t st_primary, void* fp16_stage, std::string& err);
 
     /// Owned entries the last launch() computed (0 before any), and launches so far (the evidence line's numbers).
     int64_t rows() const;
@@ -128,6 +133,10 @@ public:
     /// (so a per-call mean is the sum over calls).  Every accessor is cheap and meaningful only under the gate: with the
     /// flag off prepare() never writes them, so they keep the zero they were initialised to and these return 0.
     double last_prepare_d2h_ms() const;
+    /// STRATA_Q36_PEER_F16=1: what the fp16 packing measured - the largest magnitude in the rows and the
+    /// largest relative error of the round trip.  Zero when the flag is off (nothing was measured).
+    double last_f16_max_abs() const;
+    double last_f16_max_rel() const;
     double last_prepare_sync_ms() const;
     int64_t last_prepare_calls() const;
 
