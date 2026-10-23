@@ -85,6 +85,10 @@ public:
     /// The largest window open() allocated for.
     int64_t cap_entries() const;
 
+    /// Whether this helper's rows cross through host staging rather than a direct peer copy.  A box with a
+    /// working link says false, and the caller then does not stage the window at all.
+    bool host_route() const;
+
     // ---- per layer ----
     /// Stage the primary's activations `h_primary` ([n_tok][n_embd] floats, the MoE input `h`) and routing
     /// `ids_primary` ([n_tok * k] ints) into the helper.  Both live on the PRIMARY device; the copies are P2P.
@@ -102,7 +106,14 @@ public:
     bool prepare(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok, std::string& err);
     /// The first half: everything that can be enqueued without the host learning anything.  Returns false only on a
     /// refusal (a window too large, a copy that failed); a false here means the helper was not prepared at all.
-    bool prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok, std::string& err);
+    ///
+    /// `h_staged` / `ids_staged`: the window ALREADY staged in host memory (the activations and the routing, as
+    /// float and int32).  When they are given, the host route does NOT copy them out of the primary again - the
+    /// caller staged the window once and every helper reads that one copy.  That matters because the helpers
+    /// share the same window: without it the primary copies the same 4 MiB out once per helper, three times over.
+    /// Null means "stage it yourself", which is what a caller that prepares one helper at a time wants.
+    bool prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok, std::string& err,
+                       const float* h_staged = nullptr, const int32_t* ids_staged = nullptr);
     /// The second half: wait for the helper's stream and read the owned-row count and the widest expert back.
     /// Must follow a successful prepare_begin() for the same layer on the same helper.
     bool prepare_end(std::string& err);
