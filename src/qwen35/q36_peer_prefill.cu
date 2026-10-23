@@ -218,6 +218,10 @@ struct PeerPrefill36::Impl {
     // allocates none of it, and its allocations are therefore what they were.
     float* h_x = nullptr;        // [cap][n_embd] the primary's activations, on their way down
     int32_t* h_ids = nullptr;    // [cap]          the primary's routing
+    // WHERE THE UPLOAD READS FROM: this helper's own staging, or the caller's shared copy of the window (the
+    // helpers of one layer are given the same activations and the same routing, so the primary can stage them once).
+    const float* h_x_use = nullptr;
+    const int32_t* h_ids_use = nullptr;
     float* h_out = nullptr;      // [cap][n_embd] this helper's run, on its way back
     // STRATA_Q36_PEER_F16=1: the same run as fp16.  d_out16 is the packed image on the helper, h_out16 the pinned
     // staging the D2H writes.  Both exist only when the flag is on, so a default run allocates exactly what it did.
@@ -684,8 +688,10 @@ bool PeerPrefill36::owns(int64_t layer, int32_t expert) const {
 
 int64_t PeerPrefill36::cap_entries() const { return impl_->cap; }
 
+bool PeerPrefill36::host_route() const { return !impl_->p2p; }
+
 bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok,
-                                   std::string& err) {
+                                   std::string& err, const float* h_staged, const int32_t* ids_staged) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: prepare() on a closed executor"; return false; }
     if (h_primary == nullptr || ids_primary == nullptr) { err = "q36 peer prefill: null activations or routing"; return false; }
@@ -796,14 +802,27 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
         // on a host-route box these two copies are the serial cost the prompt timing probe suspects, and they are
         // counted separately from the row-plan sync below so each cost is visible.
         const auto t_d2h = prompt_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        On onp(m.primary);   // the two source pointers are the primary's: the copies run on its device
-        if (!ck(cudaMemcpy(m.h_x, h_primary, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
-                           cudaMemcpyDeviceToHost), "stage activations through host", err) ||
-            !ck(cudaMemcpy(m.h_ids, ids_primary, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost),
-                "stage routing through host", err))
-            return false;
+        if (h_staged != nullptr && ids_staged != nullptr) {
+            // THE CALLER ALREADY STAGED THE WINDOW.  Every helper in a layer is given the SAME activations and the
+            // SAME routing, so the primary copies them out of its memory once and the helpers read that one copy.
+            // Copying them per helper meant the primary moved the same 4 MiB out three times over.
+            m.h_x_use = h_staged;
+            m.h_ids_use = ids_staged;
+        } else {
+            m.h_x_use = m.h_x;
+            m.h_ids_use = m.h_ids;
+            On onp(m.primary);   // the two source pointers are the primary's: the copies run on its device
+            if (!ck(cudaMemcpy(m.h_x, h_primary, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
+                               cudaMemcpyDeviceToHost), "stage activations through host", err) ||
+                !ck(cudaMemcpy(m.h_ids, ids_primary, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost),
+                    "stage routing through host", err))
+                return false;
+        }
         if (prompt_timing())
             m.prep_d2h_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
+    } else {
+        m.h_x_use = nullptr;
+        m.h_ids_use = nullptr;
     }
 
     On on(m.device);
@@ -821,9 +840,9 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
         // kernel reads d_x - and an upload nobody waits for would still be queued on the helper's stream when the NEXT
         // layer's blocking D2H refills h_x, which arrives before that stream is ever synchronised.  Leaving it out is
         // cheaper than ordering around it.
-        if (!ck(cudaMemcpyAsync(m.d_x, m.h_x, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
+        if (!ck(cudaMemcpyAsync(m.d_x, m.h_x_use, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
                                 cudaMemcpyHostToDevice, m.stream), "upload activations", err) ||
-            !ck(cudaMemcpyAsync(m.d_ids, m.h_ids, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
+            !ck(cudaMemcpyAsync(m.d_ids, m.h_ids_use, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
                 "upload routing", err))
             return false;
     }

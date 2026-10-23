@@ -1586,6 +1586,16 @@ struct Engine {
     // here at a time (the wait loop hands the buffer over helper by helper), so it is sized for one helper's share of
     // a window: cap_entries rows of N halves.  Allocated only when the flag is on.
     __half* peer_f16_stage = nullptr;
+    // THE SHARED WINDOW STAGING.  Every helper of a layer is given the same activations and the same routing, so
+    // the primary copies them out of its memory ONCE into this pinned buffer and the helpers read that one copy.
+    // Before, each helper copied the same 4 MiB out of the primary for itself, three times over.
+    float* peer_stage_x = nullptr;    // [tmax * Kp][N] the window's activations, in host memory
+    int32_t* peer_stage_ids = nullptr; // [tmax * Kp]     the window's routing, in host memory
+    // STRATA_Q36_PROMPT_TIMING=1: the wall time of the ONE copy of the window out of the primary.  The helpers'
+    // own prepare() no longer copies it (they read the shared copy), so this is where that cost moved to - and
+    // without this the report would show the staging as free.
+    double peer_stage_ms = 0;
+    long long peer_stage_n = 0;
     float* hlast = nullptr;   // [N] that of the last processed position (zeros before the first): the current session's
     void *q8, *xq, *escr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
@@ -2310,6 +2320,13 @@ struct Engine {
         // a window is at most the window's entry count (tmax * Kp), and the wait loop hands the buffer over helper
         // by helper, so this holds one helper's rows at a time.  Allocated only when the flag is on.
         if (peer_f16()) peer_f16_stage = dalloc_t<__half>((size_t) tmax * (size_t) Kp * (size_t) N);
+        // The shared window staging, PINNED: the helpers' uploads read it with cudaMemcpyAsync, and a pageable
+        // buffer would turn each of those into a synchronising copy.
+        {
+            const size_t win = (size_t) tmax * (size_t) Kp;
+            CK(cudaHostAlloc((void**) &peer_stage_x, win * (size_t) N * sizeof(float), cudaHostAllocDefault));
+            CK(cudaHostAlloc((void**) &peer_stage_ids, win * sizeof(int32_t), cudaHostAllocDefault));
+        }
         sg = dalloc(T * g.n_ff_shexp); su = dalloc(T * g.n_ff_shexp); shh = dalloc(T * g.n_ff_shexp); sy = dalloc(T * N);
         sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) kVerify * g.n_vocab);
         const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp});
@@ -4006,9 +4023,31 @@ struct Engine {
         // overlap; the host's three waits then all land on work that is already in flight.
         // What this does NOT change: the row contract, the ownership witnesses below, the number of bytes, or what
         // each helper computes.  It is the ORDER of the host's waits, nothing else.
+        // THE WINDOW IS STAGED ONCE.  The three helpers are given the same activations and the same routing, so
+        // the primary copies them out of its memory into the shared pinned buffer ONCE, and each helper uploads
+        // from that one copy.  Before, every helper copied the same 4 MiB out of the primary for itself.
+        // The copy is blocking, and that is the same blocking the per-helper copies had: the primary's stream was
+        // already synchronised a few lines above (the route D2H), so the window is quiescent.
+        {
+            bool any_host_route = false;
+            for (int r = 0; r < 3; ++r)
+                if (rows[(size_t) r] != 0 && peer_on[(size_t) r] && peers[(size_t) r] != nullptr &&
+                    peers[(size_t) r]->host_route())
+                    any_host_route = true;
+            if (any_host_route) {
+                const int N = (int) m->g.n_embd;
+                const int64_t n_ent = (int64_t) T * (int64_t) m->top_k;
+                const auto t_st = prompt_timing() ? Clock::now() : Clock::time_point{};
+                CK(cudaMemcpy(peer_stage_x, hdev, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(peer_stage_ids, idsdev, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                if (prompt_timing()) { peer_stage_ms += ms_since(t_st); ++peer_stage_n; }
+            }
+        }
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
-            if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err)) return false;
+            if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err, peer_stage_x,
+                                                  peer_stage_ids))
+                return false;
         }
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
@@ -6586,7 +6625,7 @@ int strata::qwen35::run(int argc, char** argv) {
         // GPU span sum and the forward total, and a gpu_residual = forward - GPU-spans that should be ~0).
         double d_pp_mixer = 0, d_pp_rr = 0, d_pp_rd2h = 0, d_pp_eplan = 0;
         double d_pp_pwork = 0, d_pp_hwait = 0, d_pp_combine = 0, d_pp_post = 0;
-        double d_pp_forward = 0, d_pp_prep_d2h = 0, d_pp_prep_sync = 0;
+        double d_pp_forward = 0, d_pp_prep_d2h = 0, d_pp_prep_sync = 0, d_pp_stage = 0;
         double d_pp_plan = 0, d_pp_sync3022 = 0, d_pp_ppwait = 0;
         long long d_pp_layers = 0;
         // STRATA_Q36_HELPER_TIMING=1: the primary GPU's own per-token segment totals, same per-pass + aggregate
@@ -6601,11 +6640,12 @@ int strata::qwen35::run(int argc, char** argv) {
             // accumulators are reset by pp_reset() below; the helper-side ones are read twice and differenced.
             double ppb_mixer = 0, ppb_rr = 0, ppb_rd2h = 0, ppb_eplan = 0;
             double ppb_pwork = 0, ppb_hwait = 0, ppb_combine = 0, ppb_post = 0;
-            double ppb_forward = 0, ppb_prep_d2h = 0, ppb_prep_sync = 0;
+            double ppb_forward = 0, ppb_prep_d2h = 0, ppb_prep_sync = 0, ppb_stage = 0;
             double ppb_plan = 0, ppb_sync3022 = 0, ppb_ppwait = 0;
             long long ppb_layers = 0;
             if (prompt_timing_on) {
                 E.pp_reset();
+                E.peer_stage_ms = 0;
                 for (int r = 0; r < 3; ++r) {
                     if (!E.peer_on[(size_t) r]) continue;
                     ppb_prep_d2h += E.peers[(size_t) r]->last_prepare_d2h_ms();
@@ -6621,7 +6661,7 @@ int strata::qwen35::run(int argc, char** argv) {
             // are decode, not prompt, so they would add zero — but scoping at the measurement boundary is cleaner.
             double r_pp_mixer = 0, r_pp_rr = 0, r_pp_rd2h = 0, r_pp_eplan = 0;
             double r_pp_pwork = 0, r_pp_hwait = 0, r_pp_combine = 0, r_pp_post = 0;
-            double r_pp_forward = 0, r_pp_prep_d2h = 0, r_pp_prep_sync = 0;
+            double r_pp_forward = 0, r_pp_prep_d2h = 0, r_pp_prep_sync = 0, r_pp_stage = 0;
             double r_pp_plan = 0, r_pp_sync3022 = 0, r_pp_ppwait = 0;
             long long r_pp_layers = 0;
             if (prompt_timing_on) {
@@ -6642,6 +6682,9 @@ int strata::qwen35::run(int argc, char** argv) {
                 }
                 r_pp_prep_d2h = pd2h - ppb_prep_d2h;
                 r_pp_prep_sync = psync - ppb_prep_sync;
+                // The one copy of the window out of the primary, which the helpers now share (it used to be one
+                // copy per helper, inside each prepare()).
+                r_pp_stage = E.peer_stage_ms - ppb_stage;
                 r_pp_plan = E.pp_peer_plan_ms - ppb_plan;
                 r_pp_sync3022 = E.pp_sync3022_ms - ppb_sync3022;
                 r_pp_ppwait = E.pp_wait_ms - ppb_ppwait;
@@ -6722,6 +6765,7 @@ int strata::qwen35::run(int argc, char** argv) {
                 d_pp_forward += r_pp_forward;
                 d_pp_prep_d2h += r_pp_prep_d2h;
                 d_pp_prep_sync += r_pp_prep_sync;
+                d_pp_stage += r_pp_stage;
                 d_pp_plan += r_pp_plan;
                 d_pp_sync3022 += r_pp_sync3022;
                 d_pp_ppwait += r_pp_ppwait;
@@ -6786,12 +6830,12 @@ int strata::qwen35::run(int argc, char** argv) {
                              "mixer=%.3f router_route=%.3f route_d2h=%.3f plan=%.3f primary_work=%.3f "
                              "helper_wait=%.3f combine=%.3f post_combine=%.3f | "
                              "HOST WALL (overlaps the GPU spans, not additive) prep_d2h=%.3f prep_sync=%.3f "
-                             "peer_plan=%.3f sync3022=%.3f ppwait=%.3f | "
+                             "stage=%.3f peer_plan=%.3f sync3022=%.3f ppwait=%.3f | "
                              "forward=%.3f gpu_spansum=%.3f gpu_residual=%.3f\n",
                              rep, r_pp_layers,
                              r_pp_mixer * pl, r_pp_rr * pl, r_pp_rd2h * pl, r_pp_eplan * pl,
                              r_pp_pwork * pl, r_pp_hwait * pl, r_pp_combine * pl, r_pp_post * pl,
-                             r_pp_prep_d2h * pl, r_pp_prep_sync * pl, r_pp_plan * pl, r_pp_sync3022 * pl,
+                             r_pp_prep_d2h * pl, r_pp_prep_sync * pl, r_pp_stage * pl, r_pp_plan * pl, r_pp_sync3022 * pl,
                              r_pp_ppwait * pl,
                              r_pp_forward * pl, spsum * pl, gres * pl);
             }
@@ -6855,12 +6899,12 @@ int strata::qwen35::run(int argc, char** argv) {
                          "mixer=%.3f router_route=%.3f route_d2h=%.3f plan=%.3f primary_work=%.3f "
                          "helper_wait=%.3f combine=%.3f post_combine=%.3f | "
                          "HOST WALL (overlaps the GPU spans, not additive) prep_d2h=%.3f prep_sync=%.3f "
-                         "peer_plan=%.3f sync3022=%.3f ppwait=%.3f | "
+                         "stage=%.3f peer_plan=%.3f sync3022=%.3f ppwait=%.3f | "
                          "forward=%.3f gpu_spansum=%.3f gpu_residual=%.3f\n",
                          d_pp_layers,
                          d_pp_mixer * pl, d_pp_rr * pl, d_pp_rd2h * pl, d_pp_eplan * pl,
                          d_pp_pwork * pl, d_pp_hwait * pl, d_pp_combine * pl, d_pp_post * pl,
-                         d_pp_prep_d2h * pl, d_pp_prep_sync * pl, d_pp_plan * pl, d_pp_sync3022 * pl,
+                         d_pp_prep_d2h * pl, d_pp_prep_sync * pl, d_pp_stage * pl, d_pp_plan * pl, d_pp_sync3022 * pl,
                          d_pp_ppwait * pl,
                          d_pp_forward * pl, spsum * pl, gres * pl);
         }
