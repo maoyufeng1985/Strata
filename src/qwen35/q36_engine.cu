@@ -985,6 +985,15 @@ __global__ void k_to_f16(const float* x, __half* y, int64_t n) {
     if (i < n) y[i] = __float2half(x[i]);
 }
 
+/// STRATA_Q36_PEER_F16=1: the other half of the packed up leg.  The helpers' rows arrive as fp16 in the primary's
+/// staging and this puts them back into `eparts` as floats, so the combine below reads exactly the type it always
+/// read.  The rows themselves are the helper's rows, in the helper's order, at the row base the plan gave that
+/// helper - the unpacking moves values, it does not move rows.
+__global__ void k_from_f16(const __half* x, float* y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __half2float(x[i]);
+}
+
 /// The GDN conv for T tokens in ONE launch (the prompt): one block per 128-channel head, thread = channel, the
 /// 3-entry history carried in registers across the tokens and written back at the end; SiLU, then the L2 norm of the
 /// q/k heads (block < qk_heads) per token - fused_gdn_conv_l2's arithmetic, token after token.  History [channel][3].
@@ -1573,6 +1582,10 @@ struct Engine {
     float *x, *h, *y, *qkv, *hc, *z, *alpha, *beta, *gdn_y, *qg, *kx, *vx, *q, *gate, *att, *logits_r, *eparts, *moe_out,
         *sg, *su, *shh, *sy, *sgate, *ewts, *logits;
     float* hmain = nullptr;   // [tmax][N] the main model's final normed hidden of each row (the MTP seeds)
+    // STRATA_Q36_PEER_F16=1: the staging for the helpers' packed rows on their way back.  One helper's rows live
+    // here at a time (the wait loop hands the buffer over helper by helper), so it is sized for one helper's share of
+    // a window: cap_entries rows of N halves.  Allocated only when the flag is on.
+    __half* peer_f16_stage = nullptr;
     float* hlast = nullptr;   // [N] that of the last processed position (zeros before the first): the current session's
     void *q8, *xq, *escr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
@@ -1931,6 +1944,17 @@ struct Engine {
         }();
         return on;
     }
+    /// STRATA_Q36_PEER_F16=1: the helpers' rows travel back to the primary as fp16 instead of fp32.  The rows are
+    /// packed to half on the helper, copied as half, and unpacked back into `eparts` on the primary, so `eparts` and
+    /// the row contract are exactly what they are - only the bytes on the wire change.  Off by default: with the
+    /// variable unset not one byte and not one kernel changes.
+    static bool peer_f16() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_PEER_F16");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
     /// Whether state index li's layer is offered to a helper (the entries the helper holds leave the local path).
     bool helper_layer(size_t li) const {
         // only main-model layers carry a helper slot: the MTP block (li == m->layers.size()) stays local
@@ -2282,6 +2306,10 @@ struct Engine {
         gate = dalloc(T * g.n_head * g.head_dim); att = dalloc(T * g.n_head * g.head_dim);
         logits_r = dalloc(T * (g.n_expert + 1));
         eparts = dalloc(T * Kp * N); moe_out = dalloc(T * N);
+        // STRATA_Q36_PEER_F16=1: the staging for one helper's packed rows on their way back.  One helper's share of
+        // a window is at most the window's entry count (tmax * Kp), and the wait loop hands the buffer over helper
+        // by helper, so this holds one helper's rows at a time.  Allocated only when the flag is on.
+        if (peer_f16()) peer_f16_stage = dalloc_t<__half>((size_t) tmax * (size_t) Kp * (size_t) N);
         sg = dalloc(T * g.n_ff_shexp); su = dalloc(T * g.n_ff_shexp); shh = dalloc(T * g.n_ff_shexp); sy = dalloc(T * N);
         sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) kVerify * g.n_vocab);
         const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp});
@@ -3811,6 +3839,11 @@ struct Engine {
     int peer_wait_n = 0;             // the helpers' launches this layer that moe_end must wait for
     int peer_wait_hi[3] = {-1, -1, -1};
     int64_t peer_wait_li = -1;
+    // STRATA_Q36_PEER_F16=1: where each waiting helper's rows belong and how many there are.  The packed rows land in
+    // the primary's staging and are unpacked into `eparts` at the row base the plan gave that helper, so the unpack
+    // needs both numbers, and peer_plan() is where they are known.
+    int64_t peer_wait_base[3] = {0, 0, 0};
+    int64_t peer_wait_rows[3] = {0, 0, 0};
     /// The widest window the live executors can take: the SMALLEST cap_entries() among the helpers that opened,
     /// i.e. the narrowest helper's row budget.  0 when no executor is live (and in every run with the flag off),
     /// which is what makes peer_window_fits() false there and the over-cap branch unreachable.
@@ -3994,6 +4027,9 @@ struct Engine {
                 return false;
             }
             peer_wait_hi[peer_wait_n] = r;
+            // STRATA_Q36_PEER_F16=1: where this helper's rows go and how many there are, for the unpack.
+            peer_wait_base[peer_wait_n] = base[(size_t) r];
+            peer_wait_rows[peer_wait_n] = rows[(size_t) r];
             ++peer_wait_n;
         }
         return true;
@@ -4130,7 +4166,22 @@ struct Engine {
         std::string err;
         for (int i = 0; i < n; ++i) {
             const int r = hi[i];
-            if (peers[(size_t) r] != nullptr && peers[(size_t) r]->wait(st, err)) continue;
+            // STRATA_Q36_PEER_F16=1: the packed rows land in the primary's staging and are unpacked into `eparts` right
+            // after the copy that brought them, on the same stream - so the order is copy, unpack, copy, unpack, and
+            // the combine below reads floats either way.  The staging is one helper's rows at a time, which is all the
+            // stream's order needs: helper i's unpack is issued before helper i+1's copy.
+            void* stage = peer_f16() ? (void*) peer_f16_stage : nullptr;
+            if (peers[(size_t) r] != nullptr && peers[(size_t) r]->wait(st, stage, err)) {
+                if (peer_f16() && peer_f16_stage != nullptr) {
+                    const int64_t rows_here = peer_wait_rows[i];
+                    const int64_t base_here = peer_wait_base[i];
+                    const int N = (int) m->g.n_embd;
+                    k_from_f16<<<grid1(rows_here * N), kThreads, 0, st>>>(peer_f16_stage, eparts + base_here * N,
+                                                                        rows_here * N);
+                    CK(cudaGetLastError());
+                }
+                continue;
+            }
             std::fprintf(stderr, "strata-q36: STRATA_Q36_PREFILL_PEERS: helper CUDA%d, layer %lld: %s\n", r + 1,
                          (long long) li, err.c_str());
             std::fprintf(stderr, "strata-q36: STRATA_Q36_PREFILL_PEERS hands this layer's entries to the helpers before "
@@ -6515,6 +6566,10 @@ int strata::qwen35::run(int argc, char** argv) {
         const bool helper_timing = ht && ht[0] == '1' && ht[1] == '\0';
         const char* pt = std::getenv("STRATA_Q36_PROMPT_TIMING");
         const bool prompt_timing_on = pt && pt[0] == '1' && pt[1] == '\0';
+        // STRATA_Q36_PEER_F16=1: the same gate the engine's peer_f16() reads, named here so the report can say
+        // whether the packed up leg was in force for this run.
+        const char* pf = std::getenv("STRATA_Q36_PEER_F16");
+        const bool peer_f16_on = pf && pf[0] == '1' && pf[1] == '\0';
         // Per pass (r_begin/r_wait/r_ovh) and the 3-pass aggregate (d_*), so every printed tg tok/s sits next to
         // its OWN per-token numbers: the wall clock quoted from a run is one pass (the steady one), and averaging
         // ms/token over the warm-up passes biases the comparison against it.
@@ -6739,6 +6794,22 @@ int strata::qwen35::run(int argc, char** argv) {
                              r_pp_prep_d2h * pl, r_pp_prep_sync * pl, r_pp_plan * pl, r_pp_sync3022 * pl,
                              r_pp_ppwait * pl,
                              r_pp_forward * pl, spsum * pl, gres * pl);
+            }
+            // STRATA_Q36_PEER_F16=1: what the packed up leg measured.  The largest magnitude in the rows says how
+            // close they came to fp16's limit (65504); the largest relative error of the round trip says how much
+            // precision the packing cost.  Both are MEASURED, not assumed - a reader does not have to take "fp16 is
+            // close enough" on faith.
+            if (peer_f16_on) {
+                double fmax = 0.0, frel = 0.0;
+                for (int r = 0; r < 3; ++r) {
+                    if (!E.peer_on[(size_t) r] || E.peers[(size_t) r] == nullptr) continue;
+                    fmax = std::max(fmax, E.peers[(size_t) r]->last_f16_max_abs());
+                    frel = std::max(frel, E.peers[(size_t) r]->last_f16_max_rel());
+                }
+                std::fprintf(stderr,
+                             "strata-q36 PHASE3 bench %d prompt: the fp16 up leg packed rows up to %.6g in magnitude "
+                             "(fp16's limit is 65504) and the largest relative error of the round trip was %.6g\n",
+                             rep, fmax, frel);
             }
             std::fflush(stdout);
         }
