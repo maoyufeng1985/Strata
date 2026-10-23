@@ -2166,6 +2166,10 @@ struct Engine {
         pp_plan_book_ms = pp_plan_prep_ms = pp_plan_wait_ms = 0;
         pp_plan_book_n = pp_plan_prep_n = pp_plan_wait_n = 0;
         for (int r = 0; r < 3; ++r) {
+            pp_plan_wait_r[(size_t) r] = 0;
+            pp_plan_wait_r_n[(size_t) r] = 0;
+        }
+        for (int r = 0; r < 3; ++r) {
             pp_maxr_dev[(size_t) r].clear();
             pp_maxr_host[(size_t) r].clear();
         }
@@ -3866,6 +3870,10 @@ struct Engine {
     // save - which is a measurement, not an estimate.
     double pp_plan_book_ms = 0, pp_plan_prep_ms = 0, pp_plan_wait_ms = 0;
     long long pp_plan_book_n = 0, pp_plan_prep_n = 0, pp_plan_wait_n = 0;
+    // The wait PER HELPER.  Three helpers on three links might overlap or might not, and the difference between
+    // "the sum" and "the max" is the difference between a 6% and an 18% win.  Measured, not assumed.
+    double pp_plan_wait_r[3] = {0, 0, 0};
+    long long pp_plan_wait_r_n[3] = {0, 0, 0};
     // STRATA_Q36_PROMPT_TIMING=1: the two numbers the plan's own comparison produced, per layer and per helper: the
     // device's widest expert and the host's count of the same thing.  The report prints how many different values the
     // device's took across the layers (is the launch grid's shape the same every layer?) and how many layers the two
@@ -4115,7 +4123,9 @@ struct Engine {
         }
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
+            const auto t_pe = prompt_timing() ? Clock::now() : Clock::time_point{};
             if (!peers[(size_t) r]->prepare_end(err)) return false;
+            if (prompt_timing()) { pp_plan_wait_r[(size_t) r] += ms_since(t_pe); ++pp_plan_wait_r_n[(size_t) r]; }
             // STRATA_Q36_PROMPT_TIMING=1: THE THIRD WITNESS, or rather the two numbers the second one covers.  The
             // device's row plan counted its own owned rows and its own widest expert; the host counted the same two
             // from the routing it already had.  The rows are the number that decides where the helper's rows land;
@@ -6938,8 +6948,9 @@ int strata::qwen35::run(int argc, char** argv) {
                 const double pl = 1.0 / (double) r_pp_layers;
                 std::fprintf(stderr,
                              "strata-q36 PHASE3 bench %d prompt: the plan's host wall per layer: bookkeeping=%.3f "
-                             "prepare=%.3f wait=%.3f | ",
-                             rep, E.pp_plan_book_ms * pl, E.pp_plan_prep_ms * pl, E.pp_plan_wait_ms * pl);
+                             "prepare=%.3f wait=%.3f (helper CUDA1 %.3f, CUDA2 %.3f, CUDA3 %.3f) | ",
+                             rep, E.pp_plan_book_ms * pl, E.pp_plan_prep_ms * pl, E.pp_plan_wait_ms * pl,
+                             E.pp_plan_wait_r[0] * pl, E.pp_plan_wait_r[1] * pl, E.pp_plan_wait_r[2] * pl);
                 for (int r = 0; r < 3; ++r) {
                     if (E.pp_maxr_dev[(size_t) r].empty()) continue;
                     std::vector<int32_t> vals = E.pp_maxr_dev[(size_t) r];
