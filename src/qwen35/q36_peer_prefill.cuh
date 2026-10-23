@@ -104,6 +104,17 @@ public:
     int64_t rows() const;
     int64_t launches() const;
 
+    /// STRATA_Q36_PROMPT_TIMING=1 (opt-in, measurement only - see q36_engine.cu's probe): the host-route serial cost
+    /// prepare() incurs, the cost the prompt-timing probe suspects of eating the prompt's unattributed time.  Each is
+    /// the wall time of one prepare() call's blocking work: the two device-to-host staging copies (activation + routing,
+    /// the host route only - a peer-linked box does no D2H and its value stays 0), and the row-plan cudaStreamSynchronize
+    /// that brings the owned-row count back to the host.  last_prepare_calls() is how many prepare() calls were timed
+    /// (so a per-call mean is the sum over calls).  Every accessor is cheap and meaningful only under the gate: with the
+    /// flag off prepare() never writes them, so they keep the zero they were initialised to and these return 0.
+    double last_prepare_d2h_ms() const;
+    double last_prepare_sync_ms() const;
+    int64_t last_prepare_calls() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

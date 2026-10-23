@@ -26,6 +26,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,16 @@ namespace MMQ = strata::prefill::mmq;
 constexpr int kThreads = 256;
 
 inline unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b); }
+
+/// STRATA_Q36_PROMPT_TIMING=1: the opt-in measurement gate, the SAME exact-"1" parse q36_engine.cu's prompt probe
+/// makes.  Read once, so every flag-off run does no clock work here.  Only prepare()'s two blocking sections key off it.
+static bool prompt_timing() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_Q36_PROMPT_TIMING");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
 
 /// Switches the calling thread to `dev` and back.  The engine's own thread lives on the primary device, so every
 /// CUDA call that must run on the helper is inside one of these.
@@ -212,6 +223,13 @@ struct PeerPrefill36::Impl {
     bool prepared = false;
     int64_t n_owned = 0, max_rows = 0;
     int64_t rows = 0, launches = 0;
+
+    // STRATA_Q36_PROMPT_TIMING=1 (opt-in, measurement only - see q36_engine.cu's probe): the host-side serial cost
+    // prepare() adds, accumulated across the calls the engine made this run.  Written only under the gate, read via the
+    // accessors, so a flag-off run never touches none of these execute and the values stay their zero init.
+    double prep_d2h_ms = 0.0;   // the two blocking D2H copies of the host route (activations + routing)
+    double prep_sync_ms = 0.0;  // the row-plan cudaStreamSynchronize that brings rows/maxr back to the host
+    int64_t prep_calls = 0;
 };
 
 PeerPrefill36::PeerPrefill36() : impl_(new Impl()) {}
@@ -648,12 +666,19 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
     // are quiescent and there is nothing left for the copy to wait for.  It costs n_tok * (n_embd * 4 + k * 4) bytes
     // once per layer, and it buys the whole feature on a box whose two GPUs have no path between them.
     if (!m.p2p) {
+        // STRATA_Q36_PROMPT_TIMING=1: the two blocking device-to-host copies of the host route.  On a box with a
+        // working peer link this whole `if (!m.p2p)` block is skipped, so the probe does nothing there either;
+        // on a host-route box these two copies are the serial cost the prompt timing probe suspects, and they are
+        // counted separately from the row-plan sync below so each cost is visible.
+        const auto t_d2h = prompt_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         On onp(m.primary);   // the two source pointers are the primary's: the copies run on its device
         if (!ck(cudaMemcpy(m.h_x, h_primary, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
                            cudaMemcpyDeviceToHost), "stage activations through host", err) ||
             !ck(cudaMemcpy(m.h_ids, ids_primary, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost),
                 "stage routing through host", err))
             return false;
+        if (prompt_timing())
+            m.prep_d2h_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_d2h).count();
     }
 
     On on(m.device);
@@ -679,6 +704,7 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
     }
     if (m.n_pos == 0) {   // nothing resident for this layer: no entry can be owned, and no kernel has work to do
         m.prepared = true;
+        if (prompt_timing()) ++m.prep_calls;   // the D2H above (if !p2p) was still a timed call
         return true;
     }
     if (!ck(cudaMemcpyAsync(m.d_pos, m.pos_host.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
@@ -699,12 +725,19 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
     // and four small kernels.  Doing it here rather than in launch() is what keeps the hot call free of host
     // synchronisation.
     int32_t h_owned = 0, h_max = 0;
+    // STRATA_Q36_PROMPT_TIMING=1: the row-plan sync.  This is the ONLY place prepare() synchronises the helper's
+    // stream (bring the row count + widest expert back to the host, the two numbers MMQ's launch geometry needs).
+    // It overlaps the primary's MMQ launch on the linked route, but it is the one host-blocking point on the whole
+    // host route, so the probe counts it and the remainder the forward total leaves over it is the primary's time.
+    const auto t_sync = prompt_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (!ck(cudaMemcpyAsync(&h_owned, m.d_bounds + m.n_pos, sizeof(int32_t), cudaMemcpyDeviceToHost, m.stream),
             "read owned rows", err) ||
         !ck(cudaMemcpyAsync(&h_max, m.d_maxr, sizeof(int32_t), cudaMemcpyDeviceToHost, m.stream), "read widest expert",
             err) ||
         !ck(cudaStreamSynchronize(m.stream), "row plan", err))
         return false;
+    if (prompt_timing())
+        m.prep_sync_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sync).count();
     if (h_owned < 0 || h_owned > n_ent || h_max < 0) {
         err = "q36 peer prefill: the row plan produced an impossible entry count";
         return false;
@@ -712,6 +745,9 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
     m.n_owned = h_owned;
     m.max_rows = h_max;
     m.prepared = true;
+    // STRATA_Q36_PROMPT_TIMING=1: count a fully prepared layer.  The d2h/sync timers above are per-call accumulators,
+    // so a per-call mean is the sums over this many calls.  Off the gate nothing here runs (the two timers never move).
+    if (prompt_timing()) ++m.prep_calls;
     return true;
 }
 
@@ -839,5 +875,9 @@ bool PeerPrefill36::wait(cudaStream_t st_primary, std::string& err) {
 
 int64_t PeerPrefill36::rows() const { return impl_->rows; }
 int64_t PeerPrefill36::launches() const { return impl_->launches; }
+
+double PeerPrefill36::last_prepare_d2h_ms() const { return impl_->prep_d2h_ms; }
+double PeerPrefill36::last_prepare_sync_ms() const { return impl_->prep_sync_ms; }
+int64_t PeerPrefill36::last_prepare_calls() const { return impl_->prep_calls; }
 
 }  // namespace strata::qwen35
