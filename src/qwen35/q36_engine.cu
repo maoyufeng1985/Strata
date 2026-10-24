@@ -1966,9 +1966,10 @@ struct Engine {
         return on;
     }
     /// STRATA_Q36_PEER_KEEP_RESIDENT=1: measure how many routed entries of a layer hit the primary's own
-    /// VRAM slots - the share the "keep the resident experts off the helpers" shape would hand the primary,
-    /// which then multiplies them at sm_60's 2.2x fallback speed.  A throwaway gate like peer_f16's: with
-    /// the variable unset it is one getenv and the statements it guards never run.
+    /// VRAM slots (the share, as a number, not a guess).  A throwaway gate like peer_f16's: with the
+    /// variable unset it is one getenv and the statements it guards never run.  The keep-resident shape
+    /// ITSELF (whether the helpers hold the primary's slots) is NOT this gate - that is open_helpers'
+    /// own off-test (STRATA_Q36_PEER_KEEP_RESIDENT=0 turns the filter off, the default is on).
     static bool keep_resident() {
         static const bool on = [] {
             const char* v = std::getenv("STRATA_Q36_PEER_KEEP_RESIDENT");
@@ -6289,14 +6290,19 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
     // for - nothing breaks, the per-entry mask separates them at run time.
     strata::core::ExpertCache empty_primary;
     if (!empty_primary.open(1, 1, 1, 4096, err)) { err = "helper: " + err; return false; }
-    // STRATA_Q36_PEER_KEEP_RESIDENT=1: the helpers keep the primary's resident experts OFF.  Instead of standing up
-    // a fake primary cache (an open_sized cache's n_layers * n_expert residency table is GiB-sized and would not fit
-    // on the card that is the primary), the filter is applied where the ranked list is built: an expert the primary
-    // holds a VRAM slot for is dropped from every helper's `ranked`, so open() never offers it and the helper never
-    // holds it.  open() still gets the empty primary cache, whose slot_of < 0 test admits every pair it is offered -
-    // and it is offered only the pairs the primary does NOT hold.  Off by default: with the variable unset the
-    // ranked lists are exactly what they were and a default run is byte-for-byte what it was.
-    const bool keep_resident_on = Engine::keep_resident() && E.main_hybrid;
+    // STRATA_Q36_PEER_KEEP_RESIDENT: keep the primary's own VRAM slots off the helpers - the experts the primary
+    // holds a slot for (slot_of[e] >= 0) are dropped from every helper's `ranked`, so the helper never holds them
+    // and the primary's MMQ / local path computes them instead.  It is the DEFAULT shape (the primary keeps its
+    // slots empty of experts, freeing their VRAM); STRATA_Q36_PEER_KEEP_RESIDENT=0 turns it off, restoring the
+    // "helper takes every expert the primary also holds" shape (the encoding-fix baseline, the primary's slots
+    // occupied, 39/layer of weights staged D2D for nothing).  Exact-"0" parse; anything else - including unset -
+    // leaves the keep-resident filter on.  Off by the variable, the ranked lists are exactly what they were before
+    // this flag and a run with it off is byte-for-byte the encoding-fix shape.
+    const bool keep_resident_off = [] {
+        const char* v = std::getenv("STRATA_Q36_PEER_KEEP_RESIDENT");
+        return v != nullptr && v[0] == '0';
+    }();
+    const bool keep_resident_on = !keep_resident_off && E.main_hybrid;
     const auto filter_resident = [&](std::vector<std::pair<int32_t, int32_t>>& ranked) {
         if (!keep_resident_on) return;
         std::erase_if(ranked, [&](const std::pair<int32_t, int32_t>& pe) {
@@ -6342,7 +6348,7 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
             tiers.push_back(std::move(t));
         }
     }
-    for (Tier& t : tiers) filter_resident(t.ranked);   // STRATA_Q36_PEER_KEEP_RESIDENT=1: the primary's slots out
+    for (Tier& t : tiers) filter_resident(t.ranked);   // keep-resident: the primary's slots out (off only with =0)
     for (const Tier& tier : tiers) {
         const int r = tier.r, device = tier.device;
         double free_gib = 0.0;
