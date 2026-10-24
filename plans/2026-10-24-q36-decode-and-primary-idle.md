@@ -105,7 +105,12 @@ decode 的瓶颈**不在 helper 的算力**，在：
 
 ## 4. 待做（按优先级）
 
-- [ ] **提议①的落点**：helper 不接主卡常驻的 39 个专家 → 主卡算它们。实测 pp512 与 tg。
+- [x] **提议①的落点**：helper 不接主卡常驻的 39 个专家 → 主卡算它们。实测（2026-10-24，
+      `bin/strata-q36.keep8`，见 `plans/2026-10-24-q36-primary-resident-peers.md` §3b）：
+      **prompt 持平（461.6→461.8），decode 掉 12.5%（51.8→45.3 tok/s）—— 不合并。**
+      把最热专家从最快卡（helper sm_61 真 `__dp4a`）挪到最慢卡（主卡 sm_60 2.2× 回退）是净负收益。
+      旗标 `STRATA_Q36_PEER_KEEP_RESIDENT=1` 保持 opt-in、默认关；**主卡留 0 专家（编码修复后的现状）
+      是这台盒子的最优解**。
 - [ ] **decode 的 6.258 ms 同步**：每层每 token 一次 `cudaStreamSynchronize(st)`，
       看能不能不每次都排空主卡的整条流（`moe_helpers` 的注释里说：改成只等那两条 D2H，
       实测 5.4 → 5.7 ms/token，**更慢**，所以被删了）—— 那条路已证实是死路，得换别的。
