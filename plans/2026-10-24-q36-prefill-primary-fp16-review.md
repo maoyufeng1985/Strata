@@ -45,17 +45,52 @@ blk.0.ffn_up_exps.weight     type 12  dims [2048, 512, 256]   <- Q4_K
 blk.0.ffn_down_exps.weight   type 13  dims [ 512, 2048, 256]  <- Q5_K
 ```
 
-`q36_engine.cu:1468-1473` 的 `native_expert_layout` 把这两个类型算成每专家
-`L.bytes`（gate+up+down 三个量化矩阵），`L.blobs` 是 `uint8_t*`（`:1244`）。
-**主卡算专家走 `moe_mmq.cu` 的 int8 MMQ**（`q36_engine.cu:2375-2382` 的 `use_mmq`），
-helper 走 `remote_experts.cpp` 的 native grouped kernel —— 两条路都是**边读边反量化**
-（on-the-fly dequant），不是「先反量化成 FP16 再 GEMM」。
+### 2a. 反量化路径（复核，2026-10-24，两条独立复核 + 代码核对）
 
-所以：**主卡的 18.7 TFLOP/s FP16 算力在这条专家路径上根本没被用到，
-而且用不上**——权重是 4-bit/5-bit 量化数据，要吃 FP16 得先反量化，那比直接算还贵。
-`q36_engine.cu:3122` 的 `K::mm` FP16 分支是给 dense 投影（attention / shared expert）用的。
+**结论：两条路都是「边读边反量化」（on-the-fly dequant），算术是 int8 的 `STRATA_DP4A`，
+没有一条路把专家权重展开成 FP16 再做 GEMM。**
+
+| | 主卡 | helper |
+|---|---|---|
+| 路径 | `moe_mmq.cu` 的 `Context::run`（`:417`）→ llama.cpp 的 `mul_mat_q_case` | `remote_experts.cpp:553` → `native_expert_grouped`（`iq_kernels.cu:5050`） |
+| 权重怎么读 | 直接读 K-quant 块 | 直接读 K-quant 块 |
+| 反量化时机 | **on-the-fly**：dot 的内循环里解 4-bit/5-bit | 同 |
+| 有没有 FP16 临时 buffer | **没有** | **没有** |
+| 激活精度 | q8_1（8-bit + fp16 scale），device 端 `native_quantize_q8_1_kernel` 量化 | 同 |
+| 算术 | `STRATA_DP4A`（sm_60 走 4×vmad 回退） | `STRATA_DP4A`（sm_61 是真 `__dp4a`） |
+| 累加 | int32 → 乘 block scale → float | 同 |
+
+`q36_engine.cu:3122` 的 `K::mm` FP16 分支是给 **dense 投影**（attention / shared expert）用的，
+不是专家。`moe_mmq.cu` 的 `nvfp4_mode` 里虽然有 FP16 选项，但 Q4_K/Q5_K 走的是
+`STRATA_MMQ_KQUANTS` 的 K-quant MMQ 路径，**不进 FP16**。
+
+**所以：主卡的 18.7 TFLOP/s FP16 算力在这条专家路径上根本没被用到，
+而且用不上**——权重是 4-bit/5-bit 量化数据，要吃 FP16 得先反量化成 FP16 权重
+（每专家 1.81 MiB → 3.75 MiB，且多一遍转换），比直接算还贵。
+
+### 2b. 每专家的权重字节（算式）
+
+```
+Q4_K 行字节 = (n_embd/256) × 144 = (2048/256) × 144 = 1152
+Q5_K 行字节 = (n_ff/256)   × 176 = (512/256)  × 176 =  352
+gate + up = 2 × n_ff × 1152 = 1,179,648 B
+down      = n_embd × 352    =   720,896 B
+每专家合计 = 1,900,544 B = 1.8125 MiB
+```
 
 模型形状（gguf kv）：`n_embd=2048`、`expert_ff=512`、256 专家/层、41 层、`top_k=8`。
+
+### 2c. 一条要澄清的：MAXT=8 不限制 prompt 阶段
+
+`strata::kernels::cpu::MAXT = 8` 约束的是 **decode 的 `RemoteExperts::begin()` 窗口**
+（`q36_engine.cu:3151`、`:3277`：只有 `T ≤ MAXT` 的小窗口才走那条路）。
+**prompt 的大窗口走的是 `STRATA_Q36_PREFILL_PEERS` 的 `PeerPrefill36` 路径**
+（`q36_peer_prefill.cu`），它**不受 MAXT 限制** —— 远端日志
+「3 helper(s) serve prompt chunks (8680 experts held by helpers, 40 layers served…)」
+和实测 `helper_wait` 13.29 ms/层都证明 helper 在 prompt 阶段确实在算。
+（旧文档里「T=512>MAXT=8 所以 prompt 阶段 helper 专家全闲置」是**旧模型时代**的结论，
+对现在的 K-quant + peer prefill 路径**不成立**。）
+
 
 ## 3. 「prefill 用 helper 的 DP4A」—— 已经在用
 
@@ -137,13 +172,20 @@ peer access is not supported between these two devices)`。所以下腿是
 
 ## 6. 那「主卡多算专家」这条路的账
 
-主卡算 X 个专家/层要 H2D `1.83 MiB × X`（一个专家的量化权重：gate+up 各
-2048×512 的 Q4_K + down 512×2048 的 Q5_K，合计 ≈ 1.83 MiB）。
+主卡算 X 个专家/层要 H2D `1.8125 MiB × X`（一个专家的量化权重，算式见下）。
 
-- **可行性上界**（H2D 不超过 helper_wait 13.3 ms）：`1.83N / 6000 ≤ 13.3` → **N ≤ 43**。
-- **盈利上界**：主卡每多算 1 个专家，H2D 成本 = 1.83 MiB / 6.07 GB/s = **316 µs**；
-  而 helper 算 1 个专家省下的时间 = 13.3 ms / 10240 专家 ≈ **1.3 µs**。
-  **差 240 倍。** H2D 字节按专家数、不按行数，主卡每多算 1 个专家就白搬 1.83 MiB。
+```
+Q4_K 行字节 = (n_embd/256) × 144 = (2048/256) × 144 = 1152
+Q5_K 行字节 = (n_ff/256)   × 176 = (512/256)  × 176 =  352
+gate + up = 2 × n_ff × 1152 = 1,179,648 B
+down      = n_embd × 352    =   720,896 B
+每专家合计 = 1,900,544 B = 1.8125 MiB
+```
+
+- **可行性上界**（H2D 不超过 helper_wait 13.29 ms）：`1.8125N / 6070 ≤ 13.29` → **N ≤ 42**。
+- **盈利上界**：主卡每多算 1 个专家，H2D 成本 = 1.8125 MiB / 6.07 GB/s = **313 µs**；
+  而 helper 算 1 个专家省下的时间 = 13.29 ms / 10240 专家 ≈ **1.30 µs**。
+  **差 241 倍。** H2D 字节按专家数、不按行数，主卡每多算 1 个专家就白搬 1.81 MiB。
 
 **结论：净收益 ≈ 0 或负。** keep-resident 的 39 个（D2D，0 PCIe）已是主卡能吃的上限。
 
