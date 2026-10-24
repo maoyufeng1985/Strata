@@ -7,14 +7,34 @@
 
 | 卡 | 架构 | compute cap | `__dp4a` |
 |---|---|---|---|
-| 主卡 Tesla P100-12GB | GP100 | **6.0** | **没有** → 走 `dp4a.hpp` 的 4×vmad 回退（实测慢 2.2×） |
+| 主卡 Tesla P100-12GB | GP100 | **6.0** | **没有** → 走 `dp4a.hpp` 的 4×vmad 回退 |
 | 3× P104-100 | GP104 | **6.1** | **有真硬件指令** |
 
 远端 `CMAKE_CUDA_ARCHITECTURES=60;61` —— 同一份源码为两张卡编两份，
 **helper 跑的是有 `__dp4a` 的那份，主卡跑的是回退的那份**。
 
+**「回退比真 dp4a 慢多少」——MEASURED（2026-10-24，远端，`tools/sm60_dp4a_check.cu`）**：
+
+| 卡 | 字节循环（朴素参考） | `STRATA_DP4A` | 说明 |
+|---|---|---|---|
+| P100 (sm_60) | 98.2 ms | **41.9 ms** | 4×vmad 回退，比字节循环快 2.35× |
+| P104 (sm_61) | 18.1 ms | **18.1 ms** | 真 `__dp4a` |
+
+**真 `__dp4a` 比 4×vmad 回退快 41.9 / 18.1 = 2.31×。**
+（两卡各跑 1.07e9 组用例，mismatches = 0，两边都 bit-exact。）
+
+**注意这个数的出处**：`include/strata/kernels/dp4a.hpp:31` 的注释写的是
+「~2.2x faster in isolation on a Tesla P100」，**那说的是回退比朴素字节循环快 2.2×，
+不是「比真 dp4a 慢 2.2×」** —— 本文档早先把这句话读反了，数字对但依据错。
+上表的 2.31× 才是同基准下的直接对比。
+
+**范围限制**：2.31× 是**纯 dot 内循环**的差距。整条 expert kernel 里还有别的开销
+（取权重、解 scale、访存），所以**整条 kernel 的差距会小于 2.31×**。
+「主卡比 helper 慢 2.2×」这句在整条 kernel 层面是**未实测的推算**。
+
 所以「helper 是不是充分利用了 DP4A」这个问题的答案是：**helper 已经在用它能用的最快指令了**，
-问题不在 helper 侧，在**主卡侧**（它比 helper 慢 2.2×），以及**主卡和 helper 的负载分配**。
+问题不在 helper 侧，在**主卡侧**（它的 dot 比 helper 慢 2.31×，MEASURED），
+以及**主卡和 helper 的负载分配**。
 
 ## 1. decode 的分解（MEASURED）
 
@@ -100,7 +120,8 @@ primary_work 8.205 | helper_wait 6.595 | combine 0.234 | post 0.018
 decode 的瓶颈**不在 helper 的算力**，在：
 
 1. **主卡那 6.258 ms/token 的 host 同步**（32%）；
-2. **主卡自己的 sm_60 回退**（比 helper 慢 2.2×）；
+2. **主卡自己的 sm_60 回退**（dot 比 helper 慢 2.31×，MEASURED，见 §0；
+   整条 kernel 的差距未实测）；
 3. helper 的负载不均：CUDA3 的 `ms_wait` 0.751 是 CUDA1 的 0.233 的 **3.2 倍**。
 
 ## 4. 待做（按优先级）
@@ -108,7 +129,7 @@ decode 的瓶颈**不在 helper 的算力**，在：
 - [x] **提议①的落点**：helper 不接主卡常驻的 39 个专家 → 主卡算它们。实测（2026-10-24，
       `bin/strata-q36.keep8`，见 `plans/2026-10-24-q36-primary-resident-peers.md` §3b）：
       **prompt 持平（461.6→461.8），decode 掉 12.5%（51.8→45.3 tok/s）—— 不合并。**
-      把最热专家从最快卡（helper sm_61 真 `__dp4a`）挪到最慢卡（主卡 sm_60 2.2× 回退）是净负收益。
+      把最热专家从最快卡（helper sm_61 真 `__dp4a`）挪到最慢卡（主卡 sm_60 的 vmad 回退）是净负收益。
       旗标 `STRATA_Q36_PEER_KEEP_RESIDENT=1` 保持 opt-in、默认关；**主卡留 0 专家（编码修复后的现状）
       是这台盒子的最优解**。
 - [ ] **decode 的 6.258 ms 同步**：每层每 token 一次 `cudaStreamSynchronize(st)`，
