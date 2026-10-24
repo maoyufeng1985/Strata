@@ -79,6 +79,19 @@ __device__ __forceinline__ __half2 code2half2(uint32_t two, float d) {
     return __floats2half2_rn((float) a * d, (float) b * d);
 }
 
+/// The lane's 8 values of one 64-value block of an int8 activation row (64 codes, then
+/// {d0,d1,sum0,sum1}: d0 for the values 0..31, d1 for 32..63), as FP16.
+__device__ __forceinline__ void stage_block(const uint8_t* a, int j4, __half2 v[4]) {
+    const uint32_t cl = ldg32(a + j4);
+    const uint32_t ch = ldg32(a + 32 + j4);
+    const float d0 = *(const float*) (a + 64);
+    const float d1 = *(const float*) (a + 68);
+    v[0] = code2half2(cl, d0);
+    v[1] = code2half2(cl >> 16, d0);
+    v[2] = code2half2(ch, d1);
+    v[3] = code2half2(ch >> 16, d1);
+}
+
 /// The lane's 8 values of one superblock of one weight row, dequantized.
 ///
 /// `wp` the block's start, `c64` the 64-value group (0..3), `j4` the lane's first byte
@@ -142,6 +155,8 @@ __global__ __launch_bounds__(THREADS) void gate_up_fp16(const Batch b, const int
     const int c64 = lane >> 3;             // the 64-value group inside the superblock
     const int j4 = (lane & 7) * 4;         // this lane's 4 bytes in the group
 
+    const int ntile = ts[b.e1] - ts[b.e0];       // the batch's tiles (on the device: the grid's y is an upper bound)
+    if (blockIdx.y >= ntile) return;
     const int2 tl = tiles[ts[b.e0] + blockIdx.y];
     const int e = tl.x, row0 = tl.y;
     const int nrows = min(64, off[e + 1] - row0);
@@ -179,15 +194,8 @@ __global__ __launch_bounds__(THREADS) void gate_up_fp16(const Batch b, const int
             if (r >= RWB) break;
             const int row = min(rbase + r, last);
             const uint8_t* a = act + (size_t) src[row] * act_row + (size_t) (b * 4 + c64) * AB;
-            const uint32_t cl = ldg32(a + j4);
-            const uint32_t ch = ldg32(a + 32 + j4);
-            const float d0 = *(const float*) (a + 64);
-            const float d1 = *(const float*) (a + 68);
             __half2 v[4];
-            v[0] = code2half2(cl, d0);
-            v[1] = code2half2(cl >> 16, d0);
-            v[2] = code2half2(ch, d1);
-            v[3] = code2half2(ch >> 16, d1);
+            stage_block(a, j4, v);
             *(uint2*) &sx[r][64 * c64 + j4]      = *(const uint2*) &v[0];
             *(uint2*) &sx[r][64 * c64 + 32 + j4] = *(const uint2*) &v[2];
         }
@@ -281,4 +289,103 @@ __global__ __launch_bounds__(THREADS) void gate_up_fp16(const Batch b, const int
     }
 }
 
+/// The fused FP16 down projection: the H (int8, the activation layout) and the K-quant weights
+/// -> the routed rows' FP32 outputs.
+///
+/// The H's rows are the routed rows (one per routed row, in the tiles' order), so no token map is
+/// needed here.  The block covers RWB rows x (WARPS * 8) output columns; the K dimension is the
+/// H's width (n_in).
+template <int QT>
+__global__ __launch_bounds__(THREADS) void down_fp16(const Batch b, const int32_t* __restrict__ ts,
+                                                     const int2* __restrict__ tiles,
+                                                     const int32_t* __restrict__ off,
+                                                     const uint8_t* __restrict__ h,
+                                                     float* __restrict__ out, int n_out, int n_in,
+                                                     size_t d_row, size_t down_off) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int c64 = lane >> 3;             // the 64-value group inside the superblock
+    const int j4 = (lane & 7) * 4;         // this lane's 4 bytes in the group
+
+    const int ntile = ts[b.e1] - ts[b.e0];       // the batch's tiles (on the device: the grid's y is an upper bound)
+    if (blockIdx.y >= ntile) return;
+    const int2 tl = tiles[ts[b.e0] + blockIdx.y];
+    const int e = tl.x, row0 = tl.y;
+    const int nrows = min(64, off[e + 1] - row0);
+    const int rbase = row0 + blockIdx.z * RWB;
+    if (rbase >= row0 + nrows) return;
+
+    const uint8_t* blob = b.blob[e - b.e0] + down_off;
+    const int col0 = blockIdx.x * (WARPS * 8);       // the first output column
+    const int wcol = col0 + warp * 8;                // the first of the warp's 8 weight rows
+
+    const size_t h_row = (size_t) (n_in / 64) * AB;  // the H's bytes per row
+    const int nblk = n_in / QK;
+    const int last = row0 + nrows - 1;
+
+    __shared__ __half sx[RWB][QK];       // the staged H row (FP16)
+
+    __half2 acc[RWB][8];
+#pragma unroll
+    for (int r = 0; r < RWB; ++r)
+#pragma unroll
+        for (int c = 0; c < 8; ++c) acc[r][c] = __float2half2_rn(0.f);
+
+    for (int b = 0; b < nblk; ++b) {
+        __syncthreads();
+        // ---- stage this warp's two H rows as FP16 ----
+#pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+            const int r = warp * 2 + rr;
+            if (r >= RWB) break;
+            const int row = min(rbase + r, last);
+            const uint8_t* a = h + (size_t) row * h_row + (size_t) (b * 4 + c64) * AB;
+            __half2 v[4];
+            stage_block(a, j4, v);
+            *(uint2*) &sx[r][64 * c64 + j4]      = *(const uint2*) &v[0];
+            *(uint2*) &sx[r][64 * c64 + 32 + j4] = *(const uint2*) &v[2];
+        }
+        __syncthreads();
+
+        // ---- dequantize the warp's 8 weight rows for this superblock ----
+        __half2 wq[8][4];
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const uint8_t* wp = blob + (size_t) (wcol + c) * d_row + (size_t) b * blk_bytes(QT);
+            dequant_block<QT>(wp, c64, j4, wq[c]);
+        }
+
+        // ---- FMA ----
+#pragma unroll
+        for (int r = 0; r < RWB; ++r) {
+            const __half2* sl = (const __half2*) &sx[r][64 * c64 + j4];
+            const __half2* su = (const __half2*) &sx[r][64 * c64 + 32 + j4];
+#pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                acc[r][c] = __hfma2(wq[c][0], sl[0], acc[r][c]);
+                acc[r][c] = __hfma2(wq[c][1], sl[1], acc[r][c]);
+                acc[r][c] = __hfma2(wq[c][2], su[0], acc[r][c]);
+                acc[r][c] = __hfma2(wq[c][3], su[1], acc[r][c]);
+            }
+        }
+    }
+
+    // ---- reduce the 32 lanes and write the rows ----
+    const int col = col0 + warp * 8;
+#pragma unroll
+    for (int r = 0; r < RWB; ++r) {
+        const int row = rbase + r;
+        if (row > last) break;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            __half2 p = acc[r][c];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) p = __hadd2(p, __shfl_xor_sync(0xffffffffu, p, off));
+            const float2 t = __half22float2(p);
+            if (lane == 0) out[(size_t) row * n_out + col + c] = t.x + t.y;
+        }
+    }
+}
+
 }  // namespace strata::prefill::fused::f16kqc
+
