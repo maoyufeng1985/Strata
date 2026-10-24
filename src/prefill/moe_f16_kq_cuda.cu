@@ -61,17 +61,23 @@ void gate_up(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2*
     }
 }
 
-bool covers_down(int d_type) {
-    (void) d_type;
-    return false;   // the Q5_K down is not here yet
-}
+bool covers_down(int d_type) { return d_type == GGML_TYPE_Q5_K; }
 
 void down(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off, int64_t n,
           int n_expert, int64_t work_bound, const uint8_t* h, float* dm, cudaStream_t s) {
-    (void) b; (void) g; (void) ts; (void) tiles; (void) off; (void) n; (void) n_expert; (void) work_bound; (void) h;
-    (void) dm; (void) s;
-    std::fprintf(stderr, "moe_f16_kq_cuda: the down projection has no CUDA kernel yet\n");
-    std::exit(1);
+    (void) n; (void) n_expert;
+    const int n_out = (int) g.n_embd, n_in = (int) g.n_ff;
+    if (b.e1 <= b.e0 || n_out <= 0 || n_in <= 0 || work_bound <= 0) return;
+    // one block per (8 warps x 8 output columns, tile, 16 rows); the tile has at most kTileRows rows
+    const dim3 grid((n_out + f16kqc::WARPS * 8 - 1) / (f16kqc::WARPS * 8), (unsigned) work_bound,
+                    kTileRows / f16kqc::RWB);
+    f16kqc::down_fp16<GGML_TYPE_Q5_K><<<grid, f16kqc::THREADS, 0, s>>>(b, ts, tiles, off, h, dm, n_out, n_in, g.d_row,
+                                                                       g.down_off);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "moe_f16_kq_cuda: the down launch failed: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
 }
 
 }  // namespace strata::prefill::fused::f16kq
