@@ -24,6 +24,7 @@ struct NativeGeom {
     int gu_type = -1, d_type = -1;    ///< ggml types
     size_t gu_row = 0, d_row = 0;     ///< bytes per gate/up row and per down row
     size_t up_off = 0, down_off = 0;  ///< inside the blob
+    int64_t n_embd = 0, n_ff = 0;     ///< the layer's widths (the gfx11 kernels hard-code 2560/640)
 };
 
 /// enabled() (STRATA_PF_FUSED=1 on sm_80+), and the kernels cover this gate/up and down pair on this device.

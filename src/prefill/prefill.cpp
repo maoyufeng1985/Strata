@@ -4291,7 +4291,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             pt.mark(kPfGemmGU, cs);
                             if (fused_nat) {
                                 const auto& f = lay.fmt[(size_t) l];
-                                const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                                const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off,
+                                                         f.n_embd, f.n_ff};
                                 if (wb) {
                                     wb->e0 = b.e0;
                                     wb->e1 = b.e1;

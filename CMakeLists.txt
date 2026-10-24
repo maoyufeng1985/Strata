@@ -2091,6 +2091,7 @@ if(STRATA_NATIVE_EXPERTS)
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+                src/prefill/moe_f16_kq_cuda.cu
                 src/prefill/mmq_nvfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_quantize_cu})
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
@@ -2270,6 +2271,12 @@ if(STRATA_NATIVE_EXPERTS)
       set_tests_properties(prefill_fused_iq_test_f16 PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_F16=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
       add_test(NAME prefill_fused_iq_test_ws COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test_ws PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_WS=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # the fused FP16 K-quant prompt experts on CUDA (moe_f16_kq_cuda.cu): the gate/up of a Q4_K expert against
+      # a double-precision reference (the weights value by value against ggml's dequantize_row_q4_K)
+      add_executable(prefill_f16_kq_cuda_test tests/cuda/prefill_f16_kq_cuda_test.cu)
+      target_link_libraries(prefill_f16_kq_cuda_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_f16_kq_cuda_test COMMAND prefill_f16_kq_cuda_test)
+      set_tests_properties(prefill_f16_kq_cuda_test PROPERTIES TIMEOUT 300)
       # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
       # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
       add_executable(prefill_mmq_scatter_test tests/cuda/prefill_mmq_scatter_test.cpp)
@@ -2354,6 +2361,7 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
     # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
     set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
+                                src/prefill/moe_f16_kq_cuda.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
