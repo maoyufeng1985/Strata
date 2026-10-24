@@ -38,7 +38,7 @@ constexpr int AB = 80;          ///< activation bytes per 64 values: 64 codes, {
 constexpr int QK = 256;         ///< a K-quant superblock
 constexpr int RWB = 16;         ///< routed rows per block
 constexpr int WIB = 32;         ///< output indices per block (WIB gate rows + WIB up rows)
-constexpr int WARPS = 8;        ///< warps per block, 8 weight rows each
+constexpr int WARPS = 16;       ///< warps per block, 4 weight rows each
 constexpr int THREADS = 32 * WARPS;
 constexpr int Q4_BLK = 144, Q5_BLK = 176;
 
@@ -54,13 +54,21 @@ __device__ __forceinline__ uint4 ldg128(const void* p) {
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p) : "memory"); return v;
 }
 
+/// The block's scale byte with the index k (0..11): the 12 bytes sit in the header word h.y (0..3),
+/// h.z (4..7) and h.w (8..11).  A select and a shift, not an array: the index depends on the lane's
+/// group inside the superblock, so an array with that index would live in local memory and every
+/// read of it would be a local load.
+__device__ __forceinline__ uint8_t sc_byte(const uint4& h, int k) {
+    const uint32_t w = k < 4 ? h.y : (k < 8 ? h.z : h.w);
+    return (uint8_t) (w >> (8 * (k & 3)));
+}
+
 /// ggml's get_scale_min_k4, branchless: the branch on j<4 is taken by lanes 0..15 and
-/// not by 16..31 of the same warp (c64 = lane>>3), so the warp ran both paths.  `q` points
-/// into a 16-byte array with the 12 scale bytes at q[0..11], so q[j-4] is always readable.
-__device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
-    const uint8_t a0 = q[j];
-    const uint8_t a1 = q[j + 4];
-    const uint8_t a3 = q[j - 4];
+/// not by 16..31 of the same warp (c64 = lane>>3), so the warp ran both paths.
+__device__ __forceinline__ void get_scale_min_k4(const uint4& h, int j, uint8_t* d, uint8_t* m) {
+    const uint8_t a0 = sc_byte(h, j);
+    const uint8_t a1 = sc_byte(h, j + 4);
+    const uint8_t a3 = j >= 4 ? sc_byte(h, j - 4) : 0;   // only read when j >= 4
     const bool hi = (j >= 4);
     *d = hi ? (uint8_t) ((a1 & 0xF) | ((a3 >> 6) << 4)) : (uint8_t) (a0 & 63);
     *m = hi ? (uint8_t) ((a1 >>  4) | ((a0 >> 6) << 4)) : (uint8_t) (a1 & 63);
@@ -92,6 +100,17 @@ __device__ __forceinline__ void stage_block(const uint8_t* a, int j4, __half2 v[
     v[3] = code2half2(ch >> 16, d1);
 }
 
+/// The raw codes and scales of one 64-value block, in registers: the staged row without the
+/// conversion to FP16.  The prefetch uses it: the codes of the next superblock are read a
+/// superblock ahead, so their latency hides under the FMA instead of standing exposed at the
+/// barrier (one block per SM, so nothing else can fill the gap).
+__device__ __forceinline__ void load_block(const uint8_t* a, int j4, uint32_t& cl, uint32_t& ch, float& d0, float& d1) {
+    cl = ldg32(a + j4);
+    ch = ldg32(a + 32 + j4);
+    d0 = *(const float*) (a + 64);
+    d1 = *(const float*) (a + 68);
+}
+
 /// The lane's 8 values of one superblock of one weight row, dequantized.
 ///
 /// `wp` the block's start, `c64` the 64-value group (0..3), `j4` the lane's first byte
@@ -104,16 +123,9 @@ __device__ __forceinline__ void dequant_block(const uint8_t* __restrict__ wp, in
     const uint4 h = ldg128(wp);
     const __half d = __ushort_as_half((unsigned short) (h.x & 0xFFFFu));
     const __half dmin = __ushort_as_half((unsigned short) (h.x >> 16));
-    uint8_t sc[16] = {};
-    sc[4] = (uint8_t) h.y;         sc[5] = (uint8_t) (h.y >> 8);
-    sc[6] = (uint8_t) (h.y >> 16); sc[7] = (uint8_t) (h.y >> 24);
-    sc[8] = (uint8_t) h.z;         sc[9] = (uint8_t) (h.z >> 8);
-    sc[10] = (uint8_t) (h.z >> 16); sc[11] = (uint8_t) (h.z >> 24);
-    sc[12] = (uint8_t) h.w;        sc[13] = (uint8_t) (h.w >> 8);
-    sc[14] = (uint8_t) (h.w >> 16); sc[15] = (uint8_t) (h.w >> 24);
     uint8_t s0, m0, s1, m1;
-    get_scale_min_k4(2 * c64, sc + 4, &s0, &m0);
-    get_scale_min_k4(2 * c64 + 1, sc + 4, &s1, &m1);
+    get_scale_min_k4(h, 2 * c64, &s0, &m0);
+    get_scale_min_k4(h, 2 * c64 + 1, &s1, &m1);
     const float df = __half2float(d), dmf = __half2float(dmin);
     const __half2 ds0 = __floats2half2_rn(df * (float) s0, df * (float) s0);
     const __half2 ds1 = __floats2half2_rn(df * (float) s1, df * (float) s1);
@@ -165,8 +177,8 @@ __global__ __launch_bounds__(THREADS) void gate_up_fp16(const Batch b, const int
 
     const uint8_t* blob = b.blob[e - b.e0];
     const int col0 = blockIdx.x * WIB;                 // the first output index
-    const bool up = warp >= 4;                          // this warp's rows are the up rows
-    const int wcol = col0 + (warp & 3) * 8;             // the first of the warp's 8 weight rows
+    const bool up = warp >= 8;                          // this warp's rows are the up rows
+    const int wcol = col0 + (warp & 7) * 4;             // the first of the warp's 4 weight rows
     const uint8_t* wbase = blob + (up ? up_off : 0);
 
     const size_t act_row = (size_t) (n_embd / 64) * AB;
@@ -174,37 +186,52 @@ __global__ __launch_bounds__(THREADS) void gate_up_fp16(const Batch b, const int
     const int last = row0 + nrows - 1;                  // the rows past the tile's end repeat its last one
 
     __shared__ __half sx[RWB][QK];       // the staged activation (FP16)
-    __shared__ float shg[RWB][WIB];       // the gate results (then the SwiGLU results)
+    __shared__ float shg[RWB][WIB];       // the gate results
     __shared__ float shu[RWB][WIB];       // the up results
-    __shared__ float sham[RWB];           // the H block's scale, per row
-    __shared__ int shsum[RWB][4];         // the codes' sums, per row and per warp
 
-    __half2 acc[RWB][8];
+    __half2 acc[RWB][4];
 #pragma unroll
     for (int r = 0; r < RWB; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) acc[r][c] = __float2half2_rn(0.f);
+        for (int c = 0; c < 4; ++c) acc[r][c] = __float2half2_rn(0.f);
+
+    // The activation row this warp stages and its address: the row (and with it the token the map
+    // gives) does not change with the superblock, so the map is read once.  The codes of the next
+    // superblock are prefetched into registers.
+    const uint8_t* pa;
+    {
+        const int r = warp;
+        const int row = (r < RWB) ? min(rbase + r, last) : 0;
+        pa = act + (size_t) src[row] * act_row;
+    }
+    uint32_t p_cl, p_ch;
+    float p_d0, p_d1;
+    load_block(pa + (size_t) c64 * AB, j4, p_cl, p_ch, p_d0, p_d1);
 
     for (int b = 0; b < nblk; ++b) {
         __syncthreads();
-        // ---- stage this warp's two activation rows as FP16 ----
-#pragma unroll
-        for (int rr = 0; rr < 2; ++rr) {
-            const int r = warp * 2 + rr;
-            if (r >= RWB) break;
-            const int row = min(rbase + r, last);
-            const uint8_t* a = act + (size_t) src[row] * act_row + (size_t) (b * 4 + c64) * AB;
-            __half2 v[4];
-            stage_block(a, j4, v);
-            *(uint2*) &sx[r][64 * c64 + j4]      = *(const uint2*) &v[0];
-            *(uint2*) &sx[r][64 * c64 + 32 + j4] = *(const uint2*) &v[2];
+        // ---- stage this warp's activation row as FP16 (from the prefetched codes) ----
+        {
+            const int r = warp;
+            if (r < RWB) {
+                __half2 v[4];
+                v[0] = code2half2(p_cl, p_d0);
+                v[1] = code2half2(p_cl >> 16, p_d0);
+                v[2] = code2half2(p_ch, p_d1);
+                v[3] = code2half2(p_ch >> 16, p_d1);
+                *(uint2*) &sx[r][64 * c64 + j4]      = *(const uint2*) &v[0];
+                *(uint2*) &sx[r][64 * c64 + 32 + j4] = *(const uint2*) &v[2];
+            }
         }
         __syncthreads();
+        // ---- prefetch the next superblock's codes: the loads are issued here and their latency
+        //      hides under the FMA below, instead of standing exposed at the barrier ----
+        if (b + 1 < nblk) load_block(pa + (size_t) ((b + 1) * 4 + c64) * AB, j4, p_cl, p_ch, p_d0, p_d1);
 
         // ---- dequantize the warp's 8 weight rows for this superblock ----
-        __half2 wq[8][4];
+        __half2 wq[4][4];
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < 4; ++c) {
             const uint8_t* wp = wbase + (size_t) (wcol + c) * gu_row + (size_t) b * blk_bytes(QT);
             dequant_block<QT>(wp, c64, j4, wq[c]);
         }
@@ -215,7 +242,7 @@ __global__ __launch_bounds__(THREADS) void gate_up_fp16(const Batch b, const int
             const __half2* sl = (const __half2*) &sx[r][64 * c64 + j4];
             const __half2* su = (const __half2*) &sx[r][64 * c64 + 32 + j4];
 #pragma unroll
-            for (int c = 0; c < 8; ++c) {
+            for (int c = 0; c < 4; ++c) {
                 acc[r][c] = __hfma2(wq[c][0], sl[0], acc[r][c]);
                 acc[r][c] = __hfma2(wq[c][1], sl[1], acc[r][c]);
                 acc[r][c] = __hfma2(wq[c][2], su[0], acc[r][c]);
@@ -228,63 +255,47 @@ __global__ __launch_bounds__(THREADS) void gate_up_fp16(const Batch b, const int
 #pragma unroll
     for (int r = 0; r < RWB; ++r) {
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < 4; ++c) {
             __half2 p = acc[r][c];
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1) p = __hadd2(p, __shfl_xor_sync(0xffffffffu, p, off));
             const float2 t = __half22float2(p);
             const float v = t.x + t.y;
             if (lane == 0) {
-                if (up) shu[r][(warp - 4) * 8 + c] = v;
-                else     shg[r][(warp & 3) * 8 + c] = v;
+                if (up) shu[r][(warp - 8) * 4 + c] = v;
+                else     shg[r][(warp & 7) * 4 + c] = v;
             }
         }
     }
     __syncthreads();
 
-    // ---- SwiGLU: the H block's scale is the max over all 32 of its values, so the
-    //      four gate warps need each other's values (shg holds the SwiGLU results) ----
+    // ---- the SwiGLU and the int8 H: one warp per row, its 32 lanes one value each ----
+    // The old shape had the four gate warps walk a row's 32 values eight at a time: every lane ran
+    // eight fp32 divisions (the P100 has no divide instruction, so each one is a chain of
+    // instructions) and the four up warps idled.  Here each of the 32 lanes takes one value: the
+    // divisions run in parallel and every warp works on a row.
     const int hh = (col0 / 32) & 1;                 // the half of the 64-value H block
     const int fb = col0 / 64;                       // the 64-value H block
-    const int c0 = (warp & 3) * 8;
-    if (warp < 4) {
-        for (int r = 0; r < RWB; ++r) {
-            if (rbase + r > last) break;
-            for (int j = 0; j < 8; ++j) {
-                const float gt = shg[r][c0 + j], upv = shu[r][c0 + j];
-                shg[r][c0 + j] = gt / (1.0f + __expf(-gt)) * upv;
-            }
-        }
-    }
-    __syncthreads();
-    if (warp < 4) {
-        for (int r = 0; r < RWB; ++r) {
-            if (rbase + r > last) break;
-            float am = 0.0f;
-#pragma unroll 8
-            for (int j = 0; j < WIB; ++j) am = fmaxf(am, fabsf(shg[r][j]));
-            const float inv = am > 0.0f ? 127.0f / am : 0.0f;
-            uint8_t* ob = out + (size_t) (rbase + r) * (size_t) (n_ff / 64) * AB + (size_t) fb * AB;
-            uint32_t wd[2] = {};
-            int csum = 0;
+    for (int rr = warp; rr < RWB; rr += WARPS) {
+        const int row = rbase + rr;
+        if (row > last) break;
+        const float gt = shg[rr][lane];
+        const float upv = shu[rr][lane];
+        const float v = gt / (1.0f + __expf(-gt)) * upv;
+        // the H block's scale is the max over all 32 of its values
+        float am = fabsf(v);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int c = __float2int_rn(shg[r][c0 + j] * inv);
-                csum += c;
-                wd[j >> 2] |= (uint32_t) (uint8_t) (int8_t) c << (8 * (j & 3));
-            }
-            *(uint2*) (ob + hh * 32 + c0) = make_uint2(wd[0], wd[1]);
-            shsum[r][warp & 3] = csum;
-            if ((warp & 3) == 0) sham[r] = am;
-        }
-    }
-    __syncthreads();
-    if (warp == 0) {
-        for (int r = 0; r < RWB; ++r) {
-            if (rbase + r > last) break;
-            uint8_t* ob = out + (size_t) (rbase + r) * (size_t) (n_ff / 64) * AB + (size_t) fb * AB;
-            *(float*) (ob + 64 + 4 * hh) = sham[r] / 127.0f;
-            *(float*) (ob + 72 + 4 * hh) = (float) (shsum[r][0] + shsum[r][1] + shsum[r][2] + shsum[r][3]);
+        for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+        const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+        const int code = __float2int_rn(v * inv);
+        int csum = code;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) csum += __shfl_xor_sync(0xffffffffu, csum, o);
+        uint8_t* ob = out + (size_t) row * (size_t) (n_ff / 64) * AB + (size_t) fb * AB;
+        ob[hh * 32 + lane] = (uint8_t) (int8_t) code;
+        if (lane == 0) {
+            *(float*) (ob + 64 + 4 * hh) = am / 127.0f;
+            *(float*) (ob + 72 + 4 * hh) = (float) csum;
         }
     }
 }
@@ -316,8 +327,8 @@ __global__ __launch_bounds__(THREADS) void down_fp16(const Batch b, const int32_
     if (rbase >= row0 + nrows) return;
 
     const uint8_t* blob = b.blob[e - b.e0] + down_off;
-    const int col0 = blockIdx.x * (WARPS * 8);       // the first output column
-    const int wcol = col0 + warp * 8;                // the first of the warp's 8 weight rows
+    const int col0 = blockIdx.x * (WARPS * 4);       // the first output column
+    const int wcol = col0 + warp * 4;                // the first of the warp's 4 weight rows
 
     const size_t h_row = (size_t) (n_in / 64) * AB;  // the H's bytes per row
     const int nblk = n_in / QK;
@@ -325,32 +336,47 @@ __global__ __launch_bounds__(THREADS) void down_fp16(const Batch b, const int32_
 
     __shared__ __half sx[RWB][QK];       // the staged H row (FP16)
 
-    __half2 acc[RWB][8];
+    __half2 acc[RWB][4];
 #pragma unroll
     for (int r = 0; r < RWB; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) acc[r][c] = __float2half2_rn(0.f);
+        for (int c = 0; c < 4; ++c) acc[r][c] = __float2half2_rn(0.f);
+
+    // The H row this warp stages and its address (the row does not change with the superblock), and
+    // the codes of the next superblock in registers.
+    const uint8_t* pa;
+    {
+        const int r = warp;
+        const int row = (r < RWB) ? min(rbase + r, last) : 0;
+        pa = h + (size_t) row * h_row;
+    }
+    uint32_t p_cl, p_ch;
+    float p_d0, p_d1;
+    load_block(pa + (size_t) c64 * AB, j4, p_cl, p_ch, p_d0, p_d1);
 
     for (int b = 0; b < nblk; ++b) {
         __syncthreads();
-        // ---- stage this warp's two H rows as FP16 ----
-#pragma unroll
-        for (int rr = 0; rr < 2; ++rr) {
-            const int r = warp * 2 + rr;
-            if (r >= RWB) break;
-            const int row = min(rbase + r, last);
-            const uint8_t* a = h + (size_t) row * h_row + (size_t) (b * 4 + c64) * AB;
-            __half2 v[4];
-            stage_block(a, j4, v);
-            *(uint2*) &sx[r][64 * c64 + j4]      = *(const uint2*) &v[0];
-            *(uint2*) &sx[r][64 * c64 + 32 + j4] = *(const uint2*) &v[2];
+        // ---- stage this warp's H row as FP16 (from the prefetched codes) ----
+        {
+            const int r = warp;
+            if (r < RWB) {
+                __half2 v[4];
+                v[0] = code2half2(p_cl, p_d0);
+                v[1] = code2half2(p_cl >> 16, p_d0);
+                v[2] = code2half2(p_ch, p_d1);
+                v[3] = code2half2(p_ch >> 16, p_d1);
+                *(uint2*) &sx[r][64 * c64 + j4]      = *(const uint2*) &v[0];
+                *(uint2*) &sx[r][64 * c64 + 32 + j4] = *(const uint2*) &v[2];
+            }
         }
         __syncthreads();
+        // ---- prefetch the next superblock's codes ----
+        if (b + 1 < nblk) load_block(pa + (size_t) ((b + 1) * 4 + c64) * AB, j4, p_cl, p_ch, p_d0, p_d1);
 
         // ---- dequantize the warp's 8 weight rows for this superblock ----
-        __half2 wq[8][4];
+        __half2 wq[4][4];
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < 4; ++c) {
             const uint8_t* wp = blob + (size_t) (wcol + c) * d_row + (size_t) b * blk_bytes(QT);
             dequant_block<QT>(wp, c64, j4, wq[c]);
         }
@@ -361,7 +387,7 @@ __global__ __launch_bounds__(THREADS) void down_fp16(const Batch b, const int32_
             const __half2* sl = (const __half2*) &sx[r][64 * c64 + j4];
             const __half2* su = (const __half2*) &sx[r][64 * c64 + 32 + j4];
 #pragma unroll
-            for (int c = 0; c < 8; ++c) {
+            for (int c = 0; c < 4; ++c) {
                 acc[r][c] = __hfma2(wq[c][0], sl[0], acc[r][c]);
                 acc[r][c] = __hfma2(wq[c][1], sl[1], acc[r][c]);
                 acc[r][c] = __hfma2(wq[c][2], su[0], acc[r][c]);
@@ -371,13 +397,13 @@ __global__ __launch_bounds__(THREADS) void down_fp16(const Batch b, const int32_
     }
 
     // ---- reduce the 32 lanes and write the rows ----
-    const int col = col0 + warp * 8;
+    const int col = col0 + warp * 4;
 #pragma unroll
     for (int r = 0; r < RWB; ++r) {
         const int row = rbase + r;
         if (row > last) break;
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < 4; ++c) {
             __half2 p = acc[r][c];
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1) p = __hadd2(p, __shfl_xor_sync(0xffffffffu, p, off));
