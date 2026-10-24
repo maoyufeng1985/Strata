@@ -77,6 +77,26 @@ primary cache；关 = 维持 `empty_primary`（现状逐字节不变）。prefil
 | IMA / nan / Xid | 0/0/0 | 0/0/0 |
 | logits（37 行强制定 token 流） | — | **argmax 37/37 同，max\|diff\| = 0.764**（不同：这 37 个专家从 helper 挪到主卡算，数值路径变了） |
 
+**为什么 prompt 持平、decode 掉，而不是 prompt 加速**（用户追问：decode 主卡不参与专家计算，
+prefill 主卡应该加速，为何持平？）：
+
+「prefill 主卡加速」的直觉假设主卡的 MMQ 和 helper 的算术**同速**，省多少就补多少。实际不是：
+
+1. **主卡的 MMQ 比 helper 慢 2.2×**（sm_60 走 4×vmad 回退，helper sm_61 真 `__dp4a`，
+   §13.9 核过）。keep-resident 把这 39 个从 helper 挪到主卡，省的是关键路径上**最快**的一段
+   （helper_wait 的一部分），补的是**最慢**的一段（主卡 primary_work，且这 39 个占窗口
+   57.2% 热点行）→ 两头抵消，prompt 持平。
+2. **主卡的 MMQ 本就不在关键路径上**（编码修好后 `primary_work = 0.745`，只剩 shared expert；
+   `helper_wait = 13.5` 才是关键路径）。挪到这 39 个只是把关键路径上的 helper_wait 换成
+   primary_work，净额不变。
+3. **decode 掉 12.5% 才是「主卡参与专家计算」的真代价**：decode 单 token、每专家 1 行，
+   helper 的 `__dp4a` 优势最大、主卡 sm_60 回退惩罚最显眼。把这 39 个最热专家（57.2% 行）
+   从最快 helper 抢给最慢主卡，decode 纯亏。
+
+**这台盒子（P100 sm_60 主卡 + P104 sm_61 helper）主卡是唯一弱项，keep-resident 恒为负或零。**
+它要真正加速，得是**主卡算力不慢于 helper** 的机器（主卡 sm_61+ 有真 dp4a，或 helper 比主卡还慢）。
+所以这里不合并，旗标保持 opt-in 默认关。
+
 **结论：不合并。**（性能负 + 数值也不再逐字节）
 - **prompt 持平**（461.6 → 461.8）：主卡接回这 39 个专家后，prompt 没变快。主卡 MMQ（sm_60，2.2× 回退）
   算这 39 个的时间，和被省下的 `helper_wait` 抵消。
