@@ -1,17 +1,24 @@
 // src/prefill/moe_f16_kq_cuda.cuh - the fused FP16 gate/up for the K-quants, on CUDA.
 //
-// One block: RWB routed rows x WIB output indices (WIB gate rows + WIB up rows), 8 warps.
-//   warp w owns 8 weight rows: warps 0..3 the gate rows, warps 4..7 the up rows of the
+// One block: RWB routed rows x WIB output indices (WIB gate rows + WIB up rows), 16 warps.
+//   warp w owns 4 weight rows: warps 0..7 the gate rows, warps 8..15 the up rows of the
 //   same output indices, so the SwiGLU pairs them without leaving the block.
-//   Per warp: RWB rows x 8 weight rows, the accumulators in registers (half2).
+//   Per warp: RWB rows x 4 weight rows, the accumulators in registers (half2).
+//   16 warps and 128 registers a thread is what fits an SM: 8 warps at 200 registers left
+//   one block per SM and two warps per scheduler, with nothing to cover the latency.
 //
 // Along K, one superblock (256 values) at a time:
 //   - the activation (int8, one fp32 scale per 32 values) is staged into shared memory
 //     as FP16 once per block, so the int8 -> FP16 conversion is paid once per row and
-//     not once per column group;
-//   - the K-quant codes of the warp's 8 weight rows are read and dequantized into
+//     not once per column group; the next superblock's codes are prefetched into
+//     registers, so their latency hides under the FMA instead of standing exposed at
+//     the barrier;
+//   - the K-quant codes of the warp's 4 weight rows are read and dequantized into
 //     registers (the codes are never written back: no FP16 copy of the weights);
 //   - the FMA is a half2 HFMA2 against the staged activation.
+//
+// The epilogue (the SwiGLU and the int8 H) gives one warp per row and its 32 lanes
+// one value each, so the fp32 divisions run in parallel and every warp has a row.
 //
 // The lane's K indices inside a superblock are the ones ggml's dequantize_row_q4_K /
 // dequantize_row_q5_K use (low nibbles first): 64*c64 + j4 for the low nibbles and
