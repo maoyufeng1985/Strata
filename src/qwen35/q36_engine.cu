@@ -3840,8 +3840,16 @@ struct Engine {
         static const bool on = std::getenv("STRATA_Q36_PREFILL_PEERS") != nullptr;
         return on;
     }
-    /// The number stored in `peer_owner` for an expert no helper holds.
-    static constexpr uint8_t kPeerNone = 0xFF;
+    /// The number stored in `peer_owner` for an expert NO HELPER holds - the primary computes it.
+    ///
+    /// THE ENCODING, and why it is this one: the table is read by the two route kernels and by
+    /// stream_kick with the rule "non-zero = a helper holds this expert, so skip it", and by peer_plan
+    /// with the rule "0 = the primary, 1..3 = the helper's CUDA ordinal".  The two rules agree only if
+    /// every helper's number is non-zero - so the primary gets 0 and the helpers get 1..3.  The table
+    /// used to say 0xFF for the primary and 0..2 for the helpers, which disagreed with the kernels on
+    /// helper 0 (CUDA1): its experts were counted as the primary's own, multiplied on the primary, and
+    /// uploaded over PCIe - a copy nothing read.  See plans/2026-10-24-q36-peer-owner-encoding.md.
+    static constexpr uint8_t kPeerNone = 0;
     std::array<std::unique_ptr<strata::qwen35::PeerPrefill36>, 3> peers;   // one per helper, index = helpers[]'s
     std::array<bool, 3> peer_on = {false, false, false};   // which of peers[] opened AND got a route (direct or host)
     // False: every peer statement in this file is dead.  Set once, in peer_open(), and the ONLY reader that is not
@@ -3986,12 +3994,12 @@ struct Engine {
             for (int r = 0; r < 3; ++r) {
                 if (!peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
                 const bool cache_says = peers[(size_t) r]->owns((int64_t) li, e);
-                const bool table_says = own[(size_t) e] == (uint8_t) r;
+                const bool table_says = own[(size_t) e] == (uint8_t) (r + 1);
                 if (cache_says == table_says) continue;
                 err = "layer " + std::to_string((long long) li) + ", expert " + std::to_string((long long) e) +
                       ": the ownership table says " +
                       (own[(size_t) e] == kPeerNone ? std::string("the primary")
-                                                    : "helper CUDA" + std::to_string((int) own[(size_t) e] + 1)) +
+                                                    : "helper CUDA" + std::to_string((int) own[(size_t) e])) +
                       ", while helper CUDA" + std::to_string(r + 1) + "'s live cache says " +
                       (cache_says ? "it holds that expert" : "it holds no such expert");
                 return false;
@@ -4018,13 +4026,15 @@ struct Engine {
             for (int32_t e = 0; e < ne; ++e) {
                 const uint8_t o = own[(size_t) e];
                 if (o == kPeerNone) continue;
-                host_maxr[(size_t) o] = std::max(host_maxr[(size_t) o], (int64_t) peer_ecnt[(size_t) e]);
+                // the table's helper number is the CUDA ordinal (1..3); the array is indexed by helper 0..2
+                host_maxr[(size_t) (o - 1)] =
+                    std::max(host_maxr[(size_t) (o - 1)], (int64_t) peer_ecnt[(size_t) e]);
             }
         }
         for (int64_t e = 0; e < n_ent; ++e) {
             const uint8_t o = own[(size_t) h_peer_ids[e]];
             if (o == kPeerNone) ++n_local;
-            else ++rows[(size_t) o];
+            else ++rows[(size_t) (o - 1)];   // the table's helper number is the CUDA ordinal (1..3)
         }
         // The row contract (src/qwen35/q36_peer_prefill.cuh): the primary's entries first, in entry order, then each
         // helper's run in helper order, per-helper in ascending entry order.  `base_j = n_local + sum_{i<j} rows_i`.
@@ -4046,7 +4056,7 @@ struct Engine {
         std::fill(peer_row_seen.begin(), peer_row_seen.begin() + (size_t) n_ent, (uint8_t) 0);
         for (int64_t e = 0; e < n_ent; ++e) {
             const uint8_t o = own[(size_t) h_peer_ids[e]];
-            const int64_t row = o == kPeerNone ? lrank++ : base[(size_t) o] + rank[(size_t) o]++;
+            const int64_t row = o == kPeerNone ? lrank++ : base[(size_t) (o - 1)] + rank[(size_t) (o - 1)]++;
             peer_prow2_h[(size_t) e] = (int32_t) row;
             // The second half of the invariant, and the one a real bug would hit first: two entries landing in one
             // eparts row would leave one of them combined twice and the other never.  Silent logit corruption is
@@ -4240,16 +4250,18 @@ struct Engine {
             const int64_t cap = peers[(size_t) r]->cap_entries();
             peer_cap_rows = peer_cap_rows == 0 ? cap : std::min(peer_cap_rows, cap);
         }
-        // The master table: which helper holds each main layer's expert.  0xFF = the primary computes it; a helper's
-        // index (0..2) = its entries' rows live in that helper's eparts run.  The MTP block's row, when present, is
-        // all 0xFF - the block is not served (peer_layer() keeps it local, as helper_layer() does).
+        // The master table: which helper holds each main layer's expert.  0 = the primary computes it; a helper's
+        // CUDA ordinal (1..3) = its entries' rows live in that helper's eparts run.  The MTP block's row, when
+        // present, is all 0 - the block is not served (peer_layer() keeps it local, as helper_layer() does).
+        // The encoding is the one the route kernels and stream_kick already read ("non-zero = a helper"), so
+        // neither of them changes; only this file's plan does.  See kPeerNone.
         const int64_t n_state = g.n_layers + (m.has_mtp ? 1 : 0);
-        peer_owner.assign((size_t) n_state * (size_t) ne, kPeerNone);
+        peer_owner.assign((size_t) n_state * (size_t) ne, kPeerNone);   // 0 = the primary computes it
         for (int r = 0; r < 3; ++r) {
             if (!peer_on[(size_t) r]) continue;
             for (int64_t l = 0; l < g.n_layers; ++l)
                 for (int64_t e = 0; e < ne; ++e)
-                    if (peers[(size_t) r]->owns(l, (int32_t) e)) peer_owner[(size_t) l * ne + e] = (uint8_t) r;
+                    if (peers[(size_t) r]->owns(l, (int32_t) e)) peer_owner[(size_t) l * ne + e] = (uint8_t) (r + 1);
         }
         peer_any.assign((size_t) g.n_layers, 0);
         int64_t n_owned = 0;
