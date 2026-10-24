@@ -109,8 +109,8 @@ void down(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* ti
     (void) n; (void) n_expert;
     const int n_out = (int) g.n_embd, n_in = (int) g.n_ff;
     if (b.e1 <= b.e0 || n_out <= 0 || n_in <= 0 || work_bound <= 0) return;
-    // one block per (8 warps x 8 output columns, tile, 16 rows); the tile has at most kTileRows rows
-    const dim3 grid((n_out + f16kqc::WARPS * 8 - 1) / (f16kqc::WARPS * 8), (unsigned) work_bound,
+    // one block per (WARPS warps x 4 output columns, tile, 16 rows); the tile has at most kTileRows rows
+    const dim3 grid((n_out + f16kqc::WARPS * 4 - 1) / (f16kqc::WARPS * 4), (unsigned) work_bound,
                     kTileRows / f16kqc::RWB);
     if (g.d_type == GGML_TYPE_Q4_K)
         f16kqc::down_fp16<GGML_TYPE_Q4_K><<<grid, f16kqc::THREADS, 0, s>>>(b, ts, tiles, off, h, dm, n_out, n_in, g.d_row,
