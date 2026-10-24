@@ -17,4 +17,13 @@ namespace strata::prefill::fused::f16kqc {
 /// for these formats is MMQ (int8) and stays the default.
 bool requested();
 
+/// The tiles of a batch's experts, from the routing's per-expert row bounds.
+///
+/// `bounds` the routing scan's output (the first sorted row of each expert), `e0`..`e1` the experts
+/// of this group, `n_local` the rows the device owns (the sorted rows [0, n_local)).  Writes the
+/// tile list (expert, first row), the per-expert tile offsets (`ts`: the first tile of each
+/// expert, the total at e1) and the per-expert row offsets (`off`: the local rows' first row).
+void build_tiles(const int32_t* bounds, int e0, int e1, int n_local, int2* tiles, int max_tiles, int32_t* ts,
+                 int32_t* off, cudaStream_t s);
+
 }  // namespace strata::prefill::fused::f16kqc
