@@ -216,3 +216,123 @@ dispatch 在 `#if defined(__HIPCC__)` 块里，CUDA 走不到）→ 默认路径
    （CUDA 走不到），CUDA 侧要在 `experts_native` 的 CUDA 分支里另接一行，条件用
    `f16kqc::requested()`（`STRATA_PF_F16_CUDA=1`），**不要**复用 gfx11 的 `f16`
    （`STRATA_PF_F16`）——那个旗标在 CUDA 上还管着 i-quant 的 `native_f16_kernel`。
+
+## 8. 接线（2026-10-25）：落在 q36 引擎，不在 prefill 引擎
+
+### 8.1 落点为什么改
+
+计划 §1 写的是 prefill 引擎的 `experts_native`（`moe_fused_iq.cu`），但那条路在 CUDA 上
+走不到 K 量：`experts_native` 的 CUDA 分支（`moe_fused_iq.cu:1530`）的 `switch` 只有
+IQ2_XXS..IQ4_XS 和 Q2_0，**没有 Q4_K / Q5_K**；gfx11 那两行在 `#if defined(__HIPCC__)`
+块里（`:1482` / `:1508`），CUDA 编不到。prefill 引擎的 K 量 prompt 走的是
+`prefill.cpp` 的 FP16 环（整专家反量化成 FP16，约 10 MB/专家）或 MMQ int8。
+
+远程机器上只有 Qwen3.6-35B-A3B-UD-Q4_K_XL（22.9 GB），它由 **q36 引擎**
+（`src/qwen35/q36_engine.cu`）跑：几何 n_embd 2048 / n_ff 512，gate/up Q4_K、down Q5_K
+（`iq_kernels.cu:5094`），跟计划 §7.1 量的是同一个形状。所以可测的落点是 q36 引擎的
+**MMQ prompt 分支**（`q36_engine.cu:3171`），那里现在跑的是 int8 MMQ（K 量再量化成
+int8 子块）。
+
+**因此本节做的是**：q36 引擎的 MMQ prompt 分支加第三条路（旗标 opt-in），prefill
+引擎的 `experts_native` CUDA 分支不动（那需要给 CUDA 分支补 K 量支持，是另一件事，
+而且没有 Qwen3.8 的模型可测）。
+
+### 8.2 接线要修的四件事（接线前逐条核对过代码）
+
+1. `quantize_act_native(h, N, T, ...)` 的参数顺序反了：签名是 (x, rows, cols, ...)，
+   `h` 是 [T][N]（T 个 token、N 列），要写 `quantize_act_native(h, T, N, ...)`。
+2. work_bound 不对：grid.y 必须 ≥ 该批的 tile 数。照 gfx11 的算法
+   `(n + kTileRows - 1)/kTileRows + (b.e1 - b.e0)` 算，不能拿专家数当上界（会漏 tile，
+   结果静默错）。
+3. gate/up 的类型不止 Q4_K：q36 的第 2 层是 Q5_K（`iq_kernels.cu:5096` 认 12 和 13），
+   `covers()` 要认两个，launch 的模板要按实际类型选。
+4. 新缓冲区只能在旗标打开时分配：q36 的专家槽位是按 VRAM 余量放的
+   （`place_experts`），多占显存会改默认路径的 CPU/GPU 分工 → 旗标关掉时 logits 就
+   不再逐字节相同了。
+
+**这四条已经改完（2026-10-25）**，改法：
+
+1. `quantize_act_native(h, T, N, f16_xa8, st)`（`h` 是 [T][N]）。
+2. work_bound 照 gfx11 的公式逐批算：
+   `f16_wb = (n_local + kTileRows - 1)/kTileRows + (g1 - g0)`；
+   tile 表的容量跟着分配走（`f16_tiles_cap = n_expert + tmax*Kp/64 + 1`，
+   够一批的 tile 数：每 64 行一个 tile 加每个专家一个）。
+3. `covers()` 认 Q4_K 和 Q5_K，`covers_down()` 认 Q4_K 和 Q5_K；
+   launch 按 `g.gu_type` / `g.d_type` 选模板（Q5_K 的第 5 位在 `qh` 里，
+   `dequant_block<T_Q5_K>` 已经在 down 的对照里验过）。
+4. 五个缓冲区（激活、H、tile 表、两个偏移表）只在 `f16kqc::requested()` 为真时
+   分配（`Engine::init`），旗标关时一个字节都不占。
+
+**另外两条接线时才发现的**：
+
+5. **peer 那一路不能用**：`dn.ids = lid` 在被服务的层上是 `peer_lid_map`，
+   它给 eparts 的行重新编号，而融合 kernel 的 down 写的是排序行。
+   所以条件里加 `!peer_here`：被服务的层留在 MMQ 路上。
+6. **提示必须比 hybrid_t 长**：`hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid)`，
+   hybrid_t 是 CLI 的 `--hybrid-rows`（默认 128）。提示块 ≤ 128 个 token 时走的是
+   hybrid 路（VRAM 槽 + CPU 池），**MMQ 分支根本不会进**，融合路也就不会跑。
+   实测：64 个 token 的提示落在 hybrid 路（"prompt 84 tokens"），
+   168 个 token 的提示才进 MMQ 路（"bigger prompt chunks streamed"）。
+
+### 8.3 验收（全部要实测，远程 P100）
+
+| 项 | 怎么测 | 过了的标准 |
+|---|---|---|
+| 默认路径没变 | 旗标关，两个同源二进制（`strata-q36.ctrl` 对新二进制），同一提示、同一强制 token，logits 的 md5 | 逐字节相同 |
+| 旗标真的生效 | 旗标开，同一提示，logits 与旗标关的不同，且强制 token 生成的文本正常 | 文本可读、不是乱码 |
+| 数值 | 旗标开/关，logits 逐行比：argmax 一致数、max\|diff\| / logit 尺度 | 记录实测值（两条路的差是**设计上的**：int8 MMQ vs K 量原精度） |
+| 性能 | 旗标开/关，prompt 端到端 + 专家 kernel 时间 | 记录实测值 |
+
+数值那一项的参照是**引擎里现有的 K 量 CUDA 路**（`iq_kernels.cu` 的 S27/vec_dot
+K 量路，权重不重量化），不是 int8 MMQ。int8 MMQ 与 K 量原精度的差是设计上的差
+（§4 第 6 步已经写明），不是误差。
+
+**参照怎么拿到**：那条 K 量路（`native_expert_grouped` 的 v2k 分支）只在
+hybrid 路上跑（提示块 ≤ hybrid_t），而融合路在 MMQ 路上 —— 两条路互斥。
+所以参照是**同一提示跑两次**：`--hybrid-rows 128`（进 MMQ 路）和
+`--hybrid-rows 512`（留在 hybrid 路，即 K 量原精度那条），比两次的 logits。
+
+### 8.4 结果（2026-10-25，远程 P100-12GB）
+
+测法：Qwen3.6-35B-A3B-UD-Q4_K_XL，168 个 token 的提示（> hybrid_t = 128，
+所以提示块走 MMQ 路），20 个强制 token，`STRATA_Q36_CHUNK=512 --expert-slots 24`
+—— 把块大小和专家摆位**钉住**：块大小决定提示的 GEMM 选什么 tile，摆位决定
+decode 的 CPU/GPU 分工，两者都会动最后几位；不钉住时两次运行的 logits 就不可比
+（实测：同一棵源码两次跑的专家摆位是 40 和 49 个/层，logits 的 md5 不同）。
+脚本 `.run/R-f16kq-cuda3-20261025.sh`（五次运行：对照二进制旗标关、新二进制
+旗标关、新二进制旗标开，再各跑一遍）。
+
+| 项 | 实测 |
+|---|---|
+| 默认路径没变 | 对照二进制（不带新 TU）旗标关 = `9dcaf948bf8453a0180725a942c7f73d`；新二进制旗标关 = **同一个 md5**；再跑一遍还是同一个 md5 → 逐字节相同 ✓ |
+| 旗标真的生效 | 新二进制旗标开 = `7f582aafbe394d5c00bee2338923b112`（与旗标关不同 ✓），stderr 打出 `the fused FP16 K-quant experts: layer 0, 1344 local rows` ✓（路真的跑了） |
+| 数值 | 21 个位置里 argmax 一致 **20** 个（第 17 个不同：9392 对 25）；max\|diff\| 0.46-1.17，logits 的 rms 2.0-3.1 |
+| 性能 | 提示 168 token：旗标关 3549 / 3560 ms，旗标开 3553 / 3552 ms → **一样** |
+
+**性能为什么一样**：168 个 token 的提示块是 1344 行、256 个专家 → 每个专家
+平均 0.13 行。两条路都要把整层的权重读一遍（每层 486 MB，20 GB 一个块），
+这一段是共同的；专家的计算（每专家 16 行时才有意义）在这个规模上几乎没有。
+所以性能那一项要用更大的提示（504 个 token → 每专家 16 行）重测
+（`.run/R-f16kq-cuda3c-20261025.sh`）。
+
+**参照**（K 量原精度那条路，`--hybrid-rows 512` 让提示块留在 hybrid 路）：
+见下。
+
+### 8.5 剩下的活（写下来，免得散在对话里）
+
+1. **验收**（§8.3 的四项）：默认路径逐字节相同、旗标真的生效、数值、性能。
+2. **参照**：R3b 脚本跑一次 `--hybrid-rows 512`（K 量原精度那条路），
+   拿它当参照比旗标开/关的 logits。
+3. **文档**：`docs/QWEN36.md` 加这一条路（旗标、开关、测出来的数、限制）。
+4. **提交**：kernel、接线、计划、文档一起。
+5. **优化**（§7.5，按收益排）：
+   - **激活预取（双缓冲）**：现在每个 superblock 都有两个 `__syncthreads()`，
+     而一个 SM 只放得下一个 block（256 线程 × 约 180 个寄存器），
+     所以全局显存的取数延迟在每个 barrier 上全露出来 —— FMA 循环只有
+     峰值的一小部分（119 µs 对 2.25 TFLOP/s ≈ 峰值的 12%）。把下一个
+     superblock 的激活先取进寄存器再算当前的，能把这段时间藏掉。
+   - **fp32 累加**（精度）：全 fp32 是 FMA 指令 ×5（太贵）；折中办法是
+     **每个 superblock 累到 fp16、superblock 之间用 fp32**（误差降 √8 倍，
+     代价约 +13%）。
+   - **反量化 69 µs（30%）**：把 (d*s, bias) 预先算好放寄存器。
+   - 量法：用消融，不用 `clock64()`（§7.4）。

@@ -29,6 +29,10 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/moe_fused_iq.hpp"
+#include "../prefill/moe_f16_kq_cuda.hpp"
+
+#include "ggml.h"
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
@@ -1702,6 +1706,12 @@ struct Engine {
     int32_t *rcnt = nullptr, *rcur = nullptr, *rbounds = nullptr, *rmax = nullptr, *ident = nullptr, *rinv = nullptr;
     void *mq_x = nullptr, *mq_hq = nullptr;
     float *mq_gu = nullptr, *mq_h = nullptr;
+    // the fused FP16 K-quant experts (STRATA_PF_F16_CUDA=1): the activations and the H in the natural int8
+    // layout, the tiles of the experts' rows and their per-expert offsets
+    void *f16_xa8 = nullptr, *f16_hq8 = nullptr;
+    int2* f16_tiles = nullptr;
+    int32_t* f16_ts = nullptr, *f16_off = nullptr;
+    int f16_tiles_cap = 0;   // the tiles' array size (the batch's tile count never exceeds it)
     __half* x16 = nullptr;
     bool use_graph = true;
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
@@ -2395,6 +2405,22 @@ struct Engine {
             CK(cudaMalloc(&mq_hq, MMQ::q8_bytes(ne, g.n_ff)));
             mq_gu = dalloc((size_t) ne * 2 * FF);
             mq_h = dalloc((size_t) ne * FF);
+#if !defined(__HIPCC__)
+            // STRATA_PF_F16_CUDA=1: the fused FP16 K-quant path's buffers - the activations and the H in the
+            // natural int8 layout (64 codes and {d0,d1,sum0,sum1} per 64 values), the tiles of the experts' rows
+            // and their offsets.  ONLY with the flag on: the VRAM they take comes out of the experts' budget
+            // (place_experts), so with the flag off the CPU/GPU split and with it the default path's numbers
+            // would move.  The default path has to stay byte-identical.
+            if (strata::prefill::fused::f16kqc::requested()) {
+                f16_xa8 = dalloc((size_t) tmax * (size_t) (g.n_embd / 64) * 80);
+                f16_hq8 = dalloc((size_t) ne * (size_t) (g.n_ff / 64) * 80);
+                // one tile per 64 rows and one per expert, so the whole layer's rows plus its experts
+                f16_tiles_cap = (int) (g.n_expert + ne / 64 + 1);
+                f16_tiles = dalloc_t<int2>((size_t) f16_tiles_cap);
+                f16_ts = dalloc_t<int32_t>((size_t) g.n_expert + 1);
+                f16_off = dalloc_t<int32_t>((size_t) g.n_expert + 1);
+            }
+#endif
         }
         std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
         {
@@ -3252,21 +3278,71 @@ struct Engine {
             // sorted-expert order - with no helper every entry, on a served layer the ones the two route kernels did
             // not skip.  `ent_tok` maps sorted row -> token and is already right for both (the skipped rows' entries
             // are never read: `bounds` stops at n_local), so quantize's arguments do not change, only its row count.
-            MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_local, st);
-            MMQ::Product gu;
-            gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
-            // gu keeps `ident`: it writes mq_gu in SORTED row order, which is the space swiglu and the down
-            // product's activation rows live in.  Only the down product writes into `eparts`, so only it renumbers.
-            gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_local; gu.max_rows = maxr;
-            gu.dst = mq_gu; gu.ld_dst = 2 * FF;
-            mctx->run(gu, st);
-            MMQ::swiglu(mq_gu, mq_h, n_local, FF, false, st);
-            MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_local, st);
-            MMQ::Product dn;
-            dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
-            dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = lid;
-            dn.total_rows = n_local; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
-            mctx->run(dn, st);
+#if !defined(__HIPCC__)
+            namespace pf16 = strata::prefill::fused;
+            // STRATA_PF_F16_CUDA=1: the fused FP16 K-quant experts - the third prompt path.  The K-quant codes are
+            // dequantized into the registers (no FP16 copy of the weights), the activations and the H are in the
+            // natural int8 layout, so the down reads the H as it is.  The rows and their order are the MMQ path's:
+            // the tiles come from the routing's bounds, the token of each sorted row is ent_tok, and the down
+            // writes the row where the MMQ's down would - the sorted row, which is what `lid` renumbers on a served
+            // layer, so a served layer (peer_here) stays on the MMQ path.  The experts come in groups of
+            // kMaxBatch (the Batch's blob array), one launch per group.
+            if (pf16::f16kqc::requested() && !peer_here && pf16::f16kq::covers(L.L.gu_type) &&
+                pf16::f16kq::covers_down(L.L.d_type)) {
+                pf16::NativeGeom fg;
+                fg.gu_type = L.L.gu_type;
+                fg.d_type = L.L.d_type;
+                fg.gu_row = L.L.gu_row;
+                fg.d_row = L.L.d_row;
+                fg.up_off = L.L.up_off;
+                fg.down_off = L.L.down_off;
+                fg.n_embd = g.n_embd;
+                fg.n_ff = g.n_ff;
+                // the activations: one row per token (the kernel reads the token of each routed row)
+                pf16::quantize_act_native(h, T, N, f16_xa8, st);
+                {
+                    static int f16_reported = 0;
+                    if (f16_reported < 3) {
+                        ++f16_reported;
+                        std::fprintf(stderr, "strata-q36: the fused FP16 K-quant experts: layer %d, %lld local rows\n",
+                                     li, (long long) n_local);
+                    }
+                }
+                for (int g0 = 0; g0 < ne; g0 += pf16::kMaxBatch) {
+                    const int g1 = (int) std::min<int64_t>(ne, (int64_t) g0 + pf16::kMaxBatch);
+                    // the batch's tiles: one per 64 rows and one per expert (the gfx11 bound).  The grid's y is
+                    // this number: the kernel counts the batch's tiles on the device and leaves the rest idle.
+                    const int64_t f16_wb = (n_local + pf16::kTileRows - 1) / pf16::kTileRows + (g1 - g0);
+                    pf16::f16kqc::build_tiles(rbounds, g0, g1, (int) n_local, f16_tiles, f16_tiles_cap, f16_ts, f16_off,
+                                               st);
+                    pf16::Batch fb;
+                    fb.e0 = g0;
+                    fb.e1 = g1;
+                    for (int e = g0; e < g1; ++e) fb.blob[e - g0] = wbase + (size_t) e * L.stride;
+                    pf16::f16kq::gate_up(fb, fg, f16_ts, f16_tiles, f16_off, n_local, ne, f16_wb,
+                                          (const uint8_t*) f16_xa8, ent_tok, (uint8_t*) f16_hq8, st);
+                    pf16::f16kq::down(fb, fg, f16_ts, f16_tiles, f16_off, n_local, ne, f16_wb, (const uint8_t*) f16_hq8,
+                                       eparts, st);
+                }
+            } else
+#endif
+            {
+                MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_local, st);
+                MMQ::Product gu;
+                gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
+                // gu keeps `ident`: it writes mq_gu in SORTED row order, which is the space swiglu and the down
+                // product's activation rows live in.  Only the down product writes into `eparts`, so only it renumbers.
+                gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_local; gu.max_rows = maxr;
+                gu.dst = mq_gu; gu.ld_dst = 2 * FF;
+                mctx->run(gu, st);
+                MMQ::swiglu(mq_gu, mq_h, n_local, FF, false, st);
+                MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_local, st);
+                MMQ::Product dn;
+                dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
+                dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = lid;
+                dn.total_rows = n_local; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
+                mctx->run(dn, st);
+            }
             if (lhy(li)) stream_done();
             // With no helper `prow` stays `rinv`, the map it has always been; on a served layer peer_plan() set it
             // to the per-entry eparts row map the executor's contract defines.
