@@ -1965,6 +1965,17 @@ struct Engine {
         }();
         return on;
     }
+    /// STRATA_Q36_PEER_KEEP_RESIDENT=1: measure how many routed entries of a layer hit the primary's own
+    /// VRAM slots - the share the "keep the resident experts off the helpers" shape would hand the primary,
+    /// which then multiplies them at sm_60's 2.2x fallback speed.  A throwaway gate like peer_f16's: with
+    /// the variable unset it is one getenv and the statements it guards never run.
+    static bool keep_resident() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_PEER_KEEP_RESIDENT");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
     /// Whether state index li's layer is offered to a helper (the entries the helper holds leave the local path).
     bool helper_layer(size_t li) const {
         // only main-model layers carry a helper slot: the MTP block (li == m->layers.size()) stays local
@@ -3888,6 +3899,15 @@ struct Engine {
     // disagreed on.
     std::vector<int32_t> pp_maxr_dev[3], pp_maxr_host[3];
     long long pp_maxr_mismatch = 0, pp_rows_mismatch = 0;
+    // STRATA_Q36_PEER_KEEP_RESIDENT=1: over every layer the probe measured, how many routed entries hit a
+    // primary-resident expert (kr_hit) out of all the entries (kr_tot) - the share, as a fraction the report
+    // prints.  And the per-layer extremes: which layer's resident experts were the hottest / coldest, so a
+    // single "hot" number does not paper over "the 39 slots are spread across the routing, some layers' are
+    // barely used at all".
+    int64_t pp_kr_hit = 0, pp_kr_tot = 0;
+    int64_t pp_kr_hit_max = 0, pp_kr_hit_min = -1;
+    int64_t pp_kr_hit_max_li = -1, pp_kr_hit_min_li = -1;
+    int64_t pp_kr_n = 0;
     // The two numbers peer_plan() leaves behind for the local MMQ of the layer it just planned: the rows the primary
     // computes, and the sorted-row -> eparts-row table.  Read through a `peer_here ?` ternary at the use sites, so a
     // layer without a plan - and every layer of a run with the flag off - takes the value it always took.
@@ -4382,6 +4402,26 @@ struct Engine {
         } else {
             while (cudaEventQuery(ev_route) == cudaErrorNotReady) {
             }
+        }
+        // STRATA_Q36_PEER_KEEP_RESIDENT=1: of this layer's entries, how many route to an expert the primary holds
+        // a VRAM slot for, over the window's total.  `h_ids` is the routing this call just brought back D2H (the
+        // spin above waited for it), and H.slot_of names the primary's slots - one host pass over the entries, no
+        // CUDA.  Read from moe_hybrid_cpu because that is where the host has the routing in hand on BOTH the
+        // decode and the prompt chunks (the decode step and the CPU-pool prompt pass both spin on ev_route here);
+        // the mmq-only prompt branch leaves the routing on device.  The report at the end of the timed run prints
+        // the summed share, so the keep-resident shape is decided on the routing's own number, not a guess.
+        if (keep_resident()) {
+            int64_t hit = 0, tot = 0;
+            for (int e = 0; e < n_ent; ++e) {
+                const int x = h_ids[e];
+                ++tot;
+                if (H.slot_of[(size_t) x] >= 0) ++hit;
+            }
+            pp_kr_hit += hit;
+            pp_kr_tot += tot;
+            ++pp_kr_n;
+            if (hit > pp_kr_hit_max || pp_kr_hit_max_li < 0) { pp_kr_hit_max = hit; pp_kr_hit_max_li = (int64_t) li; }
+            if (hit < pp_kr_hit_min || pp_kr_hit_min < 0) { pp_kr_hit_min = hit; pp_kr_hit_min_li = (int64_t) li; }
         }
         const auto t0 = Clock::now();
         // the missed entries per expert (up to MAXT tokens per job)
@@ -6243,8 +6283,28 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
     // test admits every ranked pair and a helper may hold an expert the primary also has a slot for.  Nothing
     // breaks - the per-entry mask separates them at run time - but do not read that open() guard as "a helper only
     // ever holds experts the primary has no slot for"; it cannot, with this empty cache.
+    // a primary cache of zero slots: every (layer, expert) is "not on CUDA0", so each helper takes its own stripe.
+    // It is deliberately the EMPTY cache, not the primary's real one: with the empty cache open()'s
+    // `primary.slot_of(l, e) < 0` test is always true and a helper may hold an expert the primary ALSO has a slot
+    // for - nothing breaks, the per-entry mask separates them at run time.
     strata::core::ExpertCache empty_primary;
     if (!empty_primary.open(1, 1, 1, 4096, err)) { err = "helper: " + err; return false; }
+    // STRATA_Q36_PEER_KEEP_RESIDENT=1: the helpers keep the primary's resident experts OFF.  Instead of standing up
+    // a fake primary cache (an open_sized cache's n_layers * n_expert residency table is GiB-sized and would not fit
+    // on the card that is the primary), the filter is applied where the ranked list is built: an expert the primary
+    // holds a VRAM slot for is dropped from every helper's `ranked`, so open() never offers it and the helper never
+    // holds it.  open() still gets the empty primary cache, whose slot_of < 0 test admits every pair it is offered -
+    // and it is offered only the pairs the primary does NOT hold.  Off by default: with the variable unset the
+    // ranked lists are exactly what they were and a default run is byte-for-byte what it was.
+    const bool keep_resident_on = Engine::keep_resident() && E.main_hybrid;
+    const auto filter_resident = [&](std::vector<std::pair<int32_t, int32_t>>& ranked) {
+        if (!keep_resident_on) return;
+        std::erase_if(ranked, [&](const std::pair<int32_t, int32_t>& pe) {
+            const int32_t l = pe.first, e = pe.second;
+            return l >= 0 && (size_t) l < m.layers.size() &&
+                   E.hy[(size_t) l].slot_of[(size_t) e] >= 0;
+        });
+    };
     // One entry per helper this run opens: its index in helpers[] / want[], its CUDA device, and the (layer,
     // expert) pairs it is offered in preference order.
     struct Tier {
@@ -6282,6 +6342,7 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
             tiers.push_back(std::move(t));
         }
     }
+    for (Tier& t : tiers) filter_resident(t.ranked);   // STRATA_Q36_PEER_KEEP_RESIDENT=1: the primary's slots out
     for (const Tier& tier : tiers) {
         const int r = tier.r, device = tier.device;
         double free_gib = 0.0;
@@ -6976,6 +7037,21 @@ int strata::qwen35::run(int argc, char** argv) {
                 }
                 std::fprintf(stderr, "the host's count disagreed with the device's on %lld layer(s)\n",
                              E.pp_maxr_mismatch);
+            }
+            // STRATA_Q36_PEER_KEEP_RESIDENT=1: measured per PASS (E.pp_reset() runs between the three bench
+            // passes, so these are this pass's numbers, the ones that cross), NOT gated on the timing probe:
+            // the counters carry their own gate, and the share is the number the keep-resident decision needs
+            // even on a run without the probe.  One line per pass, so the reader sees hot/cold pass by pass.
+            if (E.pp_kr_tot > 0) {
+                std::fprintf(stderr,
+                             "strata-q36 PHASE3 bench %d: the primary's own slots took %lld of %lld routed entries "
+                             "over %lld layers (%.1f%%); the hottest layer's took %lld of its entries (layer %lld), "
+                             "the coldest layer's %lld (layer %lld)\n",
+                             rep,
+                             (long long) E.pp_kr_hit, (long long) E.pp_kr_tot, (long long) E.pp_kr_n,
+                             100.0 * (double) E.pp_kr_hit / (double) E.pp_kr_tot,
+                             (long long) E.pp_kr_hit_max, (long long) E.pp_kr_hit_max_li,
+                             (long long) E.pp_kr_hit_min, (long long) E.pp_kr_hit_min_li);
             }
             // STRATA_Q36_PEER_F16=1: what the packed up leg measured.  The largest magnitude in the rows says how
             // close they came to fp16's limit (65504); the largest relative error of the round trip says how much
