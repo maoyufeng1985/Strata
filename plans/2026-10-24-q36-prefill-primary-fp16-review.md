@@ -1,191 +1,179 @@
-# q36：prefill 把一部分专家流式给主卡算，怎么把主卡算力吃满 —— 复核（2026-10-24）
+# q36：prefill 的关键路径是 helper 的「下腿」，不是主卡的算力（2026-10-24）
 
 对象：用户问题「prefill 阶段把一部分专家从内存流式发给主卡计算，如何充分利用主卡算力」
-+「prefill 也能用 helper 的 DP4A 吗？主卡 FP16 18.7 TF」。
-只读：不改代码。硬件账 + 代码路径，把「能 / 不能 / 待测」钉死。
++「prefill 也能用 helper 的 DP4A 吗？主卡 FP16 18.7 TF」+「主卡 H2D 为什么吃不满链路」。
+只读复核 + 远端实测。硬件账 + 代码路径，把「能 / 不能 / 待测」钉死。
+
+**一句话结论：这台盒子上 prefill 的墙是 helper 的 PCIe 槽（Gen1 x4，0.81 GB/s），
+不是主卡的算力。主卡的 18.7 TFLOP/s FP16 吃不上，因为专家权重是量化的（Q4_K/Q5_K），
+根本不走 FP16 GEMM；就算走，也比 PCIe 便宜 240 倍。**
+
+---
+
+## 0. 三条实测数据（本轮新量）
+
+| 量 | 值 | 怎么量的 |
+|---|---|---|
+| 主卡 P100 H2D 持续吞吐 | **6.05–6.13 GB/s**（pinned 源 + `cudaMemcpyAsync`） | `/tmp/h2d2` 两条路径对照，4–256 MiB |
+| helper P104 H2D 持续吞吐 | **0.79–0.81 GB/s**（pinned+async 与 pageable+sync **同速**） | 同上，四张卡各跑一遍 |
+| prefill 每层时间分解 | **forward 26.7 ms/层**，其中 `plan` 6.79 ms + `helper_wait` 7.65 ms | `STRATA_Q36_PROMPT_TIMING=1`，bench 0-2 聚合，40 层 × 3 pass |
 
 ## 1. 硬件事实（先核，再算）
 
-| 卡 | PCI | 链路 | 理论单方向 | H2D 引擎实测 | FP16 | int8/DP4A |
+| 卡 | PCI | 链路（`lspci` LnkSta） | 理论单方向 | H2D 实测 | FP16 | int8/DP4A |
 |---|---|---|---|---|---|---|
-| 主卡 P100-12G | **03:00** | **Gen3 x8 @ 8.0 GT/s**（槽是 x16，`LnkSta: Width x8 (downgraded)`） | **8 GB/s** | **6.05–6.13 GB/s（2026-10-24 实测，pinned 源 + `cudaMemcpyAsync`，4–256 MiB）= 链路的 76%** | **18.7 TF（峰值，无 int8 tensor）** | **无真 DP4A，int8 走 4×vmad 回退（慢 2.2×）** |
-| helper CUDA1 | 01:00 | **Gen1 x4 @ 2.5 GT/s** | 1.25 GB/s | **0.81 GB/s（pinned+async 与 pageable+sync 同速 = 链路上限）** | 3.3 TF | **真 `__dp4a`（sm_61）** |
-| helper CUDA2 | 02:00 | 同上 | 1.25 GB/s | 0.81（同上） | 3.3 TF | 真 DP4A |
-| helper CUDA3 | 05:00 | 同上 | 1.25 GB/s | 0.79（同上） | 3.3 TF | 真 DP4A |
+| 主卡 P100-12G | 03:00 | `Speed 8GT/s (ok), Width x8 (downgraded)` → **Gen3 x8** | 8 GB/s | **6.05–6.13 GB/s = 链路的 76%** | **18.7 TF（峰值，无 int8 tensor）** | **无真 DP4A，int8 走 4×vmad 回退** |
+| helper P104 ×3 | 01/02/05:00 | `Speed 2.5GT/s (ok), Width x4 (ok)` → **Gen1 x4** | 1.25 GB/s | **0.79–0.81 GB/s = 链路的 65%** | 3.3 TF | **真 `__dp4a`（sm_61）** |
 
-**关键纠正**（2026-10-24 换槽后重测，三条）：
-- **PCI 槽位变了**：P100 换到 **03:00**（`LnkCap: Port #2, Speed 8GT/s, Width x16`，但
-  `LnkSta: Speed 8GT/s (ok), Width x8 (downgraded)` —— **协商成 x8**，理论单向 8 GB/s）；
-  三张 P104 在 **01/02/05:00**（`LnkSta: Speed 2.5GT/s (ok), Width x4 (ok)`，
-  Gen1 x4，理论单向 1.25 GB/s）。**helper 的链路只有主卡的 1/6**——这才是 helper 下腿慢的
-  结构原因。
+**关键纠正（相对上一版）**：
 - **「P100 的 H2D 只有 3 GB/s」是探针方法错**，不是硬件上限。旧探针用 pageable 源 + 同步
-  `cudaMemcpy`，量的是「驱动逐页拷进 staging 再 DMA」的慢路径。改用 pinned 源 +
-  `cudaMemcpyAsync` 侧流后实测 **6.05–6.13 GB/s = Gen3 x8 链路的 76%**。详见 §4。
-- **helper 的 0.81 GB/s 不是引擎上限，是 PCIe 链路上限**：pinned+async 与 pageable+sync
-  **同速**（0.81 vs 0.81），换源类型不动分毫 → DMA 引擎已经贴住 1.25 GB/s 的 Gen1 x4 链路
-  （吃到 65%）。**helper 下腿的墙是插槽，不是代码。**
-- P100（GP100）**没有 int8 tensor core**（Pascal 里只有 GP104 有真 `__dp4a`），
-  所以主卡 int8 走 4×vmad 回退。主卡的优势只在 **FP16（18.7 TF，helper 的 2×）**。
+  `cudaMemcpy`，量的是「驱动逐页拷进 staging 再 DMA」的慢路径。换 pinned 源 +
+  `cudaMemcpyAsync` 侧流后实测 **6.05–6.13 GB/s**。
+- **helper 的 0.81 GB/s 不是低报，是链路上限**：pinned+async 与 pageable+sync **完全同速**
+  （0.81 vs 0.81），换源类型不动分毫 → DMA 引擎已经贴住 Gen1 x4 链路。**helper 下腿没有软件解。**
+- **P100 在 03:00 是 x8 槽被降级成 x8 宽度**（`LnkCap: Width x16` 但 `LnkSta: Width x8
+  (downgraded)`），所以换槽前后带宽一样（第一版实测 4 MiB 3.77→3.65、16 MiB 4.10→3.93，
+  ±5% 噪声内）。
 
-## 2. 三个子问题逐一答
+## 2. 专家权重是量化的 —— 「主卡走 FP16 GEMM」不成立
 
-### 2.1 「prefill 用 helper 的 DP4A」—— 已经在用，不是待做
+从 gguf 读出的张量类型（`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`）：
 
-`STRATA_Q36_PREFILL_PEERS`（编码修复后）就是干这个的：3 张 P104 按 `e % 3` 拿
-3440/3400/3400 专家/层，helper 侧 MMQ 跑在 sm_61 真 `__dp4a`。prefill 的 `helper_wait`
-13.5 ms/层 **就是 helper DP4A 在干活的账单**。所以「prefill 用 helper DP4A」= 现状，
-不是要做的优化。
+```
+blk.0.ffn_gate_exps.weight   type 12  dims [2048, 512, 256]   <- Q4_K
+blk.0.ffn_up_exps.weight     type 12  dims [2048, 512, 256]   <- Q4_K
+blk.0.ffn_down_exps.weight   type 13  dims [ 512, 2048, 256]  <- Q5_K
+```
 
-### 2.2 「主卡 FP16 18.7 TF 闲置吗」—— 是的，且现在吃不到
+`q36_engine.cu:1468-1473` 的 `native_expert_layout` 把这两个类型算成每专家
+`L.bytes`（gate+up+down 三个量化矩阵），`L.blobs` 是 `uint8_t*`（`:1244`）。
+**主卡算专家走 `moe_mmq.cu` 的 int8 MMQ**（`q36_engine.cu:2375-2382` 的 `use_mmq`），
+helper 走 `remote_experts.cpp` 的 native grouped kernel —— 两条路都是**边读边反量化**
+（on-the-fly dequant），不是「先反量化成 FP16 再 GEMM」。
 
-prefill 主卡现在只算 shared expert（`primary_work = 0.745 ms/层`），专家全在 helper。
-主卡 18.7 TF 的 FP16 **完全闲置**。要吃上，得把一部分专家挪回主卡、且走 **FP16 GEMM
-（`K::mm`，`q36_engine.cu:2786` 的 `T > kGemmT` 分支）**，而不是现在 keep-resident 的
-MMQ int8 回退（那吃的是主卡的劣势，不是优势）。
+所以：**主卡的 18.7 TFLOP/s FP16 算力在这条专家路径上根本没被用到，
+而且用不上**——权重是 4-bit/5-bit 量化数据，要吃 FP16 得先反量化，那比直接算还贵。
+`q36_engine.cu:3122` 的 `K::mm` FP16 分支是给 dense 投影（attention / shared expert）用的。
 
-### 2.3 「流式多少专家给主卡」—— 受两条硬上限
+模型形状（gguf kv）：`n_embd=2048`、`expert_ff=512`、256 专家/层、41 层、`top_k=8`。
 
-- **H2D 引擎**：主卡算 X 个专家/层要 H2D `1.83 MiB × X`。按实测 6.07 GB/s：
-  X=44 → 80.5 MiB / 6.07 GB/s = **13.3 ms/层**（与 helper_wait 13.5 ms 刚好持平）。
-  若主卡引擎只吃到 4 GB/s（pageable 那种走法），X=44 → 20 ms/层（比整层还长，不可行）。
-  **主卡引擎吃多少 = 全案成立与否的前提。**
-- **主卡 sm_60 回退**：主卡 int8 MMQ 比 helper sm_61 DP4A 慢 2.2×。若主卡走 **FP16**
-  （18.7 TF），则反过来**比 helper 快 2×**（helper FP16 合计 9.9 TF）——所以主卡那部分
-  **必须走 FP16，不能走 int8 回退**，否则把活送进最慢的路径。
+## 3. 「prefill 用 helper 的 DP4A」—— 已经在用
 
-## 3. 落点（最小、opt-in、不碰默认数值路径）
+`STRATA_Q36_PREFILL_PEERS` 就是干这个的：3 张 P104 按 `e % 3` 拿 3440/3400/3400 专家/层，
+helper 侧 MMQ 跑在 sm_61 的真 `__dp4a`。prefill 的 `helper_wait` 13.3 ms/层
+**就是 helper DP4A 在干活的账单**。所以这一项 = 现状，不是待做。
 
-**形状**：主卡算 X 个专家（按热度挑**最冷**的 X，因为主卡 FP16 优势最大但 H2D 也最贵，
-冷专家行数少、H2D 占的权重字节按专家数不按行数，选冷专家让 H2D 字节不落在热点上），
-helper 少算 X 个。主卡那 X 个走 **FP16 GEMM**（`K::mm`），helper 那部分不变（DP4A）。
+## 4. 关键路径实测（`STRATA_Q36_PROMPT_TIMING=1`，2026-10-24 远端）
 
-**改动点**（都 opt-in，旗标 `STRATA_Q36_PRIMARY_FP16=N`，N = 每层主卡算的专家数，0 = 关）：
-1. `open_helpers` 的 `filter_resident`（`q36_engine.cu:6320`）：现在只滤主卡 `slot_of≥0` 的
-   39 个。改成按**热度排序取最冷的 N 个**（`H.score` 在 `place_experts` 后是 0，得用启动时
-   的静态热度 = 前 N 个冷 id；或保持 39 个常驻槽不动，N 只在这 39 个里选）。
-2. `layer()` 的 MMQ 分支（`q36_engine.cu:3247` 的 `gu`/`dn` 两段 `mctx->run`）：主卡那
-   `n_local = N` 个专家，`N > 0` 时改发射 `mm`（FP16）而不是 MMQ int8。`n_local = 0`
-   （N=0，现状）时不发射（`Context::run` 的 `max_rows > 0` 短路）。
-3. `stream_kick`（`q36_engine.cu:3563`）：主卡那 N 个走 H2D（host 内存）还是 D2D
-   （`L.blobs` 39 个常驻）取决于 N 与 39 的关系——N ≤ 39 走 D2D（不花 PCIe），
-   N > 39 多出的走 H2D。
+两臂，同一台机同一天。P1 = `bin/strata-q36.krd`（keep-resident 默认开），
+P2 = `bin/strata-q36.own`（编码修复基线）。**每层 ms，bench 0-2 聚合（40 层 × 3 pass）**：
 
-## 4. 待测 → 已量（#1 主卡 H2D，2026-10-24，远端 192.168.1.98）
-
-### 4.1 第一版探针：方法错，数字偏低
-
-`/tmp/h2d` 用 **pageable 源 + 同步 `cudaMemcpy`**。这条路径驱动要把源先逐页拷进 staging
-缓冲再 DMA，比引擎实际走的路径慢。换槽前后各量一次（`cuDeviceGetName`：dev 0=P100，
-dev 1/2/3=P104）：
-
-| 卡 | 位置 | 4 MiB | 16 MiB | 64 MiB |
-|---|---|---|---|---|
-| **主卡 P100（换槽前）** | 05:00, dev 0 | **3.77** | **4.10** | 2.99 |
-| **主卡 P100（换槽后）** | 03:00, dev 0 | 3.65 | 3.93 | 3.00 |
-| helper P104 ×3 | 05/01/02:00, dev 1/2/3 | ~0.78 | 0.79–0.80 | — |
-
-旧的大小扫描（dev 0）：1 MiB 2.88 / 4 MiB 3.64 / 8 MiB 3.84 / **16 MiB 4.06（峰值）** /
-32 MiB 3.01 / 64 MiB 2.93 / 128 MiB 2.99。
-
-**我曾据此写下「这条路径的持续吞吐就是 ~3 GB/s，是 P100 H2D 引擎的硬件上限」——这句是错的。**
-错在把 pageable+sync 的低效路径当成了硬件上限。链路本身是 Gen3 x8 @ 8.0 GT/s
-（理论单向 8 GB/s），实测只吃到 46–51%，那是**方法**的问题，不是卡的问题。
-
-### 4.2 第二版探针：pinned 源 + `cudaMemcpyAsync`（引擎实际走的路）
-
-`/tmp/h2d2`，两条路径同机对照（cudaEvent 计时，warm 3 次 + 正式迭代）：
-
-| 大小 | pageable+sync | **pinned+async** | 提升 |
+| span | P1（keep 开） | P2（keep 关） | 是什么 |
 |---|---|---|---|
-| 4 MiB | 3.82 | **6.13** | +60% |
-| 16 MiB | 4.04 | **6.05** | +50% |
-| 64 MiB | 4.18 | **6.07** | +45% |
-| 128 MiB | 4.18 | **6.07** | +45% |
-| 256 MiB | 4.20 | **6.06** | +44% |
+| mixer | 7.04 | 7.02 | GDN / attention 投影 |
+| router_route | 0.26 | 0.23 | router + route 核 |
+| route_d2h | 0.05 | 0.05 | 路由 D2H + 阻塞同步 |
+| **plan** | **6.79** | **6.82** | **peer 计划的 host 侧工作（GPU 空转）** |
+| primary_work | 4.68 | 0.76 | 主卡自己的 MMQ + shared expert |
+| **helper_wait** | **7.65** | **13.29** | **等 helper 的行 + 上腿 H2D** |
+| combine | 0.20 | 0.19 | moe_end |
+| **forward** | **26.67** | **28.37** | **整层** |
+| HOST: prep_sync | 5.11 | 5.14 | `prepare_end()` 等行计划 |
+| HOST: peer_plan | 6.77 | 6.70 | 计划总 host 墙 |
+| HOST: sync3022 | 18.66 | 20.55 | 路由 D2H 的阻塞同步 |
 
-**MEASURED：P100 的 H2D 持续吞吐 = 6.05–6.13 GB/s**（pinned 源 + `cudaMemcpyAsync` 侧流），
-= Gen3 x8 理论 8 GB/s 的 **76%**。4 MiB 以上基本是一条平线（6.05–6.13），不再随大小掉。
+**host 墙里最刺眼的一个数**（`the plan's host wall per layer`）：
 
-**引擎走的就是这条**：`L.hblobs` 是 `cudaHostAlloc` 的 pinned host 内存，拷贝是
-`cudaMemcpyAsync` on `cst` 独立流（`q36_engine.cu` 的 `stream_kick`）。所以 6.07 就是引擎
-能拿到的数，不是探针的数字游戏。
+```
+wait=5.583 (helper CUDA1 4.947, CUDA2 0.007, CUDA3 0.164)
+```
 
-**换槽（05:00 → 03:00）对 P100 的 H2D 带宽没有影响**（第一版数据 4 MiB 3.77→3.65、
-16 MiB 4.10→3.93，都在 ±5% 噪声内）。换槽前后的差别是**槽位型号**（x8 槽 → x16 槽），
-但**协商宽度被主板降级成 x8**（`LnkSta: Width x8 (downgraded)`）——所以两边的链路宽度其实一样，
-带宽自然一样。
+**CUDA1 一个人占 5.0 ms，CUDA2/CUDA3 几乎为 0。** 这不是「CUDA3 慢 3.2×」那个
+收割顺序效应（`plans/2026-10-24-q36-helper-imbalance-review.md` 复核过），
+是**第一张被等的 helper 把全部等待吃掉了**。
 
-### 4.3 helper 的 H2D：pinned+async 重测（0.81 是链路上限，不是低报）
+## 5. 为什么 CUDA1 独占 5 ms：下腿的窗口拷贝
 
-用同一个 `/tmp/h2d2`（64 MiB × 30）跑四张卡：
+`PeerPrefill36::prepare_begin`（`q36_peer_prefill.cu:799-847`）在 host 路线下做：
+- 主卡 D2H 一次：`n_tok × n_embd × 4` = 512×2048×4 = **4 MiB** 激活 + 16 KiB 路由
+  （`q36_engine.cu:4130`，**只拷一次，三个 helper 共用**，这一版已经优化过）。
+- 然后**每个 helper 各自** H2D 一份同样的 4 MiB（`q36_peer_prefill.cu:841`，
+  `cudaMemcpyAsync(m.d_x, m.h_x_use, ...)`）。
+- `prepare_end()`（`:898`）阻塞等这张卡把拷贝 + 4 个行计划核做完。
 
-| CUDA dev | 卡 | PCI | pageable+sync | **pinned+async** |
+**算账**（helper 链路实测 0.81 GB/s）：
+
+```
+4 MiB ÷ 0.81 GB/s = 5.18 ms   <- 与实测 CUDA1 wait 4.95-5.02 ms 吻合
+```
+
+**这个 5 ms 就是「第一张被等的 helper 的下腿传输时间」**，CUDA2/CUDA3 的 0.007/0.164
+是因为它们的 `prepare_end` 在 CUDA1 之后才轮到，窗口早已上传完（**收割顺序效应**）。
+
+**总账**：三个 helper 各 4 MiB = **12 MiB/层**，全在 0.81 GB/s 的链路上 = **15.5 ms/层**，
+占 forward 26.7 ms 的 **58%**。
+
+**而且 P2P 走不了**：远端日志明写
+`q36 peer prefill: CUDA1's prompt rows cross through host staging (no peer link with CUDA0:
+peer access is not supported between these two devices)`。所以下腿是
+**主卡 D2H → host → helper H2D 两段**，两段都吃 PCIe，且 helper 那一端只有 0.81 GB/s。
+
+## 6. 那「主卡多算专家」这条路的账
+
+主卡算 X 个专家/层要 H2D `1.83 MiB × X`（一个专家的量化权重：gate+up 各
+2048×512 的 Q4_K + down 512×2048 的 Q5_K，合计 ≈ 1.83 MiB）。
+
+- **可行性上界**（H2D 不超过 helper_wait 13.3 ms）：`1.83N / 6000 ≤ 13.3` → **N ≤ 43**。
+- **盈利上界**：主卡每多算 1 个专家，H2D 成本 = 1.83 MiB / 6.07 GB/s = **316 µs**；
+  而 helper 算 1 个专家省下的时间 = 13.3 ms / 10240 专家 ≈ **1.3 µs**。
+  **差 240 倍。** H2D 字节按专家数、不按行数，主卡每多算 1 个专家就白搬 1.83 MiB。
+
+**结论：净收益 ≈ 0 或负。** keep-resident 的 39 个（D2D，0 PCIe）已是主卡能吃的上限。
+
+## 7. 真正能动的地方：下腿的字节
+
+下腿传的是 **fp32 激活**。这是纯浪费——helper 侧立刻就把它量化成 q8_1 算
+（`q36_peer_prefill.cu:945` 的 `MMQ::quantize`）。fp32 → fp16 或 q8 都能省一半到四分之三：
+
+| 激活格式 | 每 helper 每层 | 一个 helper | 3 个 helper | 占 forward |
 |---|---|---|---|---|
-| dev 0 | P100 | 03:00（Gen3 **x8**） | 4.17 | **6.07** |
-| dev 1 | P104 | 01:00（Gen1 x4） | 0.81 | **0.81** |
-| dev 2 | P104 | 02:00（Gen1 x4） | 0.81 | **0.81** |
-| dev 3 | P104 | 05:00（Gen1 x4） | 0.79 | **0.79** |
+| **fp32（现状）** | 4.00 MiB | 5.18 ms | **15.5 ms** | **58%** |
+| fp16 | 2.00 MiB | 2.59 ms | 7.8 ms | 29% |
+| q8_1 | 1.00 MiB | 1.29 ms | 3.9 ms | 15% |
 
-**MEASURED：三张 P104 的 pinned+async 与 pageable+sync 完全同速**（0.81 vs 0.81）。
-这和 P100 的行为**相反**，说明差别在硬件层：
+**代价的诚实账**：主卡 D2H 那 4 MiB 也要跟着缩（4 MiB → 1 MiB），
+主卡那一端 6.07 GB/s 只省 0.66 ms；真正的大头是 helper 那一端。
+数值上：激活转 fp16 的相对误差 < 1e-3（fp16 尾数 10 bit），
+但**helper 侧本来就要量化成 q8_1（8 bit）**，所以 fp16 这一步**在数值上几乎免费**
+——q8_1 的量化误差远大于 fp16 的截断误差。**但这会改数值路径，logits 不再逐字节相同，
+必须实测。**
 
-- P100：换源类型就快 45% → 它原先被 pageable 的逐页 staging 拖住，换成 pinned 就贴住链路上限。
-- P104：**换源类型一点不变** → 它**已经在贴 PCIe 链路上限**了。Gen1 x4 理论 1.25 GB/s，
-  实测 0.81 = 链路的 65%。
+**下腿没有现成旗标**：`STRATA_Q36_PEER_F16` 管的是**上腿**（helper → 主卡的行用 fp16，
+`q36_engine.cu:1956-1962`），**下腿的激活仍是 fp32**。要做要新加一个。
 
-**所以我先前的怀疑（0.85 是 pageable 测的、可能低报）不成立**——pinned+async 一点没涨。
-helper 下腿的墙**是插槽（Gen1 x4），不是代码，也不是 DMA 引擎**。这条对「怎么提升 prefill」
-影响很大：helper 的下腿 H2D 没有软件解法，**只有换槽/换板**能改。
+## 8. 判断（按实测重算）
 
-### 4.4 三条更正（对 q36 的影响）
+- **prefill 用 helper DP4A：已在用**（`helper_wait` 13.3 ms 就是它）。
+- **主卡 FP16 18.7 TF：吃不上，也不该吃**（§2：专家权重是 Q4_K/Q5_K，走量化 MMQ，
+  不走 FP16 GEMM；而且每专家 316 µs 的 H2D 只换来 1.3 µs 的算力节省）。
+- **prefill 的真墙：helper 的下腿**（12 MiB/层 @ 0.81 GB/s = 15.5 ms/层 = forward 的 58%）。
+  这不是代码写得不好，是 **Gen1 x4 插槽**。软件能做的只有**少传字节**（fp32 → fp16/q8，
+  能省 4–12 ms/层），**换槽位/换板**能做的更多。
+- **P100 在 03:00 被降级成 x8 宽度**（`LnkCap x16` 但 `LnkSta: x8 downgraded`），
+  主卡那一端还有一倍没吃满 —— 但主卡不是瓶颈，这不重要。
 
-1. **主卡可用 H2D = 6.07 GB/s**（不是 3、不是 4.1、不是 8）。= Gen3 x8 链路的 76%。
-2. **N 的可行上界**：`1.83 MiB × N / 6000 ≤ 13.5 ms` → **N ≤ 44**（旧数按 3.0 反推是 22）。
-   但这只是「H2D 不超过 helper_wait」的**可行性**上界，不是**盈利**上界——见 §5。
-3. **helper 的 0.81 GB/s 是链路上限**（Gen1 x4 的 65%），**没有软件解**。
+## 9. 下一步（按性价比排）
 
-#2（主卡 FP16 小 GEMM 实际吞吐）**仍未量**，是下一个前提。
+1. **下腿激活 fp16 或 q8**（新旗标，opt-in）：每个 helper 省 2.6 / 3.9 ms/层，
+   3 个 helper 串行省 7.8 / 11.7 ms/层。forward 26.7 → 约 19 / 15 ms/层。
+   **数值路径会变，logits 要逐行对照**（AGENTS.md：改了默认必须实测）。
+2. **把 `prepare_end` 的等待从「按 r 序」改成「按传输完成序」**：现在 CUDA2/CUDA3 的
+   0.007 ms 说明它们的窗口早就传完了，但 host 仍按 r 序等 CUDA1 第一个。
+   改成「谁先好谁先收」不能省时间（总传输量不变），但能让 GPU 提前开始算——
+   **这条要配合「launch 能否在 wait 之前发」的检查**。
+3. **换硬件**：把三张 P104 换到 x16 槽（主卡 03:00 那个是 Gen3 x16 槽，现在协商成 x8，
+   主板在降级）。helper 换到宽槽，下腿能快 6–10 倍。
+4. **不再做**：主卡多算专家（§6 净收益负）、主卡 FP16 专家 GEMM（§2 前提不成立）。
 
-## 5. 判断（按 #1 的实测重算）
-
-- **prefill 用 helper DP4A：已在用**（`helper_wait` 13.5 ms 就是它）。
-- **主卡 FP16 18.7 TF：现在闲置**，要吃上得「主卡多算 X 个专家 + 走 FP16 不走 int8 回退」。
-- **主卡 H2D 实测 6.07 GB/s**（pinned+async；不是 3、不是 4.1、不是 8、不是 0.85）。重算 N：
-  - **可行性上界**（H2D 不超过 helper_wait 13.5 ms/层）：
-    `1.83 MiB × N / 6.07 GB/s ≤ 13.5 ms` → **N ≤ 44**。
-  - **盈利上界**（H2D 成本要小于 helper 算那些专家省下的时间）：主卡每多算 1 个专家，
-    H2D 成本 = 1.83 MiB / 6.07 GB/s = **316 µs**；而 helper 算 1 个专家省下的时间
-    = 13.5 ms / 10240 专家 ≈ **1.3 µs**。**两者差 240 倍** —— H2D 字节按专家数、不按行数，
-    主卡每多算 1 个专家就白搬 1.83 MiB。
-  - 所以 **N ≤ 44 是「不拖慢」的极限，N = 0 才是「不亏」的极限**。即使 N 提到 44（比
-    keep-resident 的 39 还多 5 个），净收益也是**大幅负数**。
-- **结论**：在这台盒子（主卡 H2D 6.07 GB/s、helper DP4A 快、helper_wait 13.5 ms 是关键路径），
-  **「流式一部分专家给主卡」的净收益 ≈ 0 或负**——主卡的 H2D 成本（每专家 316 µs）远超
-  helper 算那 1 个专家的省幅（1.3 µs）。**keep-resident 的 39 个（D2D，0 PCIe）已是主卡能吃
-  的上限**（39 个常驻槽的权重已经在 VRAM，不花 H2D），再多就撞 H2D 墙。
-- **真正能提升 prefill 的不是「主卡多算专家」**，而是**把 helper_wait 13.5 ms 压下来**。
-  helper 下腿的 H2D 实测 **0.81 GB/s = Gen1 x4 链路的 65%**，而且 pinned+async 与
-  pageable+sync **完全同速**（§4.3）——**这是 PCIe 插槽的墙，不是软件的墙**。§max-rows §3b
-  证过它藏不掉；现在多知道一条：**也压不动**（源类型不是杠杆）。
-  唯一能动的是**硬件**：把 P104 换到宽槽（x16 / Gen3），helper 的下腿能快 6–10 倍。
-  或者让主卡那 6.07 GB/s 的 H2D **和 helper 的链路并行吃**（主卡 P100 在 03:00、helper 在
-  01/02/05:00，`nvidia-smi topo -m` 显示四卡两两 **PHB**——各自独立 Host Bridge，物理上能并行，
-  但各自的 DMA 引擎吞吐独立）。
-
-## 6. 与 keep-resident 的关系
-
-keep-resident（`79a1ebca`，已默认开）是这条路的第一步：主卡算自己 39 个常驻槽的专家
-（D2D，0 PCIe），decode 掉 12.5%、prompt 持平。本方案（N>39 的流式扩展）按 §5 的 H2D 墙
-**不可行**：可行性上界 N ≤ 44 只比 39 多 5 个，而盈利上界是 0。**主卡 39 个 D2D 专家已是
-这台盒子的最优解**，prefill 的天花板在 helper 的下腿 H2D（0.81 GB/s = Gen1 x4 链路的 65%，
-**硬件墙**），不在主卡。
-
-## 7. 一句话给下一个人
-
-想在这台盒子提升 prefill，**软件层面已经到顶**：
-
-- 主卡的 18.7 TF FP16 吃不上，因为每搬 1 个专家要 316 µs 的 PCIe，而 helper 算它只省 1.3 µs。
-- helper 的下腿 0.81 GB/s 是 Gen1 x4 插槽的物理上限，软件压不动。
-- **唯一的下一步是换硬件**：把三张 P104 换到 x16 槽（主卡在 03:00 占的那个是 Gen3 x16 槽，
-  现在协商成 x8 —— 换过去的主卡可能也能恢复满 x16）。换槽后重测这三条数，再谈优化。
+#2（主卡 FP16 小 GEMM 实际吞吐）**已不需要测**——§2 说明专家不走 FP16，
+主卡 FP16 算力在这条路上用不上。
