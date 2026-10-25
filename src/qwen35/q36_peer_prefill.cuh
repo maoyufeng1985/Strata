@@ -9,6 +9,11 @@
 // device, reading the weights IN PLACE from that cache - no H2D of the blob at all.  Its result rows go straight
 // into the primary's `eparts` across the P2P link (cudaMemcpyPeerAsync), never through host memory.
 //
+// STRATA_Q36_PEER_SUM=1 changes WHAT comes back, not the arithmetic: the helper adds up its own rows per token
+// (with the routing weights the primary sends up) and sends one weighted sum per token instead of one row per
+// routed entry - the bytes then follow the prompt's tokens instead of the routing's fan-out.  That route needs the
+// host route and a packed transport, and the sums land in the primary's own buffer, not in `eparts`.
+//
 // THIS IS DELIBERATELY NOT PeerExperts (src/core/peer_experts.cpp) NOR RemoteExperts::begin: both are fixed to
 // their own window geometry (PeerExperts: H = 2560 / CAP = MAXT*10 / O(n^2) de-duplication; RemoteExperts::begin:
 // n_tok <= MAXT <= 8).  A prompt chunk is thousands of entries wide and q36's rows are 2048, so neither launch
@@ -113,6 +118,10 @@ public:
     /// share the same window: without it the primary copies the same 4 MiB out once per helper, three times over.
     /// Null means "stage it yourself", which is what a caller that prepares one helper at a time wants.
     ///
+    /// `wts_staged`: STRATA_Q36_PEER_SUM=1 - the routing weights, one per entry, in the caller's shared staging.
+    /// The helper needs them to form the per-token weighted sums (without them the sums cannot be formed, and
+    /// prepare_begin() refuses the layer).
+    ///
     /// `q8_window`: the staged activations are ALREADY in q8_1 (the format the products read) instead of fp32.
     /// The caller quantized them, so the helper GATHERS the rows it owns instead of quantizing them - the bytes
     /// are the ones its own quantize() would have produced (the same function, the same row values), so the
@@ -121,7 +130,8 @@ public:
     /// prompt sends up.  With it set, `h_staged` is REQUIRED (the caller has to have quantized the window: the
     /// helper cannot quantize a window that never arrived in fp32).
     bool prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok, std::string& err,
-                       const void* h_staged = nullptr, const int32_t* ids_staged = nullptr, bool q8_window = false);
+                       const void* h_staged = nullptr, const int32_t* ids_staged = nullptr, bool q8_window = false,
+                       const float* wts_staged = nullptr);
     /// The second half: wait for the helper's stream and read the owned-row count and the widest expert back.
     /// Must follow a successful prepare_begin() for the same layer on the same helper.
     bool prepare_end(std::string& err);
@@ -129,6 +139,10 @@ public:
     /// Compute this helper's owned entries of the window prepare() staged, on the helper, and write their rows
     /// into the PRIMARY's `eparts` starting at `eparts_row_base` (the run order documented above).
     /// `cap_entries` and the staged window bound it; nothing here reads host memory.
+    ///
+    /// STRATA_Q36_PEER_SUM=1: what is sent is not the run of rows but the PER-TOKEN WEIGHTED SUMS - one row per
+    /// token of the window - so `eparts_row_base` names nothing (the sums have no rows in the primary's `eparts`)
+    /// and the caller reads transport_rows() to learn how many rows arrived.
     bool launch(int64_t layer, float* eparts_primary, int64_t eparts_row_base, std::string& err);
 
     /// Record the helper's completion and make the PRIMARY stream `st_primary` wait for it, so a kernel the caller
@@ -143,6 +157,10 @@ public:
 
     /// Owned entries the last launch() computed (0 before any), and launches so far (the evidence line's numbers).
     int64_t rows() const;
+    /// STRATA_Q36_PEER_SUM=1: the rows the last launch() SENT - the per-token sums' count when the sums are on (one
+    /// row per token of the window), the run's row count otherwise.  The primary unpacks that many rows, so it needs
+    /// the number: the sums' rows are not the run's rows.
+    int64_t transport_rows() const;
     int64_t launches() const;
 
     /// The widest expert of the last PREPARED layer's row plan - the launch grid's column bound (MMQ's

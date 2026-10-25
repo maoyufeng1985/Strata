@@ -87,6 +87,24 @@ static bool peer_i8() {
     return on;
 }
 
+/// STRATA_Q36_PEER_SUM=1: the rows come back as one WEIGHTED SUM PER TOKEN instead of one row per routed entry.
+/// The primary combines the prompt's experts with the routing weights, so what it needs per token is a weighted
+/// sum; the helper can form it (it has the rows and, with the weights the primary sends up, the weights) and send
+/// one row per token instead of one per entry.  The bytes then scale with the prompt's TOKENS and not with the
+/// routing's fan-out: on 192.168.1.98 (2026-10-26) a helper sends 1152 rows for a 512-token window, and the sums
+/// are 512 - 2.25x less - on a link that measured 0.58 GB/s, where the down leg was 8.13 ms of the layer's 21.6.
+///
+/// The arithmetic is the same sum, formed in the helper's order instead of the primary's, so the numbers move by
+/// the order of the additions and not by the transport's precision.  OFF by default: with the variable unset not
+/// one byte and not one kernel changes.
+static bool peer_sum() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_Q36_PEER_SUM");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
 /// The bytes one row takes in the int8 transport: the values (one byte each) and the scales (one fp32 per 128
 /// values).  The same number on both sides of the link - the primary unpacks with it.
 static size_t i8_row_bytes(int64_t n_cols) {
@@ -174,9 +192,17 @@ __global__ void k_peer_scan(int32_t* __restrict__ cnt, int n_pos, int32_t* __res
 /// Each owned entry to a row: `src` = its token (the quantizer's gather), `dst` = its RANK (the product's output row
 /// inside the helper's run).  The expert order decides which activation row it lands on; the rank decides where its
 /// result goes - MMQ writes dst row `ids[activation row]`, so the run's order and the plan's order stay independent.
+///
+/// TWO ROW SPACES, and they are not the same.  The HELPER'S OWN rows (`src`, `wgt` and the activation rows) are in the
+/// expert order - the rank inside an expert group comes from an atomic, so it is not the same from run to run.  The
+/// PLAN'S rows (`rank`, and the result rows the products write) are in the entry order - a prefix count over the
+/// entries, so they are the same in every run.  `inv` is the map from the plan's rows back to the helper's own rows:
+/// the sums' kernel walks the plan's rows (a fixed order, so the sum is the same in every run) and needs each row's
+/// own token and weight, which live in the helper's own space.
 __global__ void k_peer_scatter(const int32_t* __restrict__ ids, const uint8_t* __restrict__ owned,
                                const int32_t* __restrict__ pos, const int32_t* __restrict__ rank, int n_ent, int k,
-                               int32_t* __restrict__ cur, int32_t* __restrict__ src, int32_t* __restrict__ dst) {
+                               int32_t* __restrict__ cur, int32_t* __restrict__ src, int32_t* __restrict__ dst,
+                               const float* __restrict__ wts, float* __restrict__ wgt, int32_t* __restrict__ inv) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_ent) return;
     if (!owned[ids[e]]) return;
@@ -185,6 +211,12 @@ __global__ void k_peer_scatter(const int32_t* __restrict__ ids, const uint8_t* _
     const int r = atomicAdd(&cur[p], 1);
     src[r] = e / k;
     dst[r] = rank[e];
+    // STRATA_Q36_PEER_SUM=1: the routing weight of this entry, in the HELPER'S OWN row order (the sums' kernel
+    // walks the plan's rows and picks each one's helper row through `inv`).  Null when the sums are off: then no row
+    // is ever read for a weight and the row order does not carry one.
+    if (wgt != nullptr) wgt[r] = wts[e];
+    // ... and the way back from the plan's rows to the helper's own rows.
+    if (inv != nullptr) inv[rank[e]] = r;
 }
 
 /// STRATA_Q36_PEER_F16=1: the up leg's packing.  `src` (fp32) becomes `dst` (fp16), element for element: the row
@@ -296,6 +328,40 @@ __global__ void k_pack_i8(const float* __restrict__ src, uint8_t* __restrict__ d
     }
 }
 
+/// STRATA_Q36_PEER_SUM=1: THE PER-TOKEN WEIGHTED SUMS.  The helper's rows are one per owned entry; the primary
+/// wants, per token, the weighted sum of the entries the routing gave it.  The helper can form that sum (it has
+/// the rows and, with the weights the primary sends up, the weights) and send one row per TOKEN instead of one per
+/// entry - 2.25x fewer rows on a 512-token window (512 instead of 1152), and the bytes then scale with the prompt's
+/// tokens instead of with the routing's fan-out.
+///
+/// One warp per token: the warp walks the PLAN'S rows in the plan's order - the plan's row p is the entry with the
+/// p-th rank among the owned entries, which is a prefix count over the entries, so the order is the same in every
+/// run - and accumulates the rows that are its token's.  `inv[p]` is that row's own row in the HELPER'S space, where
+/// the token (`src`) and the weight (`wgt`) live; `rows[p]` is the row itself (the products write the plan's rows).
+/// The two spaces are different: the helper's own rows are in the expert order (an atomic's order, which is not the
+/// same from run to run), and the plan's rows are in the entry order.  Walking the plan's rows and reaching through
+/// `inv` is what makes the sum the same in every run AND pairs every row with its own token and weight.
+///
+/// The walk is O(rows) per token - a segmented reduction over the plan's rows would be O(rows) in total.  The
+/// ceiling: the helper's own time, and with 1152 rows and 512 tokens the walk is 590k row checks against 9.4 MB of
+/// row data - the data dominates, so the scan is not what binds.  Upgrade path if it ever does: sort the plan's rows
+/// by token once (the plan already counts per expert) and give each token its own contiguous run.
+__global__ void k_peer_toksum(const float* __restrict__ rows, const int32_t* __restrict__ inv,
+                               const int32_t* __restrict__ src, const float* __restrict__ wgt,
+                               float* __restrict__ out, int n_rows, int n_tok, int n_cols) {
+    const int t = blockIdx.x * blockDim.y + threadIdx.y;
+    if (t >= n_tok) return;
+    const int lane = threadIdx.x;
+    float* acc = out + (size_t) t * (size_t) n_cols;
+    for (int p = 0; p < n_rows; ++p) {
+        const int r = inv[p];
+        if (src[r] != t) continue;
+        const float w = wgt[r];
+        const float* row = rows + (size_t) p * (size_t) n_cols;
+        for (int i = lane; i < n_cols; i += 32) acc[i] += w * row[i];
+    }
+}
+
 }  // namespace
 
 struct PeerPrefill36::Impl {
@@ -338,6 +404,15 @@ struct PeerPrefill36::Impl {
     unsigned int* h_i8max = nullptr;   // [1] its pinned copy, read back once per layer
     unsigned int* d_i8err = nullptr;   // [1] the largest error, as a fraction of the block's own magnitude
     unsigned int* h_i8err = nullptr;   // [1] its pinned copy
+    // STRATA_Q36_PEER_SUM=1: the per-token weighted sums.  d_sums holds them on the helper (one row per token of
+    // the window), d_wts the routing weights the primary sent up (one per entry) and d_wgt the same weights in the
+    // PLAN'S ROW ORDER (one per row of the helper's run) - the sums' kernel walks the rows and needs the weight of
+    // the row it picks.
+    float* d_sums = nullptr;   // [cap][n_embd] the per-token sums, on the helper
+    float* d_wts = nullptr;    // [cap]          the routing weights, as the primary sent them
+    float* d_wgt = nullptr;    // [cap]          the same weights, in the plan's row order
+    // The weights the primary staged for this layer (the shared staging, the same one every helper reads).
+    const float* h_w_use = nullptr;
     // What a host-route launch() left in h_out, and where it belongs.  It is remembered rather than uploaded at once
     // because wait() is the only method the caller hands the PRIMARY's stream to, and the upload has to be ordered
     // against the primary's own work there.
@@ -347,6 +422,9 @@ struct PeerPrefill36::Impl {
     // which format.  The down leg's shape is decided in launch() (which route the rows took) and read back here.
     bool pending_f16 = false;
     bool pending_i8 = false;
+    // STRATA_Q36_PEER_SUM=1: the rows the last launch() SENT (the per-token sums' count when the sums are on, the
+    // run's row count otherwise).  The primary unpacks that many rows, so it needs the number.
+    int64_t transport_rows = 0;
 
     // everything below is allocated on `device`
     float* d_x = nullptr;      // [cap][n_embd] the staged activations
@@ -361,6 +439,11 @@ struct PeerPrefill36::Impl {
     int32_t* d_ident = nullptr;    // [cap] identity row map: the products' "no reordering" table
     int32_t* d_src = nullptr;      // [cap] activation row -> token
     int32_t* d_map = nullptr;      // [cap] activation row -> output row of the run
+    // STRATA_Q36_PEER_SUM=1: the way back - the PLAN's row -> the helper's own row.  The plan's rows are in the
+    // entry order (a prefix count, the same in every run); the helper's own rows are in the expert order (an
+    // atomic's order).  The sums' kernel walks the plan's rows and needs each one's own token and weight, which
+    // live in the helper's own space - so it reaches through this map.
+    int32_t* d_inv = nullptr;      // [cap] the run's row -> the helper's own row
     int32_t* d_rank = nullptr;     // [cap] entry -> its rank among owned entries
     int32_t* d_pos = nullptr;      // [n_expert] expert -> position in the plan's expert order
     int32_t* d_cnt = nullptr;      // [n_expert + 1] rows per position
@@ -611,6 +694,17 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
         return false;
     }
     m.p2p = no_p2p.empty();
+    // STRATA_Q36_PEER_SUM=1: THE SUMS NEED THE HOST ROUTE AND A PACKED TRANSPORT.  The link route copies the rows
+    // straight into the primary's `eparts`, and `eparts` holds one row per ENTRY - the per-token sums are one row
+    // per token, which is a different layout.  The fp32 route has the same shape (it copies the rows into `eparts`),
+    // so the sums go with a packed transport (fp16 or int8), which is where the bytes are won anyway.
+    if (peer_sum() && (m.p2p || (!peer_f16() && !peer_i8()))) {
+        err = "q36 peer prefill: the per-token sums need the host route and a packed transport "
+              "(STRATA_Q36_PEER_F16=1 or STRATA_Q36_PEER_I8=1): the rows' layout is one row per entry and the sums' "
+              "is one row per token";
+        close();
+        return false;
+    }
     if (!ck(cudaStreamCreateWithFlags(&m.stream, cudaStreamNonBlocking), "helper stream", err) ||
         !ck(cudaEventCreateWithFlags(&m.ev, cudaEventDisableTiming), "helper event", err)) {
         close();
@@ -669,6 +763,21 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
             ck(cudaMalloc((void**) &m.d_i8max, sizeof(unsigned int)), "packed int8 magnitude", err) &&
             ck(cudaMalloc((void**) &m.d_i8err, sizeof(unsigned int)), "packed int8 error", err);
         if (!iok) {
+            close();
+            return false;
+        }
+    }
+    // STRATA_Q36_PEER_SUM=1: the per-token sums' buffers.  d_sums is one row per token of the window (the window's
+    // token count is at most the entry count, so `cap` rows is enough); d_wts and d_wgt are one weight per entry
+    // and per plan row; d_inv is the plan's row back to the helper's own row.  Allocated only when the flag is on,
+    // so a run without it allocates exactly what it allocated before.
+    if (peer_sum()) {
+        const bool sok =
+            ck(cudaMalloc((void**) &m.d_sums, nf * (size_t) n_embd * sizeof(float)), "per-token sums", err) &&
+            ck(cudaMalloc((void**) &m.d_wts, nf * sizeof(float)), "routing weights", err) &&
+            ck(cudaMalloc((void**) &m.d_wgt, nf * sizeof(float)), "routing weights in row order", err) &&
+            ck(cudaMalloc((void**) &m.d_inv, nf * sizeof(int32_t)), "the run's own rows", err);
+        if (!sok) {
             close();
             return false;
         }
@@ -766,7 +875,7 @@ void PeerPrefill36::close() {
         void* frees[] = {m.d_x,  m.d_x8, m.d_gu, m.d_h,       m.d_out, m.d_ys,   m.d_xq,     m.d_hq,
                          m.d_ids, m.d_ident, m.d_src, m.d_map, m.d_rank, m.d_pos, m.d_cnt,   m.d_cur,
                          m.d_bounds, m.d_maxr, m.d_owned, m.d_out16, m.d_f16max, m.d_f16rel,
-                         m.d_out_i8, m.d_i8max, m.d_i8err};
+                         m.d_out_i8, m.d_i8max, m.d_i8err, m.d_sums, m.d_wts, m.d_wgt, m.d_inv};
         for (void* p : frees)
             if (p != nullptr) cudaFree(p);
         if (m.ev != nullptr) cudaEventDestroy(m.ev);
@@ -817,6 +926,7 @@ void PeerPrefill36::close() {
     m.d_x = m.d_gu = m.d_h = m.d_out = m.d_ys = nullptr;
     m.d_xq = m.d_hq = nullptr;
     m.d_ids = m.d_ident = m.d_src = m.d_map = m.d_rank = nullptr;
+    m.d_inv = nullptr;
     m.d_pos = m.d_cnt = m.d_cur = m.d_bounds = m.d_maxr = nullptr;
     m.d_owned = nullptr;
     m.helper = nullptr;
@@ -845,7 +955,7 @@ bool PeerPrefill36::host_route() const { return !impl_->p2p; }
 
 bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok,
                                    std::string& err, const void* h_staged, const int32_t* ids_staged,
-                                   bool q8_window) {
+                                   bool q8_window, const float* wts_staged) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: prepare() on a closed executor"; return false; }
     if (h_primary == nullptr || ids_primary == nullptr) { err = "q36 peer prefill: null activations or routing"; return false; }
@@ -966,15 +1076,24 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
             // helper's upload is a quarter of the size - and the helper GATHERS its rows instead of quantizing
             // them, which is the same bytes its own quantize() would have written.
             m.h_x8_use = q8_window ? (const uint8_t*) h_staged : nullptr;
+            // STRATA_Q36_PEER_SUM=1: the routing weights, from the caller's shared staging (one copy for all the
+            // helpers, as the window and the routing are).  The helper needs them to form the per-token sums.
+            m.h_w_use = wts_staged;
         } else {
             if (q8_window) {
                 err = "q36 peer prefill: the q8_1 window needs the caller's staging (the helper cannot quantize "
                       "a window that never arrived in fp32)";
                 return false;
             }
+            if (peer_sum() && wts_staged == nullptr) {
+                err = "q36 peer prefill: the per-token sums need the caller's weights staging (the helper cannot "
+                      "form the sums without the routing weights)";
+                return false;
+            }
             m.h_x_use = m.h_x;
             m.h_ids_use = m.h_ids;
             m.h_x8_use = nullptr;   // this layer's window arrives in fp32: the helper quantizes it itself
+            m.h_w_use = wts_staged;
             On onp(m.primary);   // the two source pointers are the primary's: the copies run on its device
             if (!ck(cudaMemcpy(m.h_x, h_primary, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
                                cudaMemcpyDeviceToHost), "stage activations through host", err) ||
@@ -988,6 +1107,7 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
         m.h_x_use = nullptr;
         m.h_ids_use = nullptr;
         m.h_x8_use = nullptr;
+        m.h_w_use = nullptr;
     }
 
     On on(m.device);
@@ -1018,6 +1138,11 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
             !ck(cudaMemcpyAsync(m.d_ids, m.h_ids_use, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
                 "upload routing", err))
             return false;
+        // STRATA_Q36_PEER_SUM=1: the routing weights, one per entry (16 KB for a 512-token window).  The helper
+        // needs them to form the per-token weighted sums.
+        if (peer_sum() && !ck(cudaMemcpyAsync(m.d_wts, m.h_w_use, (size_t) n_ent * sizeof(float),
+                                              cudaMemcpyHostToDevice, m.stream), "upload routing weights", err))
+            return false;
     }
     if (m.n_pos == 0) {   // nothing resident for this layer: no entry can be owned, and no kernel has work to do
         // The row plan has nothing to plan and the stream has nothing queued, so prepare_end() will find the row
@@ -1035,7 +1160,10 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
     k_peer_count<<<grid1(n_ent), kThreads, 0, m.stream>>>(m.d_ids, m.d_owned, m.d_pos, n_ent, m.d_cnt);
     k_peer_scan<<<1, 1, 0, m.stream>>>(m.d_cnt, (int) m.n_pos, m.d_bounds, m.d_cur, m.d_maxr);
     k_peer_scatter<<<grid1(n_ent), kThreads, 0, m.stream>>>(m.d_ids, m.d_owned, m.d_pos, m.d_rank, n_ent, (int) m.k,
-                                                            m.d_cur, m.d_src, m.d_map);
+                                                            m.d_cur, m.d_src, m.d_map,
+                                                            peer_sum() ? m.d_wts : nullptr,
+                                                            peer_sum() ? m.d_wgt : nullptr,
+                                                            peer_sum() ? m.d_inv : nullptr);
     if (!ck(cudaGetLastError(), "row plan kernels", err)) return false;
 
     // THE TWO NUMBERS THE HOST NEEDS.  MMQ's launches are sized on the host (rows, the launch grid), so the row count
@@ -1182,9 +1310,31 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
     //    No link: one device-to-host copy of the same rows into the pinned h_out, on the same helper stream, and the
     //    PRIMARY-side upload is left for wait() - the only method that is handed the primary's stream.  What it must
     //    write is remembered rather than passed along, because launch() has no primary stream to issue it on.
+    //
+    // STRATA_Q36_PEER_SUM=1: what travels is not the rows but the PER-TOKEN WEIGHTED SUMS.  The helper adds up its
+    // own rows per token (with the routing weights the primary sent up) and the primary gets one row per token:
+    // 512 rows for a 512-token window where the rows were 1152.  The bytes then scale with the prompt's tokens and
+    // not with the routing's fan-out, and the link that carries them (0.58 GB/s on the box) is the prompt's biggest
+    // cost.  The sum is the same addition the primary would have done, in the plan's row order, so the path stays
+    // deterministic.
+    const float* pack_src = m.d_out;
+    int64_t pack_rows = n;
+    if (peer_sum()) {
+        // The sums ACCUMULATE (a token's rows are added one by one), so they start at zero.  One memset of the
+        // window's rows (4 MB for a 512-token window) on the helper - the helper has the time to spare while the
+        // down leg's bytes are being packed.
+        if (!ck(cudaMemsetAsync(m.d_sums, 0, (size_t) m.prep_n_tok * (size_t) m.n_embd * sizeof(float), m.stream),
+                "clear the per-token sums", err))
+            return false;
+        k_peer_toksum<<<dim3((unsigned) ((m.prep_n_tok + 7) / 8), 1, 1), dim3(32, 8), 0, m.stream>>>(
+            m.d_out, m.d_inv, m.d_src, m.d_wgt, m.d_sums, (int) n, (int) m.prep_n_tok, (int) m.n_embd);
+        if (!ck(cudaGetLastError(), "the per-token sums", err)) return false;
+        pack_src = m.d_sums;
+        pack_rows = m.prep_n_tok;
+    }
     if (m.p2p) {
-        if (!ck(cudaMemcpyPeerAsync(eparts_primary + eparts_row_base * m.n_embd, m.primary, m.d_out, m.device,
-                                    (size_t) n * (size_t) m.n_embd * sizeof(float), m.stream), "copy the run", err))
+        if (!ck(cudaMemcpyPeerAsync(eparts_primary + eparts_row_base * m.n_embd, m.primary, pack_src, m.device,
+                                    (size_t) pack_rows * (size_t) m.n_embd * sizeof(float), m.stream), "copy the run", err))
             return false;
     } else if (peer_i8()) {
         // STRATA_Q36_PEER_I8=1: the int8 down leg.  The rows are packed to one byte a value (a scale per 128 values)
@@ -1197,10 +1347,10 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
             !ck(cudaMemsetAsync(m.d_i8err, 0, sizeof(unsigned int), m.stream), "clear packed int8 error", err))
             return false;
         // One warp per row: 8 rows a block, 32 lanes a warp.
-        k_pack_i8<<<dim3(1, (unsigned) ((n + 7) / 8)), dim3(32, 8), 0, m.stream>>>(
-            m.d_out, m.d_out_i8, (int) n, (int) m.n_embd, m.d_i8max, m.d_i8err);
+        k_pack_i8<<<dim3(1, (unsigned) ((pack_rows + 7) / 8)), dim3(32, 8), 0, m.stream>>>(
+            pack_src, m.d_out_i8, (int) pack_rows, (int) m.n_embd, m.d_i8max, m.d_i8err);
         if (!ck(cudaGetLastError(), "pack the run as int8", err)) return false;
-        if (!ck(cudaMemcpyAsync(m.h_out_i8, m.d_out_i8, (size_t) n * rb, cudaMemcpyDeviceToHost, m.stream),
+        if (!ck(cudaMemcpyAsync(m.h_out_i8, m.d_out_i8, (size_t) pack_rows * rb, cudaMemcpyDeviceToHost, m.stream),
                 "copy the int8 run to host staging", err))
             return false;
         // The measurements come back with the same copy: 4 bytes next to the rows, read on the helper's stream.
@@ -1211,8 +1361,9 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
             return false;
         m.pending_eparts = eparts_primary;
         m.pending_base = eparts_row_base;
-        m.pending_n = n;
+        m.pending_n = pack_rows;   // the sums' rows when the sums are on, the run's rows otherwise
         m.pending_i8 = true;
+        m.transport_rows = pack_rows;
     } else if (peer_f16()) {
         // STRATA_Q36_PEER_F16=1: the packed up leg.  The rows are packed to half on the helper (which also MEASURES
         // the largest magnitude it saw, so the question "can fp16 carry these values" is answered by a number and
@@ -1221,10 +1372,11 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
         if (!ck(cudaMemsetAsync(m.d_f16max, 0, sizeof(unsigned int), m.stream), "clear packed magnitude", err) ||
             !ck(cudaMemsetAsync(m.d_f16rel, 0, sizeof(unsigned int), m.stream), "clear packed relative error", err))
             return false;
-        k_pack_f16<<<grid1(n * m.n_embd), kThreads, 0, m.stream>>>(m.d_out, m.d_out16, n * m.n_embd, m.d_f16max,
-                                                                m.d_f16rel);
+        k_pack_f16<<<grid1(pack_rows * m.n_embd), kThreads, 0, m.stream>>>(pack_src, m.d_out16,
+                                                                            pack_rows * m.n_embd, m.d_f16max,
+                                                                            m.d_f16rel);
         if (!ck(cudaGetLastError(), "pack the run", err)) return false;
-        if (!ck(cudaMemcpyAsync(m.h_out16, m.d_out16, (size_t) n * (size_t) m.n_embd * sizeof(__half),
+        if (!ck(cudaMemcpyAsync(m.h_out16, m.d_out16, (size_t) pack_rows * (size_t) m.n_embd * sizeof(__half),
                                 cudaMemcpyDeviceToHost, m.stream), "copy the packed run to host staging", err))
             return false;
         // The measurement comes back with the same copy: 4 bytes next to the rows, read on the helper's stream.
@@ -1235,8 +1387,9 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
             return false;
         m.pending_eparts = eparts_primary;
         m.pending_base = eparts_row_base;
-        m.pending_n = n;
+        m.pending_n = pack_rows;   // the sums' rows when the sums are on, the run's rows otherwise
         m.pending_f16 = true;
+        m.transport_rows = pack_rows;
     } else {
         if (!ck(cudaMemcpyAsync(m.h_out, m.d_out, (size_t) n * (size_t) m.n_embd * sizeof(float),
                                 cudaMemcpyDeviceToHost, m.stream), "copy the run to host staging", err))
@@ -1302,6 +1455,9 @@ bool PeerPrefill36::wait(cudaStream_t st_primary, void* packed_stage, std::strin
 }
 
 int64_t PeerPrefill36::rows() const { return impl_->rows; }
+// STRATA_Q36_PEER_SUM=1: the rows the last launch() sent.  With the sums on, that is the number of tokens of the
+// window (the sums' rows); without them, the number of rows in the helper's run.
+int64_t PeerPrefill36::transport_rows() const { return impl_->transport_rows; }
 int64_t PeerPrefill36::launches() const { return impl_->launches; }
 
 // The widest expert of the last PREPARED layer's row plan - the number MMQ sizes its launch grid on (its

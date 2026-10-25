@@ -328,7 +328,7 @@ __global__ void k_add_rms(float* x, const float* y, const float* w, float* h, in
 /// attention norm).  Replaces combine + gate + add + rms.
 __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, const float* wts, int K_,
                           const float* shared, const float* sgate, int sg_stride, const float* wn, float* h, int n,
-                          float eps) {
+                          float eps, const float* sums = nullptr, int nsums = 0, int sum_stride = 0) {
     __shared__ float sh[kThreads];
     __shared__ const float* pk[16];
     const int t = blockIdx.x;
@@ -342,6 +342,11 @@ __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, con
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float acc = wr[0] * pk[0][i];
         for (int k = 1; k < K_; ++k) acc = fmaf(wr[k], pk[k][i], acc);
+        // STRATA_Q36_PEER_SUM=1: the helpers' PER-TOKEN WEIGHTED SUMS.  The helper-owned slots' weights are zero
+        // (their rows are not written - the helpers send sums, not rows), so the loop above counted only the
+        // primary's own rows; the sums are the helpers' share of the token, added here.
+        if (sums != nullptr)
+            for (int hs = 0; hs < nsums; ++hs) acc += sums[((size_t) hs * sum_stride + t) * n + i];
         acc += gs * shared[(size_t) t * n + i];
         const float v = xr[i] + acc;
         xr[i] = v;
@@ -1025,6 +1030,16 @@ __global__ void k_from_i8(const uint8_t* __restrict__ src, float* __restrict__ d
     }
 }
 
+/// STRATA_Q36_PEER_SUM=1: the weights the combine reads.  The primary's own copy of the routing weights with the
+/// HELPER-OWNED slots zeroed: those entries' rows are never written (the helpers send per-token weighted sums
+/// instead of per-entry rows), so their weight must not count - the helper's share of the token arrives as the sum.
+__global__ void k_peer_zero_wts(const float* __restrict__ src, float* __restrict__ dst, const int32_t* __restrict__ ids,
+                                 const uint8_t* __restrict__ owned, int n_ent) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_ent) return;
+    dst[e] = owned[ids[e]] != 0 ? 0.0f : src[e];
+}
+
 /// The GDN conv for T tokens in ONE launch (the prompt): one block per 128-channel head, thread = channel, the
 /// 3-entry history carried in registers across the tokens and written back at the end; SiLU, then the L2 norm of the
 /// q/k heads (block < qk_heads) per token - fused_gdn_conv_l2's arithmetic, token after token.  History [channel][3].
@@ -1618,6 +1633,13 @@ struct Engine {
     // a window: cap_entries rows of N halves.  Allocated only when the flag is on.
     __half* peer_f16_stage = nullptr;
     uint8_t* peer_i8_stage = nullptr;
+    // STRATA_Q36_PEER_SUM=1: the per-token weighted sums the helpers send back, one row per token per helper, and
+    // the routing weights the helpers need to form them (the primary's copy, with the helper-owned slots zeroed,
+    // is what the combine reads).
+    float* peer_sums = nullptr;      // [3][T][N] the helpers' per-token sums
+    int peer_sums_n = 0;             // how many helpers' sums the combine adds (0 = none: the layer was not served)
+    float* peer_wts = nullptr;       // [T][K] the weights the combine reads (the helper-owned slots are zero)
+    float* peer_stage_wts = nullptr; // pinned [T][K] the weights on their way up to the helpers
     // THE SHARED WINDOW STAGING.  Every helper of a layer is given the same activations and the same routing, so
     // the primary copies them out of its memory ONCE into this pinned buffer and the helpers read that one copy.
     // Before, each helper copied the same 4 MiB out of the primary for itself, three times over.
@@ -2046,6 +2068,20 @@ struct Engine {
         static const bool on = [] {
             const char* v = std::getenv("STRATA_Q36_PEER_I8");
             return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    /// STRATA_Q36_PEER_SUM=1: the helpers' rows come back as one WEIGHTED SUM PER TOKEN instead of one row per
+    /// routed entry.  The bytes then scale with the prompt's tokens and not with the routing's fan-out (512 rows
+    /// instead of 1152 for a 512-token window), on a link that measured 0.58 GB/s - where the down leg was 8.13 ms
+    /// of the prompt's 21.6 ms per layer (192.168.1.98, 2026-10-26).
+    /// The sums land in their own buffer and the combine adds them; the helper-owned entries' own rows are not
+    /// written and their weights are zero, so the combine's own sum counts only the primary's rows.
+    /// Off by default: with the variable unset not one byte and not one kernel changes.
+    static bool peer_sum() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_PEER_SUM");
+            return v && v[0] == '1' && v[1] == ' ';
         }();
         return on;
     }
@@ -2642,6 +2678,15 @@ struct Engine {
         const size_t rb = (size_t) N + (size_t) (N / 128) * sizeof(float);
         peer_i8_stage = dalloc_t<uint8_t>((size_t) tmax * (size_t) Kp * rb);
     }
+    // STRATA_Q36_PEER_SUM=1: the per-token sums the helpers send back (one row per token per helper), the weights
+    // the combine reads (the primary's own copy, with the helper-owned slots zeroed), and the PINNED staging for
+    // the weights on their way up to the helpers (one copy for all three, as the window and the routing are).
+    if (peer_sum()) {
+        peer_sums = dalloc((size_t) 3 * (size_t) tmax * (size_t) N);
+        peer_wts = dalloc((size_t) tmax * (size_t) Kp);
+        CK(cudaHostAlloc((void**) &peer_stage_wts, (size_t) tmax * (size_t) Kp * sizeof(float),
+                         cudaHostAllocDefault));
+    }
         // The shared window staging, PINNED: the helpers' uploads read it with cudaMemcpyAsync, and a pageable
         // buffer would turn each of those into a synchronising copy.  The activations go in q8_1 - the format the
         // helpers' products read - because the helpers' links are slow (measured 0.81 GB/s against the primary's
@@ -3223,14 +3268,26 @@ struct Engine {
     void moe_end(int T, const int32_t* prow, const float* shared, const float* sgate, const float* wn, float* hout,
                  int sgs = 1) {
         const int N = (int) m->g.n_embd, Kp = (int) m->top_k;
-        const bool small = fast_k && T <= 8 && N <= 2048 && N % 256 == 0 && Kp <= 15;
+        // STRATA_Q36_PEER_SUM=1: the small path (k_moe_out_small) has no place for the helpers' sums, so the sums
+        // keep the general path.  With the sums on the layer is a prompt chunk (T > kGemmT = 8) anyway, so this
+        // never changes an answer - it says so.
+        const bool small = fast_k && T <= 8 && N <= 2048 && N % 256 == 0 && Kp <= 15 && peer_sums_n == 0;
+        // STRATA_Q36_PEER_SUM=1: WHAT THE COMBINE READS.  With the sums on, the weights are the router's own with
+        // the helper-owned slots zeroed (those entries' rows are never written - the helpers send per-token sums
+        // instead), and the helpers' sums are added on top of the primary's own rows.  Without the sums this is
+        // exactly what it always was: the router's own weights and no sums.  The sums' row stride is `tmax`, the
+        // buffer's own stride, not T: a layer's window is shorter than the buffer and the next layer's sums land
+        // after this one's.
+        const float* wts_read = peer_sums_n > 0 ? peer_wts : ewts;
+        const float* sums_read = peer_sums_n > 0 ? peer_sums : nullptr;
         if (small && verify_k) {
             if (!vx_) {
                 CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
                 CK(cudaMalloc((void**) &vh_, (size_t) 8 * 2048 * 4));
             }
             CK(cudaMemcpyAsync(vx_, x, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
-            k_moe_out<<<T, kThreads, 0, st>>>(vx_, eparts, prow, ewts, Kp, shared, sgate, sgs, wn, vh_, N, m->eps);
+            k_moe_out<<<T, kThreads, 0, st>>>(vx_, eparts, prow, wts_read, Kp, shared, sgate, sgs, wn, vh_, N, m->eps,
+                                             sums_read, peer_sums_n, tmax);
         }
         if (small) {
             const bool mkq = wn != nullptr && hout == h;   // the next layer's input, quantized here
@@ -3245,7 +3302,8 @@ struct Engine {
             return;
         }
         xq_ready = false;
-        k_moe_out<<<T, kThreads, 0, st>>>(x, eparts, prow, ewts, Kp, shared, sgate, sgs, wn, hout, N, m->eps);
+        k_moe_out<<<T, kThreads, 0, st>>>(x, eparts, prow, wts_read, Kp, shared, sgate, sgs, wn, hout, N, m->eps,
+                                         sums_read, peer_sums_n, tmax);
     }
     /// y [T][n_out] = W x from x's q8_1 image, 8 columns per launch.
     void mmq(const Mat& w, const void* q, float* out, int T) {
@@ -3504,6 +3562,10 @@ struct Engine {
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         helper_mask_li = -1;   // set below, when this layer's window actually goes to a helper
+        // STRATA_Q36_PEER_SUM=1: this layer's count of the helpers' per-token sums.  Zero until the peer plan
+        // counts the helpers that took a share of THIS layer's window - a layer the peer path does not serve
+        // (or a decode layer) must not read the sums of the layer before it.
+        peer_sums_n = 0;
         ev_mark(kSegDisp);      // E2: routing done; the route D2H and moe_helpers' host wait follow
         if (hy_rows) {
             // ONE copy of `ids` and `h` for this layer, issued ahead of every host block.  moe_helpers' window
@@ -3568,6 +3630,13 @@ struct Engine {
             // primary's own entries only and `eparts` rows [0, n_local) are the ones this MMQ writes.  With the
             // flag off `owned` is null and both kernels run exactly the statements they always ran.
             const uint8_t* owned = peer_mask(li);
+            // STRATA_Q36_PEER_SUM=1: the weights the combine will read - the router's own weights with the
+            // helper-owned slots zeroed, because those entries' rows are never written (the helpers send the
+            // per-token sums instead).  Issued here, right after the route, so the ids and the mask are ready.
+            // The COUNT of the sums is not set here: only the peer plan knows how many helpers took a share of
+            // this layer's window, and a helper with no entry sends nothing.
+            if (peer_here && peer_sum())
+                k_peer_zero_wts<<<grid1(n_ent), kThreads, 0, st>>>(ewts, peer_wts, ids, owned, (int) n_ent);
             CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
             k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt, owned);
             k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
@@ -4486,6 +4555,9 @@ struct Engine {
     // needs both numbers, and peer_plan() is where they are known.
     int64_t peer_wait_base[3] = {0, 0, 0};
     int64_t peer_wait_rows[3] = {0, 0, 0};
+    // STRATA_Q36_PEER_SUM=1: the slot in the sums' buffer each waiting helper's per-token sums go to (-1 when the
+    // sums are off).  The slot is the helper's index among the helpers that took a share of this layer's window.
+    int peer_wait_slot[3] = {-1, -1, -1};
     /// The widest window the live executors can take: the SMALLEST cap_entries() among the helpers that opened,
     /// i.e. the narrowest helper's row budget.  0 when no executor is live (and in every run with the flag off),
     /// which is what makes peer_window_fits() false there and the over-cap branch unreachable.
@@ -4545,7 +4617,7 @@ struct Engine {
     /// be dead, so there is nothing to fall back to anyway (the failure policy the deferred helper path documents).
     bool peer_plan(size_t li, int T, const float* hdev, const int32_t* idsdev, float* epartsd, std::string& err) {
         const auto& g = m->g;
-        const int Kp = (int) m->top_k, ne = (int) g.n_expert;
+        const int Kp = (int) m->top_k, ne = (int) g.n_expert, N = (int) g.n_embd;
         const int64_t n_ent = (int64_t) T * Kp;
         // STRATA_Q36_PROMPT_TIMING=1: the plan's host wall, in three parts - the host's own bookkeeping, the
         // prepare_begin() calls (which only ENQUEUE the helpers' transfers and row plans) and the
@@ -4667,6 +4739,15 @@ struct Engine {
         if (n_local > 0) k_peer_lid<<<grid1(n_local), kThreads, 0, st>>>(ent_dst, peer_prow2, (int) n_local, peer_lid);
         peer_n = n_local;
         peer_lid_map = peer_lid;
+        // STRATA_Q36_PEER_SUM=1: THE ROWS THE HELPERS WOULD HAVE WRITTEN ARE ZEROED.  With the sums on, nobody
+        // writes the helper-owned rows of eparts - the helpers send per-token sums instead - but the combine still
+        // READS them (its row map names a row for every entry) with a zero weight.  A row nobody wrote can hold
+        // anything, and 0 * NaN is NaN, so the range is cleared here: one memset of (n_ent - n_local) rows (4 MB
+        // for a 512-token window), a few microseconds on this card.  The rows are contiguous - the primary's own
+        // entries first, then each helper's run in helper order - so one memset covers them.
+        if (peer_sum() && n_ent > n_local)
+            CK(cudaMemsetAsync(epartsd + n_local * (int64_t) N, 0,
+                                (size_t) (n_ent - n_local) * (size_t) N * sizeof(float), st));
         // Every helper that owns an entry of this window: launch its share now, so its arithmetic runs on its own
         // stream while the primary's MMQ runs below.  A helper with no entry here is not touched at all (its stream
         // stays idle, which is cheaper than an empty launch).  The row bases passed are the same bases the plan
@@ -4706,6 +4787,10 @@ struct Engine {
                 CK(cudaMemcpyAsync(peer_stage_q8, d_peer_q8, (size_t) T * MMQ::q8_row_bytes((int64_t) N),
                                    cudaMemcpyDeviceToHost, st));
                 CK(cudaMemcpyAsync(peer_stage_ids, idsdev, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+                // STRATA_Q36_PEER_SUM=1: the routing weights go up with the window and the routing (16 KB for a
+                // 512-token window).  The helpers need them to form the per-token weighted sums.
+                if (peer_sum())
+                    CK(cudaMemcpyAsync(peer_stage_wts, ewts, (size_t) n_ent * sizeof(float), cudaMemcpyDeviceToHost, st));
                 CK(cudaStreamSynchronize(st));
                 if (prompt_timing()) { peer_stage_ms += ms_since(t_st); ++peer_stage_n; }
             }
@@ -4719,7 +4804,8 @@ struct Engine {
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
             if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err, peer_stage_q8,
-                                                  peer_stage_ids, /*q8_window=*/true))
+                                                  peer_stage_ids, /*q8_window=*/true,
+                                                  /*wts_staged=*/peer_sum() ? peer_stage_wts : nullptr))
                 return false;
         }
         const auto t_prep = prompt_timing() ? Clock::now() : Clock::time_point{};
@@ -4769,6 +4855,10 @@ struct Engine {
             // STRATA_Q36_PEER_F16=1: where this helper's rows go and how many there are, for the unpack.
             peer_wait_base[peer_wait_n] = base[(size_t) r];
             peer_wait_rows[peer_wait_n] = rows[(size_t) r];
+            // STRATA_Q36_PEER_SUM=1: the slot in the sums' buffer this helper's per-token sums go to.  Only a
+            // helper that took a share of this window gets one, and the slots are packed (0, 1, 2) in helper
+            // order, so the combine adds them without needing to know which helper sent which.
+            peer_wait_slot[peer_wait_n] = peer_sum() ? peer_sums_n++ : -1;
             ++peer_wait_n;
         }
         if (prompt_timing()) { pp_plan_wait_ms += ms_since(t_prep); ++pp_plan_wait_n; }
@@ -4918,18 +5008,24 @@ struct Engine {
             const bool i8 = peer_i8();
             void* stage = i8 ? (void*) peer_i8_stage : (peer_f16() ? (void*) peer_f16_stage : nullptr);
             if (peers[(size_t) r] != nullptr && peers[(size_t) r]->wait(st, stage, err)) {
-                const int64_t rows_here = peer_wait_rows[i];
-                const int64_t base_here = peer_wait_base[i];
                 const int N = (int) m->g.n_embd;
+                // STRATA_Q36_PEER_SUM=1: WHERE THE ROWS LAND.  With the sums on, what came back is not the helper's
+                // run of rows but its PER-TOKEN SUMS - one row per token of the window - so they go into the sums'
+                // buffer at this helper's slot, not into eparts.  The executor says how many rows it sent
+                // (transport_rows()); the sums' rows are not the run's rows.
+                const bool sums = peer_sum();
+                const int64_t rows_here = sums ? peers[(size_t) r]->transport_rows() : peer_wait_rows[i];
+                const int64_t base_here = peer_wait_base[i];
+                float* dst = sums ? (peer_sums + (size_t) peer_wait_slot[i] * (size_t) tmax * (size_t) N)
+                                  : (eparts + base_here * N);
                 if (i8 && peer_i8_stage != nullptr) {
                     // STRATA_Q36_PEER_I8=1: the int8 rows unpack back into the floats the combine reads.  One warp
                     // per row, eight rows a block.
                     k_from_i8<<<dim3(1, (unsigned) ((rows_here + 7) / 8)), dim3(32, 8), 0, st>>>(
-                        peer_i8_stage, eparts + base_here * N, (int) rows_here, N);
+                        peer_i8_stage, dst, (int) rows_here, N);
                     CK(cudaGetLastError());
                 } else if (peer_f16() && peer_f16_stage != nullptr) {
-                    k_from_f16<<<grid1(rows_here * N), kThreads, 0, st>>>(peer_f16_stage, eparts + base_here * N,
-                                                                        rows_here * N);
+                    k_from_f16<<<grid1(rows_here * N), kThreads, 0, st>>>(peer_f16_stage, dst, rows_here * N);
                     CK(cudaGetLastError());
                 }
                 continue;
