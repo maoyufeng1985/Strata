@@ -1599,8 +1599,10 @@ struct Engine {
     // THE SHARED WINDOW STAGING.  Every helper of a layer is given the same activations and the same routing, so
     // the primary copies them out of its memory ONCE into this pinned buffer and the helpers read that one copy.
     // Before, each helper copied the same 4 MiB out of the primary for itself, three times over.
-    float* peer_stage_x = nullptr;    // [tmax * Kp][N] the window's activations, in host memory
+    uint8_t* peer_stage_q8 = nullptr; // [tmax][q8 row bytes] the window's activations, in q8_1, in host memory
     int32_t* peer_stage_ids = nullptr; // [tmax * Kp]     the window's routing, in host memory
+    uint8_t* d_peer_q8 = nullptr;     // [tmax][q8 row bytes] the same, on the device: the primary quantizes the
+                                      // window once and the helpers read those bytes (a quarter of the fp32 ones)
     // STRATA_Q36_PROMPT_TIMING=1: the wall time of the ONE copy of the window out of the primary.  The helpers'
     // own prepare() no longer copies it (they read the shared copy), so this is where that cost moved to - and
     // without this the report would show the staging as free.
@@ -2436,6 +2438,8 @@ struct Engine {
         }
         pp_maxr_mismatch = 0;
         pp_rows_mismatch = 0;
+        pp_rows_r[0] = pp_rows_r[1] = pp_rows_r[2] = 0;
+        pp_rows_local = 0;
     }
     /// One boundary on st, only under the gate (so the default path gains no statement).
     void ev_mark(int i) {
@@ -2598,11 +2602,18 @@ struct Engine {
         // by helper, so this holds one helper's rows at a time.  Allocated only when the flag is on.
         if (peer_f16()) peer_f16_stage = dalloc_t<__half>((size_t) tmax * (size_t) Kp * (size_t) N);
         // The shared window staging, PINNED: the helpers' uploads read it with cudaMemcpyAsync, and a pageable
-        // buffer would turn each of those into a synchronising copy.
+        // buffer would turn each of those into a synchronising copy.  The activations go in q8_1 - the format the
+        // helpers' products read - because the helpers' links are slow (measured 0.81 GB/s against the primary's
+        // 6.03 on 192.168.1.98, 2026-10-25) and the window is the biggest thing the prompt sends up.
         {
             const size_t win = (size_t) tmax * (size_t) Kp;
-            CK(cudaHostAlloc((void**) &peer_stage_x, win * (size_t) N * sizeof(float), cudaHostAllocDefault));
+            const size_t q8row = MMQ::q8_row_bytes((int64_t) N);
+            CK(cudaHostAlloc((void**) &peer_stage_q8, (size_t) tmax * q8row, cudaHostAllocDefault));
             CK(cudaHostAlloc((void**) &peer_stage_ids, win * sizeof(int32_t), cudaHostAllocDefault));
+            // The device buffer holds what MMQ::quantize WRITES: the rows plus the buffer's trailing pad
+            // (MMQ::q8_bytes), so it is sized by q8_bytes and not by rows x row_bytes.  Sizing it by the rows
+            // alone left the last 128 blocks (18 KiB) of the quantization past the end of the allocation.
+            d_peer_q8 = dalloc_t<uint8_t>(MMQ::q8_bytes((int64_t) tmax, (int64_t) N));
         }
         sg = dalloc(T * g.n_ff_shexp); su = dalloc(T * g.n_ff_shexp); shh = dalloc(T * g.n_ff_shexp); sy = dalloc(T * N);
         sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) kVerify * g.n_vocab);
@@ -3556,6 +3567,11 @@ struct Engine {
             // the plan is the one place a peer bug can silently corrupt logits, and a wrong answer is worse than a
             // failed run.
             if (peer_here) {
+                // THE WINDOW, IN q8_1: the format the helpers' products read.  Quantized here, on the primary's
+                // stream, and staged by the plan below.  The helpers' links are slow (measured 0.81 GB/s against
+                // the primary's 6.03 on 192.168.1.98, 2026-10-25) and the window is the biggest thing the prompt
+                // sends up: a quarter of the bytes is 5 ms -> 1.4 ms per layer on this box.
+                MMQ::quantize(h, nullptr, d_peer_q8, L.L.gu_type, N, N, T, st);
                 // STRATA_Q36_PROMPT_TIMING=1: host wall around peer_plan_or_exit, the host loop over the helpers
                 // (including the ownership cross-check that rows() must agree with the master table).  One of the
                 // four host-side costs the probe exposes alongside the GPU event spans.  The wall time is host work;
@@ -4401,6 +4417,11 @@ struct Engine {
     // disagreed on.
     std::vector<int32_t> pp_maxr_dev[3], pp_maxr_host[3];
     long long pp_maxr_mismatch = 0, pp_rows_mismatch = 0;
+    // STRATA_Q36_PROMPT_TIMING=1: THE TRAFFIC BALANCE.  The entries the plan sent to each helper and the ones the
+    // primary kept, summed over the layers of the pass.  A helper's work is proportional to its entries (each entry
+    // is one expert's 2048-wide output row), so the SLOWEST helper sets the layer's critical path - and these four
+    // numbers say whether the three are even.  Measured, not assumed.
+    long long pp_rows_r[3] = {0, 0, 0}, pp_rows_local = 0;
     // STRATA_Q36_PEER_KEEP_RESIDENT=1: over every layer the probe measured, how many routed entries hit a
     // primary-resident expert (kr_hit) out of all the entries (kr_tot) - the share, as a fraction the report
     // prints.  And the per-layer extremes: which layer's resident experts were the hottest / coldest, so a
@@ -4558,6 +4579,11 @@ struct Engine {
             if (o == kPeerNone) ++n_local;
             else ++rows[(size_t) (o - 1)];   // the table's helper number is the CUDA ordinal (1..3)
         }
+        // STRATA_Q36_PROMPT_TIMING=1: the traffic balance (the probe's gate; four increments per layer, no CUDA call).
+        if (prompt_timing()) {
+            for (int r = 0; r < 3; ++r) pp_rows_r[(size_t) r] += rows[(size_t) r];
+            pp_rows_local += n_local;
+        }
         // The row contract (src/qwen35/q36_peer_prefill.cuh): the primary's entries first, in entry order, then each
         // helper's run in helper order, per-helper in ascending entry order.  `base_j = n_local + sum_{i<j} rows_i`.
         int64_t base[3] = {0, 0, 0}, at = n_local;
@@ -4629,8 +4655,17 @@ struct Engine {
                 const int N = (int) m->g.n_embd;
                 const int64_t n_ent = (int64_t) T * (int64_t) m->top_k;
                 const auto t_st = prompt_timing() ? Clock::now() : Clock::time_point{};
-                CK(cudaMemcpy(peer_stage_x, hdev, (size_t) T * (size_t) N * sizeof(float), cudaMemcpyDeviceToHost));
-                CK(cudaMemcpy(peer_stage_ids, idsdev, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                // THE WINDOW GOES UP IN q8_1.  The primary quantized it (the MMQ branch above, the format the
+                // helpers' products read), so the helpers gather their rows instead of quantizing them: the bytes
+                // are the ones their own quantize() would have written, and the upload is a quarter of the size.
+                // THE COPIES RIDE THE PRIMARY'S STREAM.  The window's quantization ran on that stream, and it
+                // is a non-blocking one: a blocking cudaMemcpy on the default stream does NOT wait for it, so
+                // the copy could read the window before the quantization wrote it, and the helpers would have
+                // computed on half-written rows.  Both copies go on the stream and one sync waits for both.
+                CK(cudaMemcpyAsync(peer_stage_q8, d_peer_q8, (size_t) T * MMQ::q8_row_bytes((int64_t) N),
+                                   cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(peer_stage_ids, idsdev, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+                CK(cudaStreamSynchronize(st));
                 if (prompt_timing()) { peer_stage_ms += ms_since(t_st); ++peer_stage_n; }
             }
         }
@@ -4642,8 +4677,8 @@ struct Engine {
         const auto t_book = prompt_timing() ? Clock::now() : Clock::time_point{};
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
-            if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err, peer_stage_x,
-                                                  peer_stage_ids))
+            if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err, peer_stage_q8,
+                                                  peer_stage_ids, /*q8_window=*/true))
                 return false;
         }
         const auto t_prep = prompt_timing() ? Clock::now() : Clock::time_point{};
@@ -7670,6 +7705,14 @@ int strata::qwen35::run(int argc, char** argv) {
                 }
                 std::fprintf(stderr, "the host's count disagreed with the device's on %lld layer(s)\n",
                              E.pp_maxr_mismatch);
+                // STRATA_Q36_PROMPT_TIMING=1: the traffic balance, per layer: the entries each helper took and the
+                // ones the primary kept.  The helpers' work is proportional to these, so the biggest one is the layer's
+                // critical path - and a 3:1:1 split says the other two helpers are idle half the time.
+                std::fprintf(stderr,
+                             "strata-q36 PHASE3 bench %d prompt: the entries per layer: primary %.1f, helper CUDA1 %.1f, "
+                             "CUDA2 %.1f, CUDA3 %.1f\n",
+                             rep, (double) E.pp_rows_local * pl, (double) E.pp_rows_r[0] * pl,
+                             (double) E.pp_rows_r[1] * pl, (double) E.pp_rows_r[2] * pl);
             }
             // STRATA_Q36_PEER_KEEP_RESIDENT=1: measured per PASS (E.pp_reset() runs between the three bench
             // passes, so these are this pass's numbers, the ones that cross), NOT gated on the timing probe:

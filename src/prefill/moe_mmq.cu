@@ -382,6 +382,15 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) pad512(cols) * sizeof(block_q8_1_mmq) / (4 * QK8_1) + 128 * sizeof(block_q8_1_mmq);
 }
 
+size_t q8_row_bytes(int64_t cols) {
+    // The buffer's trailing pad cancels in the difference, so what is left is one row's blocks.
+    return q8_bytes(2, cols) - q8_bytes(1, cols);
+}
+
+size_t q8_block_bytes() { return sizeof(block_q8_1_mmq); }
+
+size_t q8_row_blocks(int64_t cols) { return q8_row_bytes(cols) / sizeof(block_q8_1_mmq); }
+
 namespace {
 __global__ void scale_gu_rows_kernel(float* __restrict__ gu, int64_t ld, int64_t n_ff, const int32_t* __restrict__ bounds,
                                      int n, const float* __restrict__ tails, int64_t row0) {
