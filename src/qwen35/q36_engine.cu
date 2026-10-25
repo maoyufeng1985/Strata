@@ -2018,10 +2018,29 @@ struct Engine {
         }();
         return on;
     }
+    /// STRATA_Q36_MTP_HELPER=1 (opt-in): the MTP block's own layer's experts go to the helpers, like the main
+    /// layers' do.  Off by default, and the reason is measured (2026-10-25, 192.168.1.98): with the flag off the
+    /// MTP layer's experts are in no VRAM at all - the primary's slots cover the 40 main layers and the helpers'
+    /// caches hold 40 layers - so the CPU pool computes them, and that is most of the draft step's layer time
+    /// (the layer 1.458 ms of a 2.725 ms draft step, against the head's 1.267 ms).  With the flag on the helpers'
+    /// caches carry the MTP layer too (85 experts each, about 160 MiB), and the layer runs on the GPU.
+    ///
+    /// The arithmetic changes with it: a helper's grouped kernel and the CPU pool are two different
+    /// implementations (the main layers have the same pair), so the drafts the MTP block proposes change a little
+    /// and the acceptance moves with them.  The committed text is the verify window's, so it usually does not.
+    static bool mtp_helper_flag() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_MTP_HELPER");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
     /// Whether state index li's layer is offered to a helper (the entries the helper holds leave the local path).
     bool helper_layer(size_t li) const {
         // only main-model layers carry a helper slot: the MTP block (li == m->layers.size()) stays local
-        if (li >= (size_t) m->g.n_layers) return false;
+        // unless STRATA_Q36_MTP_HELPER=1 puts its experts on the helpers as well
+        if (li >= (size_t) m->g.n_layers)
+            return mtp_helper_flag() && m->has_mtp && li == (size_t) m->g.n_layers;
         // STRATA_Q36_HELPER_PARALLEL: the geometry is not layer-indexed - every main layer is offered to every
         // helper, because each helper holds a share of every layer's experts.  helper_of_layer is empty then.
         if (helper_row_split) return helpers_enabled();
@@ -6689,7 +6708,14 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
     // carried m.mtp would be refused (41 != 40).
     std::vector<C::NativeFmt> fmt;
     std::vector<strata::kernels::NativeExpertLayout> layouts;
-    fmt.reserve(m.layers.size());
+    // STRATA_Q36_MTP_HELPER=1: the MTP block's layer joins the table, so the helpers can hold its experts and
+    // that layer runs on the GPU instead of the CPU pool (see Engine::mtp_helper_flag).  Off by default the
+    // table covers the MAIN layers only: the MTP block's experts stay on the primary (its window is one draft
+    // step), and expert_layout_set_native checks fmt.size() == n_layers - a table that also carried m.mtp
+    // would be refused (41 != 40).  `all` still holds the MTP block, for the helper tier's own layer map below.
+    const bool mtp_helper = E.mtp_helper_flag() && m.has_mtp;
+    const int64_t hl_layers = g.n_layers + (mtp_helper ? 1 : 0);
+    fmt.reserve((size_t) hl_layers);
     layouts.reserve(fmt.capacity());
     uint64_t total = 0;
     std::vector<const Layer*> all;
@@ -6698,7 +6724,7 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
 // The layout table covers the MAIN layers only: the MTP block's experts stay on the primary (its window is one
     // draft step), and expert_layout_set_native checks fmt.size() == n_layers - a table that also carried m.mtp
     // would be refused (41 != 40).  `all` still holds the MTP block, for the helper tier's own layer map below.
-    for (size_t i = 0; i < m.layers.size(); ++i) {
+    for (size_t i = 0; i < (size_t) hl_layers; ++i) {
         const Layer* L = all[i];
         C::NativeFmt f;
         if (!C::native_fmt(L->L.gu_type, L->L.d_type, g.n_embd, g.n_ff, f, err)) return false;
@@ -6717,11 +6743,11 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
         layouts.back().stride = L->stride;
         total += (uint64_t) f.bytes * (uint64_t) g.n_expert;
     }
-    if (!C::expert_layout_set_native(g.n_layers, g.n_expert, fmt, total, err)) return false;
+    if (!C::expert_layout_set_native(hl_layers, g.n_expert, fmt, total, err)) return false;
 
     // one tier per helper device, holding every layer's experts of its stripe
     E.helper_src.set(all, g.n_expert);
-    std::vector<uint8_t> claimed((size_t) g.n_layers * (size_t) g.n_expert, 0);
+    std::vector<uint8_t> claimed((size_t) hl_layers * (size_t) g.n_expert, 0);
     // STRATA_Q36_HELPER_PARALLEL=1: every helper takes a balanced share of EVERY main layer's experts, in place of
     // the contiguous layer stripes below.  Same expert count per helper (L*E/n either way, so the same VRAM budget
     // fills the same number of slots), but which layer a helper covers is no longer what decides whether the two
@@ -6741,6 +6767,12 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
     // afford is left to the local paths, which is the same partial-help behaviour the layer stripes have when a
     // helper cannot hold its whole stripe.
     const bool row_split = E.helper_parallel();
+    // STRATA_Q36_MTP_HELPER=1 needs the row split: the MTP block's layer is not in any layer stripe, and the
+    // stripe shape asks helper_of_layer which helper owns a layer (a table with no entry for it).
+    if (mtp_helper && !row_split) {
+        err = "STRATA_Q36_MTP_HELPER=1 needs STRATA_Q36_HELPER_PARALLEL=1 (the MTP block's layer is in no layer stripe)";
+        return false;
+    }
     std::vector<int> enabled;
     for (int r = 0; r < 3; ++r)
         if (want[(size_t) r] > 0) enabled.push_back(r);
@@ -6805,9 +6837,13 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
             t.row_split = true;
             t.e_mod = (int64_t) k;
             t.e_n = n;
-            t.ranked.reserve((size_t) ((g.n_expert + n - 1 - (int64_t) k) / n) * (size_t) g.n_layers);
-            for (int64_t e = (int64_t) k; e < g.n_expert; e += n)
+            t.ranked.reserve((size_t) ((g.n_expert + n - 1 - (int64_t) k) / n) * (size_t) hl_layers);
+            for (int64_t e = (int64_t) k; e < g.n_expert; e += n) {
+                // the MTP block's layer first: an 'auto' tier that runs out of VRAM stops at the end of the
+                // list, and the MTP layer's experts are the ones the flag is for
+                if (mtp_helper) t.ranked.emplace_back((int32_t) g.n_layers, (int32_t) e);
                 for (int64_t l = 0; l < g.n_layers; ++l) t.ranked.emplace_back((int32_t) l, (int32_t) e);
+            }
             tiers.push_back(std::move(t));
         }
     } else {
@@ -6837,7 +6873,7 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
             return false;
         }
         const int slots = want[(size_t) r] == std::numeric_limits<int>::max() ? (1 << 20) : want[(size_t) r];
-        if (!E.helpers[(size_t) r].open(device, slots, g.n_layers, g.n_expert, tier.ranked, empty_primary,
+        if (!E.helpers[(size_t) r].open(device, slots, hl_layers, g.n_expert, tier.ranked, empty_primary,
                                         E.helper_src, claimed, err, auto_size[(size_t) r], g.n_embd, g.n_ff,
                                         m.top_k, &layouts)) {
             err = "helper CUDA" + std::to_string(device) + ": " + err;
