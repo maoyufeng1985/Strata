@@ -134,11 +134,12 @@ public:
     /// Record the helper's completion and make the PRIMARY stream `st_primary` wait for it, so a kernel the caller
     /// issues on `st_primary` afterwards reads this helper's rows.  Nothing is copied to the host.
     ///
-    /// STRATA_Q36_PEER_F16=1: `fp16_stage` is the PRIMARY's staging for the packed rows (a `__half*` with room for
-    /// this helper's rows).  When it is not null the rows travel as fp16 and land there; the caller unpacks them
-    /// back into `eparts` on the same stream.  When it is null the rows travel as fp32, straight into `eparts`, and
-    /// nothing about the route changes.
-    bool wait(cudaStream_t st_primary, void* fp16_stage, std::string& err);
+    /// `packed_stage` is the PRIMARY's staging for the packed rows, when the transport packs them: a `__half*` with
+    /// room for this helper's rows under STRATA_Q36_PEER_F16=1, a `uint8_t*` with room for the int8 image (one byte
+    /// a value plus one fp32 scale per 128 values) under STRATA_Q36_PEER_I8=1.  When it is not null the rows travel
+    /// packed and land there; the caller unpacks them back into `eparts` on the same stream.  When it is null the
+    /// rows travel as fp32, straight into `eparts`, and nothing about the route changes.
+    bool wait(cudaStream_t st_primary, void* packed_stage, std::string& err);
 
     /// Owned entries the last launch() computed (0 before any), and launches so far (the evidence line's numbers).
     int64_t rows() const;
@@ -162,6 +163,11 @@ public:
     /// largest relative error of the round trip.  Zero when the flag is off (nothing was measured).
     double last_f16_max_abs() const;
     double last_f16_max_rel() const;
+    /// STRATA_Q36_PEER_I8=1: what the int8 packing measured - the largest magnitude in the rows and the largest
+    /// error as a fraction of the block's own magnitude (the precision the transport costs, scale-free: a per-element
+    /// relative error would be dominated by the values nearest zero and would say nothing).  Zero when the flag is off.
+    double last_i8_max_abs() const;
+    double last_i8_max_rel() const;
     double last_prepare_sync_ms() const;
     int64_t last_prepare_calls() const;
 

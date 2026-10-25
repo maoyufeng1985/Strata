@@ -1004,6 +1004,27 @@ __global__ void k_from_f16(const __half* x, float* y, int64_t n) {
     if (i < n) y[i] = __half2float(x[i]);
 }
 
+/// STRATA_Q36_PEER_I8=1: the other half of the int8 down leg.  The helpers' rows arrive as int8 (one fp32 scale per
+/// 128 values) in the primary's staging and this puts them back into `eparts` as floats, so the combine below
+/// reads exactly the type it always read.  The rows are the helper's rows, in the helper's order, at the row base
+/// the plan gave that helper - the unpacking moves values, it does not move rows.
+///
+/// One warp per row: the 128 values of a block are four per lane, and the block's scale is read by lane 0.
+__global__ void k_from_i8(const uint8_t* __restrict__ src, float* __restrict__ dst, int n_rows, int n_cols) {
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= n_rows) return;
+    const int lane = threadIdx.x;
+    const int nblk = n_cols / 128;
+    const uint8_t* s = src + (size_t) row * ((size_t) n_cols + (size_t) nblk * sizeof(float));
+    const float* scale = (const float*)(s + n_cols);
+    float* d = dst + (size_t) row * (size_t) n_cols;
+    for (int b = 0; b < nblk; ++b) {
+        const uint8_t* q = s + b * 128;
+        const float sc = scale[b];
+        for (int j = lane; j < 128; j += 32) d[b * 128 + j] = (float)((int8_t) q[j]) * sc;
+    }
+}
+
 /// The GDN conv for T tokens in ONE launch (the prompt): one block per 128-channel head, thread = channel, the
 /// 3-entry history carried in registers across the tokens and written back at the end; SiLU, then the L2 norm of the
 /// q/k heads (block < qk_heads) per token - fused_gdn_conv_l2's arithmetic, token after token.  History [channel][3].
@@ -1596,6 +1617,7 @@ struct Engine {
     // here at a time (the wait loop hands the buffer over helper by helper), so it is sized for one helper's share of
     // a window: cap_entries rows of N halves.  Allocated only when the flag is on.
     __half* peer_f16_stage = nullptr;
+    uint8_t* peer_i8_stage = nullptr;
     // THE SHARED WINDOW STAGING.  Every helper of a layer is given the same activations and the same routing, so
     // the primary copies them out of its memory ONCE into this pinned buffer and the helpers read that one copy.
     // Before, each helper copied the same 4 MiB out of the primary for itself, three times over.
@@ -2010,6 +2032,19 @@ struct Engine {
     static bool peer_f16() {
         static const bool on = [] {
             const char* v = std::getenv("STRATA_Q36_PEER_F16");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    /// STRATA_Q36_PEER_I8=1: the helpers' rows travel back to the primary as int8 (one scale per 128 values) instead
+    /// of fp16.  MEASURED on 192.168.1.98 (2026-10-26): the down leg is 8.13 ms of the prompt's 21.6 ms per layer
+    /// - 38% of the prompt - because the helpers' links carry it at 0.58 GB/s; half the bytes is half that time.
+    /// The rows are the helper's rows, in the helper's order, at the row base the plan gave that helper: only the
+    /// width of an element on the wire changes, and `eparts` still holds floats when the combine reads it.
+    /// Off by default: with the variable unset not one byte and not one kernel changes.
+    static bool peer_i8() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_PEER_I8");
             return v && v[0] == '1' && v[1] == '\0';
         }();
         return on;
@@ -2601,6 +2636,12 @@ struct Engine {
         // a window is at most the window's entry count (tmax * Kp), and the wait loop hands the buffer over helper
         // by helper, so this holds one helper's rows at a time.  Allocated only when the flag is on.
         if (peer_f16()) peer_f16_stage = dalloc_t<__half>((size_t) tmax * (size_t) Kp * (size_t) N);
+    // STRATA_Q36_PEER_I8=1: the staging for one helper's int8 rows on their way back (one byte a value plus one fp32
+    // scale per 128 values, so a row takes N + N/128*4 bytes).  Allocated only when the flag is on.
+    if (peer_i8()) {
+        const size_t rb = (size_t) N + (size_t) (N / 128) * sizeof(float);
+        peer_i8_stage = dalloc_t<uint8_t>((size_t) tmax * (size_t) Kp * rb);
+    }
         // The shared window staging, PINNED: the helpers' uploads read it with cudaMemcpyAsync, and a pageable
         // buffer would turn each of those into a synchronising copy.  The activations go in q8_1 - the format the
         // helpers' products read - because the helpers' links are slow (measured 0.81 GB/s against the primary's
@@ -4869,16 +4910,24 @@ struct Engine {
         std::string err;
         for (int i = 0; i < n; ++i) {
             const int r = hi[i];
-            // STRATA_Q36_PEER_F16=1: the packed rows land in the primary's staging and are unpacked into `eparts` right
-            // after the copy that brought them, on the same stream - so the order is copy, unpack, copy, unpack, and
-            // the combine below reads floats either way.  The staging is one helper's rows at a time, which is all the
-            // stream's order needs: helper i's unpack is issued before helper i+1's copy.
-            void* stage = peer_f16() ? (void*) peer_f16_stage : nullptr;
+            // STRATA_Q36_PEER_F16=1 / STRATA_Q36_PEER_I8=1: the packed rows land in the primary's staging and are
+            // unpacked into `eparts` right after the copy that brought them, on the same stream - so the order is
+            // copy, unpack, copy, unpack, and the combine below reads floats either way.  The staging is one
+            // helper's rows at a time, which is all the stream's order needs: helper i's unpack is issued before
+            // helper i+1's copy.
+            const bool i8 = peer_i8();
+            void* stage = i8 ? (void*) peer_i8_stage : (peer_f16() ? (void*) peer_f16_stage : nullptr);
             if (peers[(size_t) r] != nullptr && peers[(size_t) r]->wait(st, stage, err)) {
-                if (peer_f16() && peer_f16_stage != nullptr) {
-                    const int64_t rows_here = peer_wait_rows[i];
-                    const int64_t base_here = peer_wait_base[i];
-                    const int N = (int) m->g.n_embd;
+                const int64_t rows_here = peer_wait_rows[i];
+                const int64_t base_here = peer_wait_base[i];
+                const int N = (int) m->g.n_embd;
+                if (i8 && peer_i8_stage != nullptr) {
+                    // STRATA_Q36_PEER_I8=1: the int8 rows unpack back into the floats the combine reads.  One warp
+                    // per row, eight rows a block.
+                    k_from_i8<<<dim3(1, (unsigned) ((rows_here + 7) / 8)), dim3(32, 8), 0, st>>>(
+                        peer_i8_stage, eparts + base_here * N, (int) rows_here, N);
+                    CK(cudaGetLastError());
+                } else if (peer_f16() && peer_f16_stage != nullptr) {
                     k_from_f16<<<grid1(rows_here * N), kThreads, 0, st>>>(peer_f16_stage, eparts + base_here * N,
                                                                         rows_here * N);
                     CK(cudaGetLastError());
@@ -7417,6 +7466,10 @@ int strata::qwen35::run(int argc, char** argv) {
         // whether the packed up leg was in force for this run.
         const char* pf = std::getenv("STRATA_Q36_PEER_F16");
         const bool peer_f16_on = pf && pf[0] == '1' && pf[1] == '\0';
+        // STRATA_Q36_PEER_I8=1: the same gate the engine's peer_i8() reads, so the report can say whether the int8
+        // down leg was in force and what it cost in precision.
+        const char* pi = std::getenv("STRATA_Q36_PEER_I8");
+        const bool peer_i8_on = pi && pi[0] == '1' && pi[1] == '\0';
         // Per pass (r_begin/r_wait/r_ovh) and the 3-pass aggregate (d_*), so every printed tg tok/s sits next to
         // its OWN per-token numbers: the wall clock quoted from a run is one pass (the steady one), and averaging
         // ms/token over the warm-up passes biases the comparison against it.
@@ -7744,6 +7797,21 @@ int strata::qwen35::run(int argc, char** argv) {
                              "strata-q36 PHASE3 bench %d prompt: the fp16 up leg packed rows up to %.6g in magnitude "
                              "(fp16's limit is 65504) and the largest relative error of the round trip was %.6g\n",
                              rep, fmax, frel);
+            }
+            // STRATA_Q36_PEER_I8=1: what the int8 down leg measured.  The largest magnitude says how close the rows
+            // came to the transport's range; the largest error RELATIVE TO THE BLOCK'S OWN MAGNITUDE says how much
+            // precision the packing cost - the fraction of the signal one byte a value can carry.
+            if (peer_i8_on) {
+                double imax = 0.0, ierel = 0.0;
+                for (int r = 0; r < 3; ++r) {
+                    if (!E.peer_on[(size_t) r] || E.peers[(size_t) r] == nullptr) continue;
+                    imax = std::max(imax, E.peers[(size_t) r]->last_i8_max_abs());
+                    ierel = std::max(ierel, E.peers[(size_t) r]->last_i8_max_rel());
+                }
+                std::fprintf(stderr,
+                             "strata-q36 PHASE3 bench %d prompt: the int8 down leg packed rows up to %.6g in magnitude "
+                             "and the largest error was %.6g of the block's own magnitude\n",
+                             rep, imax, ierel);
             }
             std::fflush(stdout);
         }
