@@ -68,6 +68,37 @@ void build_tiles(const int32_t* bounds, int e0, int e1, int n_local, int2* tiles
     }
 }
 
+/// The down launch, with the row map.  `ids` is null for the identity (the row the kernel computed is
+/// the destination row); with a map the value of the SORTED row goes to `ids[row]`.
+static void launch_down(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off,
+                        int64_t work_bound, const uint8_t* h, float* dm, const int32_t* ids, cudaStream_t s) {
+    const int n_out = (int) g.n_embd, n_in = (int) g.n_ff;
+    if (b.e1 <= b.e0 || n_out <= 0 || n_in <= 0 || work_bound <= 0) return;
+    // one block per (WARPS warps x 4 output columns, tile, 16 rows); the tile has at most kTileRows rows
+    const dim3 grid((n_out + f16kqc::WARPS * 4 - 1) / (f16kqc::WARPS * 4), (unsigned) work_bound,
+                    kTileRows / f16kqc::RWB);
+    if (g.d_type == GGML_TYPE_Q4_K)
+        f16kqc::down_fp16<GGML_TYPE_Q4_K><<<grid, f16kqc::THREADS, 0, s>>>(b, ts, tiles, off, h, dm, n_out, n_in, g.d_row,
+                                                                            g.down_off, ids);
+    else
+        f16kqc::down_fp16<GGML_TYPE_Q5_K><<<grid, f16kqc::THREADS, 0, s>>>(b, ts, tiles, off, h, dm, n_out, n_in, g.d_row,
+                                                                            g.down_off, ids);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "moe_f16_kq_cuda: the down launch failed: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+/// Down for the experts' rows, with the row map: the value of the SORTED row goes to `ids[row]`.
+/// CUDA-only (the map is the peer path's), so the shared interface (moe_f16_kq.hpp) stays as it is
+/// and the gfx11 build does not see this at all.
+void down_rows(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off, int64_t n,
+               int n_expert, int64_t work_bound, const uint8_t* h, float* dm, const int32_t* ids, cudaStream_t s) {
+    (void) n; (void) n_expert;
+    launch_down(b, g, ts, tiles, off, work_bound, h, dm, ids, s);
+}
+
 }  // namespace strata::prefill::fused::f16kqc
 
 namespace strata::prefill::fused::f16kq {
@@ -107,22 +138,7 @@ bool covers_down(int d_type) { return d_type == GGML_TYPE_Q4_K || d_type == GGML
 void down(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off, int64_t n,
           int n_expert, int64_t work_bound, const uint8_t* h, float* dm, cudaStream_t s) {
     (void) n; (void) n_expert;
-    const int n_out = (int) g.n_embd, n_in = (int) g.n_ff;
-    if (b.e1 <= b.e0 || n_out <= 0 || n_in <= 0 || work_bound <= 0) return;
-    // one block per (WARPS warps x 4 output columns, tile, 16 rows); the tile has at most kTileRows rows
-    const dim3 grid((n_out + f16kqc::WARPS * 4 - 1) / (f16kqc::WARPS * 4), (unsigned) work_bound,
-                    kTileRows / f16kqc::RWB);
-    if (g.d_type == GGML_TYPE_Q4_K)
-        f16kqc::down_fp16<GGML_TYPE_Q4_K><<<grid, f16kqc::THREADS, 0, s>>>(b, ts, tiles, off, h, dm, n_out, n_in, g.d_row,
-                                                                            g.down_off);
-    else
-        f16kqc::down_fp16<GGML_TYPE_Q5_K><<<grid, f16kqc::THREADS, 0, s>>>(b, ts, tiles, off, h, dm, n_out, n_in, g.d_row,
-                                                                            g.down_off);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "moe_f16_kq_cuda: the down launch failed: %s\n", cudaGetErrorString(e));
-        std::exit(1);
-    }
+    f16kqc::launch_down(b, g, ts, tiles, off, work_bound, h, dm, nullptr, s);
 }
 
 }  // namespace strata::prefill::fused::f16kq

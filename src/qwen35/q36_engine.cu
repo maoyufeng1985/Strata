@@ -3710,10 +3710,11 @@ struct Engine {
             // dequantized into the registers (no FP16 copy of the weights), the activations and the H are in the
             // natural int8 layout, so the down reads the H as it is.  The rows and their order are the MMQ path's:
             // the tiles come from the routing's bounds, the token of each sorted row is ent_tok, and the down
-            // writes the row where the MMQ's down would - the sorted row, which is what `lid` renumbers on a served
-            // layer, so a served layer (peer_here) stays on the MMQ path.  The experts come in groups of
-            // kMaxBatch (the Batch's blob array), one launch per group.
-            if (pf16::f16kqc::requested() && !peer_here && pf16::f16kq::covers(L.L.gu_type) &&
+            // writes the row where the MMQ's down would - through `lid`, which is the identity without a helper
+            // and the plan's row map on a served layer (the peer path numbers its rows in the entry order, and
+            // the combine reads that order).  The experts come in groups of kMaxBatch (the Batch's blob array),
+            // one launch per group.
+            if (pf16::f16kqc::requested() && pf16::f16kq::covers(L.L.gu_type) &&
                 pf16::f16kq::covers_down(L.L.d_type)) {
                 pf16::NativeGeom fg;
                 fg.gu_type = L.L.gu_type;
@@ -3747,8 +3748,10 @@ struct Engine {
                     for (int e = g0; e < g1; ++e) fb.blob[e - g0] = wbase + (size_t) e * L.stride;
                     pf16::f16kq::gate_up(fb, fg, f16_ts, f16_tiles, f16_off, n_local, ne, f16_wb,
                                           (const uint8_t*) f16_xa8, ent_tok, (uint8_t*) f16_hq8, st);
-                    pf16::f16kq::down(fb, fg, f16_ts, f16_tiles, f16_off, n_local, ne, f16_wb, (const uint8_t*) f16_hq8,
-                                       eparts, st);
+                    // THE ROW MAP: the fused down computes the SORTED row, and the value belongs to the row
+                    // `lid[sorted row]` - the identity without a helper, the plan's row on a served layer.
+                    pf16::f16kqc::down_rows(fb, fg, f16_ts, f16_tiles, f16_off, n_local, ne, f16_wb, (const uint8_t*) f16_hq8,
+                                            eparts, lid, st);
                 }
             } else
 #endif
