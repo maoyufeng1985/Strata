@@ -16,8 +16,8 @@
 // class takes a RemoteExperts& rather than opening a cache of its own.
 //
 // OPT-IN, and the default path is untouched: q36_engine.cu calls none of this unless STRATA_Q36_PREFILL_PEERS is
-// set AND the branch conditions hold AND a two-way P2P probe passed.  With the flag off, no object of this type is
-// constructed and no statement added here executes.
+// set to exactly "1" AND the branch conditions hold AND a two-way P2P probe passed.  With the flag off, no object of
+// this type is constructed and no statement added here executes.
 #pragma once
 
 #include "strata/kernels/iq_kernels.hpp"
