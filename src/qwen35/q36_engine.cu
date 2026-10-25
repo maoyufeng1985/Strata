@@ -231,15 +231,21 @@ bool peer_copies_data(int prim, int peer, std::string& why) {
 /// peer access was refused, and MemcpyPeer reported success having host-staged everything - so on that machine only a
 /// host route can serve a prompt chunk at all.
 ///
-/// **OPT-IN, and now for a MEASURED reason: the route does not survive a decode step yet.**  On 192.168.1.98 with
-/// `STRATA_Q36_PREFILL_PEERS=1 STRATA_Q36_PREFILL_PEERS_HOST=1`, `--bench-pp 160 --bench-tg 0` is clean (96.8 / 103.5
-/// / 104.2 tok/s, three passes, rc=0) but `--bench-pp 160 --bench-tg 8` dies with "an illegal memory access was
-/// encountered" at the first sync after the prompt - with one helper, three helpers, and under both layer striping
-/// and the row split, while the SAME configuration with `..._HOST=0` (peer path off, nothing staged) is clean at
-/// 49.3 tok/s pp160.  So the chunk arithmetic lands correctly and something in the staged buffers or the last
-/// layer's un-waited copies is wrong across the prompt/decode boundary.  Until that is fixed a default-on host
-/// route would turn a working default run into a crash, so the route requires the exact string "1"; unset, empty or
-/// any other value keeps today's behaviour (P2P or the clean local fallback).  Read once, like helper_async().
+/// **OPT-IN.**  The route requires the exact string "1"; unset, empty or any other value keeps today's behaviour
+/// (P2P or the clean local fallback).  Read once, like helper_async().
+///
+/// **What the route is worth, and what it costs** (measured on 192.168.1.98, Tesla P100 primary + 3x P104-100):
+/// the prompt's experts run on the helpers instead of on the primary, and the prompt goes from 156 to 494 tok/s
+/// (plans/2026-10-25-q36-peer-prefill-today.md).  The cost is that the prompt's numbers are then the HELPERS'
+/// numbers (q8_1 activations, native_expert_grouped) and not the primary's (MMQ int8), so the text the model
+/// produces from such a prompt is not the default path's text.
+///
+/// **The illegal memory access of 2026-10-21 is gone** (it was the helper cache's slot stride not matching the
+/// primary's L.stride - the helpers read the weights from a misaligned address, the NaN walked the rest of the
+/// layers, and the argmax's sentinel token id 0x7fffffff became an out-of-range row in the embedding lookup;
+/// plans/2026-10-21-q36-peer-ima-root-cause.md).  Measured 2026-10-25 with the record's own crash commands
+/// (`--bench-pp 256 --bench-tg 128`, `--bench-pp 512 --bench-tg 2`, `--bench-pp 160 --bench-tg 8`): rc=0, no
+/// illegal memory access, no new Xid in dmesg (plans/2026-10-25-q36-peer-decode-defect.md).
 bool peer_host_route() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_Q36_PREFILL_PEERS_HOST");
@@ -4715,9 +4721,9 @@ struct Engine {
             const int device = r + 1;   // helpers[r] was opened on CUDA r+1 (0..2 map to 1..3)
             std::string perr;
             // Two questions, two routes: the copy probe says whether a DIRECT link is worth preferring, and
-            // peer_host_route() says whether host staging may stand in for one (opt-in: it does not survive a decode
-            // step yet - see that function).  Only a helper that fails both is out of the prompt path, which is
-            // today's behaviour whenever the variable is not exactly "1".
+            // peer_host_route() says whether host staging may stand in for one (opt-in: see that function).  Only a
+            // helper that fails both is out of the prompt path, which is today's behaviour whenever the variable is
+            // not exactly "1".
             const bool direct = peer_copies_data(prim, device, perr);
             if (!direct && !peer_host_route()) {
                 std::fprintf(stderr, "strata-q36: STRATA_Q36_PREFILL_PEERS: helper CUDA%d is out of the prompt "
@@ -4729,7 +4735,8 @@ struct Engine {
                 // staging itself, but a reader of stderr must not have to guess why a helper went the slow way.
                 std::fprintf(stderr, "strata-q36: STRATA_Q36_PREFILL_PEERS: helper CUDA%d takes the host route: %s; "
                                      "its expert rows are staged through host memory (STRATA_Q36_PREFILL_PEERS_HOST=1, "
-                                     "experimental: a decode step after the prompt is not safe yet)\n",
+                                     "experimental: the prompt's experts are computed by the helper, so the numbers "
+                                     "are the helper's and not the primary's)\n",
                              device, perr.c_str());
                 perr.clear();   // the probe's words are spent; open() must report its own failure, not this one
             }
