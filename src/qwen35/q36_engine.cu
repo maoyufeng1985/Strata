@@ -3958,7 +3958,8 @@ struct Engine {
             // STRATA_Q36_MTP_MAPPED: the pick becomes the next step's input token on the DEVICE, and the host's report
             // comes from mapped memory.  One launch, right after the head: no host round trip is on the path between
             // two chained steps any more.
-            if (pub_slot >= 0) q36k::k_chain_publish<<<1, 32, 0, st>>>(tok_m, pick_m, pick_h_d, pub_slot);
+            if (pub_slot >= 0)
+                q36k::k_chain_publish<<<1, 32, 0, st>>>(tok_m, pick_m, pick_h_d, pub_slot, (int) m->g.n_vocab);
         }
     }
 
@@ -5119,6 +5120,7 @@ struct Engine {
         };
         if (n == 1) {
             CK(cudaStreamSynchronize(st));   // the pinned staging is free again
+            check_ids(toks, 1, "a decode step's token");
             hpin[0] = toks[0];
             hpin[1] = (int32_t) pos;
             CK(cudaMemcpyAsync(tok, hpin, 4, cudaMemcpyHostToDevice, st));
@@ -5140,6 +5142,7 @@ struct Engine {
         for (int64_t i = 0; i < n; i += tmax) {
             const int T = (int) std::min<int64_t>(tmax, n - i);
             CK(cudaStreamSynchronize(st));
+            check_ids(toks + i, T, "a prompt chunk's tokens");
             hpin[1] = (int32_t) pos;
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
@@ -5205,6 +5208,7 @@ struct Engine {
             }
             pmax = std::max<int64_t>(pmax, ss.pos + gr[g].n - 1);
         }
+        check_ids(hrow, T, "the batched rows' tokens");
         CK(cudaMemcpyAsync(tok, hrow, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_rcell, hrow + 8, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_rslot, hrow + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
@@ -5290,6 +5294,7 @@ struct Engine {
             pmax = std::max<int64_t>(pmax, rows[r].cell);
             CK(cudaMemcpyAsync(mtp_seed() + (size_t) r * N, rows[r].seed, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         }
+        check_ids(hrow, T, "the MTP rows' tokens");
         CK(cudaMemcpyAsync(tok_m, hrow, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_rcell, hrow + 8, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(d_rslot, hrow + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
@@ -5403,6 +5408,7 @@ struct Engine {
         for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
         hpin[16 + fix.size()] = x_tok;
         hpin[1] = (int32_t) (pos - (int64_t) fix.size());
+        check_ids(hpin + 16, T0, "the MTP block's tokens");
         CK(cudaMemcpyAsync(tok_m, hpin + 16, (size_t) T0 * 4, cudaMemcpyHostToDevice, st));
         // The chain's positions, staged ONCE for the whole window: element 0 is the T0 rows' base (what the step
         // below reads), element d is chained step d's (pos + d).  The kernels read them at execution, so a step
@@ -5473,6 +5479,7 @@ struct Engine {
             if (D > 0) drafts[(size_t) D - 1] = ((volatile int32_t*) pick_h)[D - 1];
         } else if (!sfx.lookup)
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
+            check_ids(&drafts[(size_t) d - 1], 1, "a draft step's token");
             hpin[0] = drafts[(size_t) d - 1];
             hpin[1] = (int32_t) (pos + d);
             CK(cudaMemcpyAsync(tok_m, hpin, 4, cudaMemcpyHostToDevice, st));
@@ -5492,6 +5499,7 @@ struct Engine {
         hpin[16] = x_tok;
         for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[(size_t) d];
         hpin[1] = (int32_t) pos;
+        check_ids(hpin + 16, T, "the verify window's tokens");
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
@@ -5612,6 +5620,23 @@ struct Engine {
     void clear_route_counts() {
         for (Hy& H : hy) std::fill(H.score.begin(), H.score.end(), 0.0);
         row_ids.clear();
+    }
+
+    /// A token id has to be IN the vocabulary: the embedding lookup reads `id * row_bytes` from the table, and the
+    /// argmax's fallback - nothing in the row beat -inf, e.g. a row of NaNs - is 0x7fffffff, which is not a token id.
+    /// Such a pick used to reach the embedding lookup as a row index, and the read past the end of the table was
+    /// what the 2026-10-21 illegal memory access actually was (plans/2026-10-21-q36-peer-ima-root-cause.md).
+    /// A row whose logits are not finite is a broken row, and a broken row ends the run with a line that says so:
+    /// a wrong answer is worse than a failed run.
+    void check_ids(const int32_t* ids, int n, const char* what) {
+        for (int i = 0; i < n; ++i) {
+            const int32_t id = ids[i];
+            if (id >= 0 && id < (int32_t) m->g.n_vocab) continue;
+            std::fprintf(stderr, "strata-q36: %s: the token id %d is outside the vocabulary (it holds %d ids): the "
+                                 "logits row is not finite; the run ends here\n",
+                         what, (int) id, (int) m->g.n_vocab);
+            std::exit(1);
+        }
     }
 
     int greedy() {
