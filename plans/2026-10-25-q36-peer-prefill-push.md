@@ -210,10 +210,64 @@ helper 那条链（helper_wait 7.45）和主卡自己的活（mixer 6.76 + prima
 
 ## 4. 下一步：解码（tg64 58.9）
 
-- 这台机器 tg64 = 58.9 tok/s（17 ms/token，40 层 ⇒ 0.42 ms/层），而同一台 RTX 3060 上是 117.8
-  ⇒ 差的那一半是**每层等 helper 的往返**。
-- 10-20 的记录说解码的瓶颈是等 helper；引擎自带的 `STRATA_Q36_HELPER_TIMING=1` 探针会报
-  每个 helper 的 ms/tok wall、ms_begin、ms_wait ⇒ 先量，再决定是「少等」还是「少传」。
+### 4.1 量到的（MEASURED，2026-10-26，q8 window 的二进制 `bin/strata-q36.q8fix`）
+
+`.run/R-decode2-20261026.sh`，三张 helper 与旗标同前，另加 `STRATA_Q36_HELPER_TIMING=1`：
+
+| | tg64 | pp512 |
+|---|---:|---:|
+| D1 三张 helper | **58.8** | 589.0 |
+| D2 一张 helper | 20.1 | 303.9 |
+| D3 没有 helper（主卡自己） | 15.3 | 156.4 |
+
+⇒ **helper 让解码快 3.8 倍**（没有 helper 时主卡要从主机内存搬专家：每层 192 MiB）。
+
+**每一层 447 µs（17.02 ms/token，40 层）的去向**（D1 bench 2 的 GPU 时间线，µs/层）：
+
+| 段 | µs/层 | 在谁身上 |
+|---|---:|---|
+| attn_ssm（mixer 的 dense GEMV）| **204** | 主卡 GPU（MMQ 的 Q8_0 解码核）|
+| router | 20 | 主卡 GPU |
+| helper_dispatch | 64 | 主卡等路由的 D2H + 把活交给 worker |
+| local_grouped | 2 | 主卡 VRAM 里的专家 |
+| local_shared | 32 | shared expert（MMQ）|
+| cpu_pool | 109 | **GPU 空着**（主机在等 helper 的行）|
+| helper_merge | 15 | 把 helper 的行并进 eparts |
+
+⇒ 主卡自己真的在算的 273 µs/层（61%），**helper 的一个来回 ≈ 173 µs/层（39%）**。
+每个 helper 的 host 侧：ms_begin 45 µs/层、ms_wait 37、ms_sync_overhead 3.3。
+
+### 4.2 剩下的候选，和为什么先做不了
+
+| 候选 | 预计 | 在哪个文件 | 能做吗 |
+|---|---:|---|---|
+| mixer 的 204 µs/层（MMQ 的 Q8_0 解码 GEMV）| 大 | 第三方 llama.cpp + 共享的 mmq | **不能**：那是 fork 出来的依赖 |
+| helper 的一个来回 173 µs/层 | 大 | `src/core/remote_experts.cpp`（CUDA+HIP 共用）| **不能**：本机没有 ROCm，编不了 HIP |
+| shared expert 的 32 µs/层 | ~10 µs | 共享的 mmq | 同上 |
+| S2 `launch_check` 的 `cudaGetLastError`（每层 11.5 次 × 1.31 µs）| 15 µs/层（+4%）| `native_mmvq.cu`（HIP 也编）| 同上 |
+| S3 `DeviceScope` 的换设备（drain 里 get + 2×set）| 9.5 µs/层（+2%）| `remote_experts.cpp` | 同上 |
+
+⇒ **解码剩下的力气都在共享的核心文件里，而本机编不了 HIP** ⇒ AGENTS.md 的
+「改了哪个后端就编哪个」这一条过不去 ⇒ 先记着，不动。
+
+### 4.3 不改代码能拿的（旗标，MEASURED 2026-10-26，同一台机器，同一个二进制）
+
+`.run/R-decode-flags-20261026.sh`，bench 2：
+
+| | tg64 | pp512 |
+|---|---:|---:|
+| E1 现在的旗标 | 59.3 | 589.7 |
+| E2 `--kv int8` | **61.5**（+3.7%）| 590.3（不变）|
+| E3 `--kv int8 --mtp 2` | 59.6 | 521.8（-11%）|
+| E4 `--kv int8 --mtp 3` | 61.2 | 527.7（-11%）|
+
+⇒ **`--kv int8` 是白拿的 3.7%**（KV 缓存的 int8：每 kKVG 个值一个 FP16 比例尺 ⇒ 字节减半）。
+⇒ **`--mtp` 在这个 bench 里没有**：2026-10-25 记的「D=2 是 81.5 tok/s」是另一套量法
+（serve 路径的吞吐，不是这个 bench 的 tg64）⇒ 以这里为准：**MTP 的草稿没有变成墙钟**，
+而它的 MTP 块占显存 ⇒ prompt 掉 11% ⇒ **不用**。
+
+⇒ 剩下的路：要么在有 ROCm 的机器上编 HIP 之后动那两个共享文件（+6%），
+要么动第三方 llama.cpp 的解码核（大，但要维护一个 fork）⇒ 两件都不是这台机器能定的事。
 
 ## 产出
 
