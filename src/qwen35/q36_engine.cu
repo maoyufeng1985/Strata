@@ -3812,6 +3812,43 @@ struct Engine {
         return on;
     }
     float* h_logits = nullptr;          // host staging for the draft head's logits (diagnostic path only)
+    // STRATA_Q36_MTP_TIMING=1: the draft step's own segments.  A step is the MTP block's layer plus the draft head,
+    // and the head reads the whole vocabulary (q36: 248320 x 2048 Q8_0 = 515 MiB), so the two are worth telling
+    // apart.  Three events on the stream: the step's start, the layer's end, the head's end.
+    static bool mtp_timing() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_MTP_TIMING");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    cudaEvent_t mtp_ev[3] = {};         // 0: the step's start, 1: after the MTP layer, 2: after the draft head
+    double d_mtp_layer_ms = 0, d_mtp_head_ms = 0, d_mtp_step_ms = 0;
+    long long d_mtp_n = 0;
+    // The FIRST sample of a window is not a draft step: it is the MTP block over the whole window (D+1 rows) plus
+    // the last row's head - the block the verify window's first row comes from.  It is counted apart from the
+    // chained steps (one row each), because a mean over the two is neither.
+    double d_mtp_prep_layer_ms = 0, d_mtp_prep_head_ms = 0;
+    long long d_mtp_prep_n = 0;
+    /// The three spans of the step that just finished (its sync is done).  The mapped chain (one submission for the
+    /// whole chain) is not measured here: its steps overlap, so one event set cannot tell them apart.
+    void mtp_timing_read(bool prep = false) {
+        if (!mtp_timing() || d_mtp_n < 0) return;
+        float a = 0, b = 0, c = 0;
+        if (cudaEventElapsedTime(&a, mtp_ev[0], mtp_ev[1]) != cudaSuccess) return;
+        if (cudaEventElapsedTime(&b, mtp_ev[1], mtp_ev[2]) != cudaSuccess) return;
+        if (cudaEventElapsedTime(&c, mtp_ev[0], mtp_ev[2]) != cudaSuccess) return;
+        if (prep) {
+            d_mtp_prep_layer_ms += a;
+            d_mtp_prep_head_ms += b;
+            ++d_mtp_prep_n;
+            return;
+        }
+        d_mtp_layer_ms += a;
+        d_mtp_head_ms += b;
+        d_mtp_step_ms += c;
+        ++d_mtp_n;
+    }
     int32_t mtp_top2_tok = -1;          // the runner-up token of the draft just computed (-1 = unknown)
     int32_t mtp_top2_prev[16] = {};     // the runner-up of each draft in the current window
     long long dp_tested[16] = {}, dp_ok[16] = {};   // per position: drafts verified / accepted
@@ -3867,6 +3904,7 @@ struct Engine {
                      int pub_slot = -1) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+        if (mtp_timing()) CK(cudaEventRecord(mtp_ev[0], st));
         if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
@@ -3875,8 +3913,10 @@ struct Engine {
         mm(m->eh_proj, mtp_cat, x, T);
         k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
         layer(m->mtp, m->layers.size(), T, p0, dpos, graph_mode, false, m->mtp_shnorm, hmtp);
+        if (mtp_timing()) CK(cudaEventRecord(mtp_ev[1], st));
         if (draft) {
             head_draft(hmtp + (size_t) (T - 1) * N);
+            if (mtp_timing()) CK(cudaEventRecord(mtp_ev[2], st));
             // STRATA_Q36_MTP_MAPPED: the pick becomes the next step's input token on the DEVICE, and the host's report
             // comes from mapped memory.  One launch, right after the head: no host round trip is on the path between
             // two chained steps any more.
@@ -5359,6 +5399,7 @@ struct Engine {
         if (D > 0 && !mapped_chain && !sfx.lookup) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
+            mtp_timing_read(true);   // STRATA_Q36_MTP_TIMING: the window's prep (the MTP block over D+1 rows)
             drafts[0] = hpin[2];
             if (mtp_top2() && D <= 16) mtp_top2_prev[0] = mtp_top2_tok;
         }
@@ -5403,6 +5444,7 @@ struct Engine {
             else forward_mtp(1, pos + d, seeds, true, false, pos0_m);
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
+            mtp_timing_read();   // STRATA_Q36_MTP_TIMING: this draft step's spans
             drafts[(size_t) d] = hpin[2];
             if (mtp_top2() && d < 16) mtp_top2_prev[d] = mtp_top2_tok;
         }
@@ -5750,11 +5792,24 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.gpu_timing = false;
     {
         const char* ht = std::getenv("STRATA_Q36_HELPER_TIMING");
-        if (ht && ht[0] == '1' && ht[1] == '\0') {
+        // STRATA_Q36_GPU_TIMING=0: the host's counters without the GPU timeline.  The GPU probe's marks are
+        // host-side events, so a path that replays the layer's kernels from a graph (STRATA_Q36_SHARED_GRAPH=1)
+        // cannot carry them - this switch leaves the host's own counters on and the GPU timeline off, so the two
+        // can be measured together.  Unset, the flag behaves as before.
+        const char* gt = std::getenv("STRATA_Q36_GPU_TIMING");
+        const bool gpu_off = gt && gt[0] == '0' && gt[1] == '\0';
+        if (ht && ht[0] == '1' && ht[1] == '\0' && !gpu_off) {
             for (int k = 0; k < Engine::kGsegN; ++k)
                 CK(cudaEventCreate(&E.ev_seg_ev[k]));
             E.gpu_timing = true;
         }
+    }
+    // STRATA_Q36_MTP_TIMING=1: the draft step's three events (the step's start, the MTP layer's end, the head's end),
+    // created only under that gate, so a flag-off run allocates and records nothing it did not before.
+    {
+        const char* mt = std::getenv("STRATA_Q36_MTP_TIMING");
+        if (mt && mt[0] == '1' && mt[1] == '\0')
+            for (int k = 0; k < 3; ++k) CK(cudaEventCreate(&E.mtp_ev[k]));
     }
     // STRATA_Q36_PROMPT_TIMING=1: the per-layer prompt-chunk events, created only under that gate, so a flag-off run
     // allocates nothing it did not before.  NOTE: no cudaEventDisableTiming - these are the events cudaEventElapsedTime
@@ -7094,6 +7149,14 @@ int strata::qwen35::run(int argc, char** argv) {
                                  E.dp_ok[d], 100.0 * (double) E.dp_ok[d] / (double) E.dp_tested[d]);
                 }
             }
+            if (E.mtp_timing() && E.d_mtp_n > 0)
+                std::fprintf(stderr, "strata-q36 MTP-TIMING: %lld draft step(s): layer %.3f ms, head %.3f ms, step %.3f ms (per step)\n",
+                             E.d_mtp_n, E.d_mtp_layer_ms / (double) E.d_mtp_n, E.d_mtp_head_ms / (double) E.d_mtp_n,
+                             E.d_mtp_step_ms / (double) E.d_mtp_n);
+            if (E.mtp_timing() && E.d_mtp_prep_n > 0)
+                std::fprintf(stderr, "strata-q36 MTP-TIMING: %lld window prep(s) (the MTP block over D+1 rows): layer %.3f ms, head %.3f ms\n",
+                             E.d_mtp_prep_n, E.d_mtp_prep_layer_ms / (double) E.d_mtp_prep_n,
+                             E.d_mtp_prep_head_ms / (double) E.d_mtp_prep_n);
             if (E.d_adapt) {
                 // --mtp-adaptive: where the learned depth spent the rounds, and what it learned per depth.
                 std::fprintf(stderr, "strata-q36 MTP-ADAPT: rounds per draft depth and the learned means "
