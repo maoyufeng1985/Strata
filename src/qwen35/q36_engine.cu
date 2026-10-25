@@ -4338,13 +4338,19 @@ struct Engine {
     // the helpers own.  The arithmetic of each entry is one of the two the engine already runs (an int8 MMQ on the
     // primary, `PeerPrefill36`'s int8 MMQ on a helper), never a third thing.
     //
-    // OPT-IN, and the default path is untouched: `peer_prefill_on` is false unless the variable is set AND the MMQ
-    // path exists AND helpers are open AND every helper it will use got a route - a direct link the copy probe
-    // trusts, or host staging if that is allowed.  With it false, no executor is constructed, no buffer is
-    // allocated, no kernel takes the extra argument's non-null value, and every host test below is a
+    // OPT-IN, and the default path is untouched: `peer_prefill_on` is false unless the variable is set to exactly
+    // "1" AND the MMQ path exists AND helpers are open AND every helper it will use got a route - a direct link
+    // the copy probe trusts, or host staging if that is allowed.  With it false, no executor is constructed, no
+    // buffer is allocated, no kernel takes the extra argument's non-null value, and every host test below is a
     // constant-false branch.
+    //
+    // The parse is the exact string "1", the rule peer_host_route() and peer_f16() use: a variable's mere presence
+    // is not a request, so `=0` and `=x` mean off, not on.
     bool prefill_peers() const {
-        static const bool on = std::getenv("STRATA_Q36_PREFILL_PEERS") != nullptr;
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_PREFILL_PEERS");
+            return v != nullptr && std::strcmp(v, "1") == 0;
+        }();
         return on;
     }
     /// The number stored in `peer_owner` for an expert NO HELPER holds - the primary computes it.

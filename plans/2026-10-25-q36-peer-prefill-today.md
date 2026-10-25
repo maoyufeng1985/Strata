@@ -106,9 +106,9 @@ logits 逐行 RMS 差 1.5e-1~3.3e-1」是同一件事（`q36_engine.cu:4081-4092
 ## 4. 现在的状态（未合并的东西）
 
 - peer 路径**已经写进用户侧的文档**（`docs/QWEN36.md` 的 "The prompt's experts on the helper GPUs" 一节，
-  2026-10-25）。旗标：`STRATA_Q36_PREFILL_PEERS`（**只要变量在就算开**，`=0` 也开；`q36_engine.cu:4346`）、
-  `STRATA_Q36_PREFILL_PEERS_HOST=1`（host 兜底，本机无 P2P，12 对全 0）、
-  `STRATA_Q36_PEER_F16=1`（两个都要正好是 "1"）。
+  2026-10-25）。旗标：`STRATA_Q36_PREFILL_PEERS=1`（**正好是 "1" 才开**，`=0`/`=x` 关；
+  `q36_engine.cu:4348-4354`）、`STRATA_Q36_PREFILL_PEERS_HOST=1`（host 兜底，本机无 P2P，
+  12 对全 0）、`STRATA_Q36_PEER_F16=1`（三个都要正好是 "1"）。
 - 引擎自己印的警告还在：「host route: on … **experimental: a decode step after the prompt is not
   safe yet**」（`q36_engine.cu:4729`）。今天实测没有 IMA（10-24 的编码修复和 10-22 的 slot 排序修复
   之后，这条老缺陷没有再复现），但**「不安全」那句本身还没撤**。
