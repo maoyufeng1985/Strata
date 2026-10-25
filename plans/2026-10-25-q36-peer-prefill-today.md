@@ -105,9 +105,10 @@ logits 逐行 RMS 差 1.5e-1~3.3e-1」是同一件事（`q36_engine.cu:4081-4092
 
 ## 4. 现在的状态（未合并的东西）
 
-- peer 路径**只活在 `plans/` 里**：`grep -rn PREFILL_PEERS docs/ src/program/` 没有任何命中，
-  用户侧的文档（`docs/QWEN36.md`）没有它。旗标：`STRATA_Q36_PREFILL_PEERS=1`（认 "1"）、
-  `STRATA_Q36_PREFILL_PEERS_HOST=1`（host 兜底，本机无 P2P，12 对全 0）、`STRATA_Q36_PEER_F16=1`。
+- peer 路径**已经写进用户侧的文档**（`docs/QWEN36.md` 的 "The prompt's experts on the helper GPUs" 一节，
+  2026-10-25）。旗标：`STRATA_Q36_PREFILL_PEERS`（**只要变量在就算开**，`=0` 也开；`q36_engine.cu:4346`）、
+  `STRATA_Q36_PREFILL_PEERS_HOST=1`（host 兜底，本机无 P2P，12 对全 0）、
+  `STRATA_Q36_PEER_F16=1`（两个都要正好是 "1"）。
 - 引擎自己印的警告还在：「host route: on … **experimental: a decode step after the prompt is not
   safe yet**」（`q36_engine.cu:4729`）。今天实测没有 IMA（10-24 的编码修复和 10-22 的 slot 排序修复
   之后，这条老缺陷没有再复现），但**「不安全」那句本身还没撤**。
@@ -119,10 +120,11 @@ logits 逐行 RMS 差 1.5e-1~3.3e-1」是同一件事（`q36_engine.cu:4081-4092
 1. **「prefill 优化到 300 多」是真的，而且今天还有效**：Qwen3.6 的 peer prompt 路径 **493.6 tok/s**
    （默认路径 156.1，+216%），decode 不掉（tg64 59.4 vs 58.5）。
 2. **默认路径 156 tok/s 是设计如此**，不是回归：prompt chunk（T=512）太大，helper 那条路只吃 ≤8 行。
-3. **peer 路径还不是能进默认的东西**：数值与默认路径不同（36/37 argmax，max\|diff\| 0.837），
-   引擎的「decode after the prompt is not safe yet」警告没撤，用户侧文档里也没有它。
-4. **下一步（三件，按顺序）**：
-   a. **把「decode after the prompt」那条老缺陷查清并撤掉警告**（今天没复现 IMA，但没查）；
-   b. **写 `docs/QWEN36.md` 的一节**，把这个 opt-in 路径、三个旗标和今天的数字写进去
-      （现在只有 `plans/` 里有，AGENTS.md 要求「每个实测数字都要说清测在哪」）；
+3. **peer 路径还不是能进默认的东西**：数值与默认路径不同（216 token 的 prompt，32 行 logits 里只有 9 行
+   argmax 相同，max\|diff\| 34.47，第 0 行就不同），引擎的「decode after the prompt is not safe yet」
+   警告**已撤**（`8b844007`），用户侧文档**已写**（`docs/QWEN36.md`，2026-10-25）。
+4. **下一步（按顺序）**：
+   a. ~~把「decode after the prompt」那条老缺陷查清并撤掉警告~~ → **已完成**
+      （`plans/2026-10-25-q36-peer-decode-defect.md`，`8b844007`）；
+   b. ~~写 `docs/QWEN36.md` 的一节~~ → **已完成**（`docs/QWEN36.md`）；
    c. **如果要进默认**，先立一条「与默认路径逐字节相同」的验收门（现在做不到，见 §3）。
