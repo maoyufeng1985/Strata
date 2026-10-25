@@ -173,6 +173,28 @@ __global__ void k_peer_scatter(const int32_t* __restrict__ ids, const uint8_t* _
 ///
 /// A value that does not fit is CLAMPED, not silently turned into an infinity: the transport has to deliver
 /// something finite, and the clamp is visible in the measured maximum.
+__global__ void k_gather_q8(const uint8_t* __restrict__ src, const int32_t* __restrict__ map, uint8_t* __restrict__ dst,
+                            int n, int n_src_rows, int nblk, int blk_bytes) {
+    // THE q8_1 WINDOW'S GATHER: the caller sent the window already quantized, so the helper copies the rows it
+    // owns into the products' order instead of quantizing them.  The bytes are the ones MMQ::quantize would have
+    // written for the same row values - the same function, the same values - so the numbers do not move.
+    //
+    // THE MOVE IS BY BLOCK, NOT BY ROW.  The MMQ's activation layout is banded: the blocks of one band (128 values
+    // of every row) are contiguous and the rows sit inside the band, so the block of row r in band b is at
+    // b*nrows + r (quantize_mmq_q8_1_cuda writes it that way, and the MMQ kernel reads it the same way).  The
+    // caller's window has the WINDOW's row count and the helper's rows have the HELPER's, so the two strides
+    // differ and the blocks have to be moved one by one.
+    const int chunks = blk_bytes / 16;      // a block is a whole number of 16-byte pieces
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t) n * nblk * chunks) return;
+    const int c = (int) (idx % chunks);
+    const int b = (int) ((idx / chunks) % nblk);
+    const int i = (int) (idx / ((int64_t) chunks * nblk));
+    const uint8_t* s = src + ((int64_t) b * n_src_rows + map[i]) * blk_bytes + c * 16;
+    uint8_t* d = dst + ((int64_t) b * n + i) * blk_bytes + c * 16;
+    *(uint4*) d = *(const uint4*) s;
+}
+
 __global__ void k_pack_f16(const float* __restrict__ src, __half* __restrict__ dst, int64_t n,
                             unsigned int* __restrict__ max_abs, unsigned int* __restrict__ max_rel) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -221,6 +243,7 @@ struct PeerPrefill36::Impl {
     // WHERE THE UPLOAD READS FROM: this helper's own staging, or the caller's shared copy of the window (the
     // helpers of one layer are given the same activations and the same routing, so the primary can stage them once).
     const float* h_x_use = nullptr;
+    const uint8_t* h_x8_use = nullptr;   // the same window already in q8_1 (the caller's staging)
     const int32_t* h_ids_use = nullptr;
     float* h_out = nullptr;      // [cap][n_embd] this helper's run, on its way back
     // STRATA_Q36_PEER_F16=1: the same run as fp16.  d_out16 is the packed image on the helper, h_out16 the pinned
@@ -242,6 +265,7 @@ struct PeerPrefill36::Impl {
 
     // everything below is allocated on `device`
     float* d_x = nullptr;      // [cap][n_embd] the staged activations
+    void* d_x8 = nullptr;      // [cap][q8 row bytes] the staged activations ALREADY in q8_1 (the caller's staging)
     float* d_gu = nullptr;     // [cap][2 n_ff] the gate+up product
     float* d_h = nullptr;      // [cap][n_ff]   SwiGLU out
     float* d_out = nullptr;    // [cap][n_embd] this helper's run, before the one peer copy
@@ -513,6 +537,9 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
     const size_t nf = (size_t) cap_entries;
     const bool ok =
         ck(cudaMalloc((void**) &m.d_x, nf * (size_t) n_embd * sizeof(float)), "activation staging", err) &&
+        // The q8_1 window: the caller quantized it (the format the products read), so the helper gathers its rows
+        // instead of quantizing them.  A quarter of the bytes over a slow link.
+        ck(cudaMalloc(&m.d_x8, MMQ::q8_bytes(cap_entries, n_embd)), "q8 activation staging", err) &&
         ck(cudaMalloc((void**) &m.d_gu, nf * (size_t) (2 * n_ff) * sizeof(float)), "gate+up staging", err) &&
         ck(cudaMalloc((void**) &m.d_h, nf * (size_t) n_ff * sizeof(float)), "SwiGLU staging", err) &&
         ck(cudaMalloc((void**) &m.d_out, nf * (size_t) n_embd * sizeof(float)), "result run", err) &&
@@ -620,7 +647,7 @@ void PeerPrefill36::close() {
         On on(m.device);
         if (m.stream != nullptr) cudaStreamSynchronize(m.stream);
         m.mctx.reset();   // its pool belongs to the helper: destroy it there
-        void* frees[] = {m.d_x,  m.d_gu, m.d_h,       m.d_out, m.d_ys,   m.d_xq,     m.d_hq,
+        void* frees[] = {m.d_x,  m.d_x8, m.d_gu, m.d_h,       m.d_out, m.d_ys,   m.d_xq,     m.d_hq,
                          m.d_ids, m.d_ident, m.d_src, m.d_map, m.d_rank, m.d_pos, m.d_cnt,   m.d_cur,
                          m.d_bounds, m.d_maxr, m.d_owned, m.d_out16, m.d_f16max, m.d_f16rel};
         for (void* p : frees)
@@ -691,7 +718,8 @@ int64_t PeerPrefill36::cap_entries() const { return impl_->cap; }
 bool PeerPrefill36::host_route() const { return !impl_->p2p; }
 
 bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok,
-                                   std::string& err, const float* h_staged, const int32_t* ids_staged) {
+                                   std::string& err, const void* h_staged, const int32_t* ids_staged,
+                                   bool q8_window) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: prepare() on a closed executor"; return false; }
     if (h_primary == nullptr || ids_primary == nullptr) { err = "q36 peer prefill: null activations or routing"; return false; }
@@ -806,11 +834,21 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
             // THE CALLER ALREADY STAGED THE WINDOW.  Every helper in a layer is given the SAME activations and the
             // SAME routing, so the primary copies them out of its memory once and the helpers read that one copy.
             // Copying them per helper meant the primary moved the same 4 MiB out three times over.
-            m.h_x_use = h_staged;
+            m.h_x_use = (const float*) h_staged;
             m.h_ids_use = ids_staged;
+            // In the q8_1 mode the staged activations are the q8_1 bytes (the caller quantized them), so the
+            // helper's upload is a quarter of the size - and the helper GATHERS its rows instead of quantizing
+            // them, which is the same bytes its own quantize() would have written.
+            m.h_x8_use = q8_window ? (const uint8_t*) h_staged : nullptr;
         } else {
+            if (q8_window) {
+                err = "q36 peer prefill: the q8_1 window needs the caller's staging (the helper cannot quantize "
+                      "a window that never arrived in fp32)";
+                return false;
+            }
             m.h_x_use = m.h_x;
             m.h_ids_use = m.h_ids;
+            m.h_x8_use = nullptr;   // this layer's window arrives in fp32: the helper quantizes it itself
             On onp(m.primary);   // the two source pointers are the primary's: the copies run on its device
             if (!ck(cudaMemcpy(m.h_x, h_primary, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
                                cudaMemcpyDeviceToHost), "stage activations through host", err) ||
@@ -823,6 +861,7 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
     } else {
         m.h_x_use = nullptr;
         m.h_ids_use = nullptr;
+        m.h_x8_use = nullptr;
     }
 
     On on(m.device);
@@ -840,7 +879,15 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
         // kernel reads d_x - and an upload nobody waits for would still be queued on the helper's stream when the NEXT
         // layer's blocking D2H refills h_x, which arrives before that stream is ever synchronised.  Leaving it out is
         // cheaper than ordering around it.
-        if (!ck(cudaMemcpyAsync(m.d_x, m.h_x_use, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
+        if (m.h_x8_use != nullptr) {
+            // THE q8_1 WINDOW: a quarter of the bytes (the helpers' links measured 0.81 GB/s, the primary's
+            // 6.03 - 192.168.1.98, 2026-10-25), and the helper gathers its rows instead of quantizing them.
+            if (!ck(cudaMemcpyAsync(m.d_x8, m.h_x8_use, (size_t) n_tok * MMQ::q8_row_bytes(m.n_embd),
+                                    cudaMemcpyHostToDevice, m.stream), "upload q8 activations", err) ||
+                !ck(cudaMemcpyAsync(m.d_ids, m.h_ids_use, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
+                    "upload routing", err))
+                return false;
+        } else if (!ck(cudaMemcpyAsync(m.d_x, m.h_x_use, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
                                 cudaMemcpyHostToDevice, m.stream), "upload activations", err) ||
             !ck(cudaMemcpyAsync(m.d_ids, m.h_ids_use, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
                 "upload routing", err))
@@ -942,7 +989,18 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
     //    the primary passes.
     float* const ys_gu = MMQ::fp4_activations(L.gu_type) ? m.d_ys : nullptr;
     float* const ys_d = MMQ::fp4_activations(L.d_type) ? m.d_ys : nullptr;
-    MMQ::quantize(m.d_x, m.d_src, m.d_xq, L.gu_type, m.n_embd, m.n_embd, n, m.stream, ys_gu);
+    if (m.h_x8_use != nullptr) {
+        // THE q8_1 WINDOW: the rows the products read are the caller's rows, moved into the plan's order and into
+        // the MMQ's banded layout.  The bytes are the ones MMQ::quantize would have written for the same values.
+        const int blk = (int) MMQ::q8_block_bytes();
+        const int nblk = (int) MMQ::q8_row_blocks(m.n_embd);
+        const int64_t total = (int64_t) n * nblk * (blk / 16);
+        k_gather_q8<<<grid1(total), kThreads, 0, m.stream>>>((const uint8_t*) m.d_x8, m.d_src, (uint8_t*) m.d_xq, n,
+                                                             (int) m.prep_n_tok, nblk, blk);
+        if (!ck(cudaGetLastError(), "gather the q8 rows", err)) return false;
+    } else {
+        MMQ::quantize(m.d_x, m.d_src, m.d_xq, L.gu_type, m.n_embd, m.n_embd, n, m.stream, ys_gu);
+    }
 
     // 2. gate+up as one [2 n_ff] product per arithmetic run of experts, the weights read in place from the cache.
     //    Output rows stay in the PLAN's expert order (the identity table), because that is the index space `bounds`

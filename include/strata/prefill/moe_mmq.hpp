@@ -29,6 +29,15 @@ Nvfp4Mode nvfp4_mode();
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
 size_t q8_bytes(int64_t rows, int64_t cols);
+/// Bytes of ONE q8_1 activation row of `cols` values: the row's own blocks, without the buffer's trailing pad
+/// (q8_bytes carries a fixed pad at the end of the whole buffer, so the per-row size is the difference of two
+/// of them).  A row's bytes are a whole number of 16-byte blocks.
+size_t q8_row_bytes(int64_t cols);
+/// Bytes of ONE q8_1 block (128 values plus the scales): the unit the activations' layout is built of.
+size_t q8_block_bytes();
+/// The blocks of ONE q8_1 row of `cols` values: the MMQ's band width (the blocks of a band are contiguous and the
+/// rows sit inside the band, so a row's bytes are NOT one run - the block of row r in band b is at b*nrows + r).
+size_t q8_row_blocks(int64_t cols);
 
 /// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.

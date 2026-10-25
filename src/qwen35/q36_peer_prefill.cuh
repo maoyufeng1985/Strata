@@ -112,8 +112,16 @@ public:
     /// caller staged the window once and every helper reads that one copy.  That matters because the helpers
     /// share the same window: without it the primary copies the same 4 MiB out once per helper, three times over.
     /// Null means "stage it yourself", which is what a caller that prepares one helper at a time wants.
+    ///
+    /// `q8_window`: the staged activations are ALREADY in q8_1 (the format the products read) instead of fp32.
+    /// The caller quantized them, so the helper GATHERS the rows it owns instead of quantizing them - the bytes
+    /// are the ones its own quantize() would have produced (the same function, the same row values), so the
+    /// numbers do not move.  It is a quarter of the bytes over a link that is slow: the helpers' H2D measured
+    /// 0.81 GB/s against the primary's 6.03 (192.168.1.98, 2026-10-25), and the window is the biggest thing the
+    /// prompt sends up.  With it set, `h_staged` is REQUIRED (the caller has to have quantized the window: the
+    /// helper cannot quantize a window that never arrived in fp32).
     bool prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok, std::string& err,
-                       const float* h_staged = nullptr, const int32_t* ids_staged = nullptr);
+                       const void* h_staged = nullptr, const int32_t* ids_staged = nullptr, bool q8_window = false);
     /// The second half: wait for the helper's stream and read the owned-row count and the widest expert back.
     /// Must follow a successful prepare_begin() for the same layer on the same helper.
     bool prepare_end(std::string& err);
