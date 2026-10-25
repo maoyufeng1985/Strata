@@ -1714,6 +1714,37 @@ struct Engine {
     int f16_tiles_cap = 0;   // the tiles' array size (the batch's tile count never exceeds it)
     __half* x16 = nullptr;
     bool use_graph = true;
+    // STRATA_Q36_SHARED_GRAPH=1: the shared expert's kernels in a CUDA graph, one graph per layer (the weights
+    // differ per layer, so the kernel arguments differ).  The shared expert's four launches sit in the dispatch
+    // window, where the GPU has nothing to do: the host's cost of them IS the wall clock's cost - unlike the
+    // mixer's launches, which hide inside the GPU's mixer work.
+    std::vector<cudaGraphExec_t> shared_ge;
+    bool shared_graph_ok = false;
+    static bool shared_graph_flag() {
+        static const bool v = [] {
+            const char* e = std::getenv("STRATA_Q36_SHARED_GRAPH");
+            return e && e[0] == '1' && e[1] == '\0';
+        }();
+        return v;
+    }
+    /// STRATA_Q36_SHARED_GRAPH=1: capture one CUDA graph per layer for the decode's shared expert.  The capture runs
+    /// the same method the replay replaces, with the decode's shape (one token, the router's folded gate), so the
+    /// graph holds the kernels the layer would issue and nothing else.
+    void capture_shared_graphs() {
+        const size_t n = m->layers.size();
+        if (n == 0) return;
+        shared_ge.assign(n, nullptr);
+        for (size_t li = 0; li < n; ++li) {
+            cudaGraph_t g = nullptr;
+            CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+            shared_expert(m->layers[li], 1, true);
+            CK(cudaStreamEndCapture(st, &g));
+            CK(cudaGraphInstantiate(&shared_ge[li], g, 0));
+            CK(cudaGraphDestroy(g));
+        }
+        shared_graph_ok = true;
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_SHARED_GRAPH: %zu layer shared-expert graphs captured\n", n);
+    }
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
 
     // ---- --mtp-adaptive (opt-in): the learned per-depth draft cost and acceptance (EMA), and the D the next
@@ -2080,7 +2111,7 @@ struct Engine {
     // they are d_host_layer_ms - d_prebegin_ms; the point of the split is to see WHICH part of the host's work is
     // the critical path, because the whole decode step is host-bound on this box (MEASURED 2026-10-25: the host's
     // own work is 282 us per layer, the GPU's timeline 427 us, and the GPU waits).
-    double d_h_mixer_ms = 0, d_h_begin_ms = 0, d_h_local_ms = 0, d_h_cpu_ms = 0, d_h_finish_ms = 0;
+    double d_h_mixer_ms = 0, d_h_begin_ms = 0, d_h_local_ms = 0, d_h_shared_ms = 0, d_h_cpu_ms = 0, d_h_finish_ms = 0;
     // ---- STRATA_Q36_HELPER_PARALLEL_MARSHAL=1 (opt-in): the helper window's begin() calls, and the finish()
     // calls in moe_helpers_wait, run on their own worker threads, so the three helpers are dispatched at the
     // same time instead of one after the other.
@@ -2206,7 +2237,11 @@ struct Engine {
         }
         marshal_on = false;
     }
-    ~Engine() { marshal_stop(); }
+    ~Engine() {
+        marshal_stop();
+        for (auto& gx : shared_ge)
+            if (gx) { CK(cudaGraphExecDestroy(gx)); gx = nullptr; }
+    }
     /// Hand a job to a worker.  The worker owns helper r (r is the helper's index in helpers[]).
     void marshal_post(int r, int kind, size_t li, int T, int Kp, const float* x, const int32_t* ids, float* out) {
         Marshal& m = marshal_[(size_t) r];
@@ -3133,26 +3168,48 @@ struct Engine {
         }
     }
 
-    /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
-    /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
-    /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
-    void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
-               const float* wn, float* hout) {
+    /// The shared expert: the gate and the up (one product when the shapes allow), the SwiGLU and its q8_1 image,
+    /// the down product, and the gate's own product (only when the router did not fold the gate into the router's
+    /// GEMV - `ext`).
+    /// Its own method, so STRATA_Q36_SHARED_GRAPH=1 can capture it into a CUDA graph.  MEASURED 2026-10-25
+    /// (192.168.1.98): the graph moved the host's cost of these launches out of the dispatch window (22.7 -> 6.6 us
+    /// per layer) and the wall clock did not move - the time reappeared in the harvest's wait, because what the host
+    /// spent here was the GPU's shared-expert work, not the launches.  The flag stays (it is opt-in, the default path
+    /// is byte-identical) and the result is recorded in plans/2026-10-25-q36-mixer-graph.md.
+    void shared_expert(const Layer& L, int T, bool ext) {
         const auto& g = m->g;
-        const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
-        const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, D = (int) g.ssm_state_size;
+        const int N = (int) g.n_embd, FS = (int) g.n_ff_shexp;
+        if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+        if (T <= kGemmT) {
+            if (!shared_gu(L, T)) {
+                apply(L.sh_gate, xq, sg, T);
+                apply(L.sh_up, xq, su, T);
+                K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);   // SwiGLU and its q8_1 image in one launch
+            }
+            mmq(L.sh_down, q8, sy, T);
+        } else {
+            apply(L.sh_gate, xq, sg, T);
+            apply(L.sh_up, xq, su, T);
+            k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
+            mm(L.sh_down, shh, sy, T);
+        }
+        if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
+    }
+    /// The layer's mixer: the GDN or the attention branch, the norm, the router's GEMV and the top-k.  Its own
+    /// method, so the host's cost of it is one thing (the probe's "mixer" segment) and not a hundred lines inside
+    /// layer().  The host spends 55 us per layer here (MEASURED 2026-10-25 on 192.168.1.98) and the GPU 135, and
+    /// the host's part sits INSIDE the GPU's: the decode's wall clock is not shortened by making these launches
+    /// cheaper (a CUDA graph of this method was measured: neutral, the text identical - see
+    /// plans/2026-10-25-q36-mixer-graph.md).
+    /// Returns the router's fused flag: the router's GEMV wrote g.n_expert + 1 columns (the shared expert's gate is
+    /// the last one) and the combine reads the gate from there.
+    bool mixer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
+               bool hy_rows, bool mmq_rows) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, Kp = (int) m->top_k;
+        const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads;
         const int C = (int) g.ssm_conv_channels;
         const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
-        // STRATA_Q36_HELPER_TIMING=1: E0, the start of this layer's tile.  Only opens a tile when the probe is on
-        // and no graph is being captured; every other mark below is a no-op unless this one opened it.
-        // Only ONE layer of ONE forward carries a tile: the 8 shared events cannot survive 40 layers of records,
-        // and the number being explained is the single-token decode step (T==1).  gp_open_this_forward is set by
-        // forward() for the LAST layer only, so exactly one tile per forward is ever queued.
-        if (gpu_timing && gpu_open_this_forward && !gpu_timing_hold) { gpu_timing_open = true; }
-        // STRATA_Q36_HELPER_TIMING=1: the host's time in the layer's own enqueues (the mixer, the router), measured
-        // from here to the routing's end.  Zero statements run with the flag off (the ternary takes Clock::now()
-        // only when the flag is on).
-        const auto t_mixer0 = helper_timing() ? Clock::now() : Clock::time_point{};
         ev_mark(kSegAttnEsm);
         // STRATA_Q36_PROMPT_TIMING=1: P0, the start of this layer's span, only for the MMQ branch of a prompt chunk.
         // Recorded on the primary stream next to the existing ev_mark(kSegAttnEsm) so it lines up with the attention
@@ -3323,13 +3380,37 @@ struct Engine {
         const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
         if (ext) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, T);
         else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
+        if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, nullptr, T,
+                                      ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
+            K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
+        return ext;
+    }
+
+    /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
+    /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
+    /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
+    void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
+               const float* wn, float* hout) {
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
+        // STRATA_Q36_HELPER_TIMING=1: E0, the start of this layer's tile.  Only opens a tile when the probe is on
+        // and no graph is being captured; every other mark below is a no-op unless this one opened it.
+        // Only ONE layer of ONE forward carries a tile: the 8 shared events cannot survive 40 layers of records,
+        // and the number being explained is the single-token decode step (T==1).  gp_open_this_forward is set by
+        // forward() for the LAST layer only, so exactly one tile per forward is ever queued.
+        if (gpu_timing && gpu_open_this_forward && !gpu_timing_hold) { gpu_timing_open = true; }
+        // STRATA_Q36_HELPER_TIMING=1: the host's time in the layer's own enqueues (the mixer, the router), measured
+        // from here to the routing's end.  Zero statements run with the flag off (the ternary takes Clock::now()
+        // only when the flag is on).
+        const auto t_mixer0 = helper_timing() ? Clock::now() : Clock::time_point{};
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
         const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
-        if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, nullptr, T,
-                                      ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
-            K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
+        // the mixer's kernels: the GDN or the attention branch, the norm, the router and the top-k.  Its own
+        // method, so the host's cost of it is one thing (the probe's "mixer" segment) and not a hundred lines
+        // inside layer().
+        const bool ext = mixer(L, li, T, p0, dpos, graph_mode, verify, hy_rows, mmq_rows);
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         helper_mask_li = -1;   // set below, when this layer's window actually goes to a helper
@@ -3544,21 +3625,20 @@ struct Engine {
         }
         // the shared expert, scaled by sigmoid(w . h)
         ev_mark(kSegShared);    // E4: the local grouped expert GEMM is issued; the shared expert follows
-        if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
-        if (T <= kGemmT) {
-            if (!shared_gu(L, T)) {
-                apply(L.sh_gate, xq, sg, T);
-                apply(L.sh_up, xq, su, T);
-                K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);   // SwiGLU and its q8_1 image in one launch
-            }
-            mmq(L.sh_down, q8, sy, T);
+        // STRATA_Q36_SHARED_GRAPH=1: the shared expert's kernels replayed from this layer's graph.  The conditions
+        // are the ones the capture assumed: one token, not a verify window, not the MTP's multi-row path, and no
+        // probe (the probe's marks are host-side events a graph does not carry).
+        const bool sg = shared_graph_ok && li < shared_ge.size() && shared_ge[li] && T == 1 && !verify && !rows_mode &&
+                        ext && !gpu_timing;
+        if (helper_timing()) {
+            const auto t_sh = Clock::now();
+            if (sg) CK(cudaGraphLaunch(shared_ge[li], st));
+            else shared_expert(L, T, ext);
+            d_h_shared_ms += ms_since(t_sh);
         } else {
-            apply(L.sh_gate, xq, sg, T);
-            apply(L.sh_up, xq, su, T);
-            k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
-            mm(L.sh_down, shh, sy, T);
+            if (sg) CK(cudaGraphLaunch(shared_ge[li], st));
+            else shared_expert(L, T, ext);
         }
-        if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
         if (hy_rows) {   // the CPU pool's experts (while the GPU runs the rest), merged
             if (helper_timing()) {
                 const auto t_cpu = Clock::now();
@@ -5409,7 +5489,7 @@ struct Engine {
         hy_cpu_ms = 0;
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
         d_host_layer_ms = 0; d_host_layer_n = 0;
-        d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
+        d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_shared_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: the GPU-segment accumulators reset with the host ones, or bench
                       // pass 1 would leak into pass 2 and into the AGG aggregate.
         pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason, for the prompt-chunk accumulators
@@ -5437,7 +5517,7 @@ struct Engine {
         hy_cpu_ms = 0;
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
         d_host_layer_ms = 0; d_host_layer_n = 0;
-        d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
+        d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_shared_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: same reason as in warmup()
         pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason
         row_ids.clear();
@@ -7051,6 +7131,10 @@ int strata::qwen35::run(int argc, char** argv) {
         }
     } report{E};
     E.reset();
+    // STRATA_Q36_SHARED_GRAPH=1: the shared expert's kernels in a CUDA graph, one per layer, captured here.  Only
+    // where the full forward's graph is off (the hybrid mode: the host takes part in every layer), because inside
+    // the full graph the shared expert is already one node.
+    if (E.shared_graph_flag() && !E.use_graph) E.capture_shared_graphs();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (suffix_k > 0) {
         if (!m.has_mtp) {
@@ -7214,7 +7298,7 @@ int strata::qwen35::run(int argc, char** argv) {
             long long pn0 = 0, sn0 = 0;
             double hostl0 = 0;
             long long hostln0 = 0;
-            double hmix0 = 0, hbeg0 = 0, hloc0 = 0, hcpu0 = 0, hfin0 = 0;
+            double hmix0 = 0, hbeg0 = 0, hloc0 = 0, hsh0 = 0, hcpu0 = 0, hfin0 = 0;
             double g0[Engine::kGsegN] = {}, span0 = 0, resid0 = 0, emb0 = 0, head0 = 0;
             long long gn0 = 0, drop0 = 0;
             if (helper_timing) {
@@ -7226,7 +7310,7 @@ int strata::qwen35::run(int argc, char** argv) {
                 pre0 = E.d_prebegin_ms; spin0 = E.d_route_spin_ms;
                 pn0 = E.d_prebegin_n; sn0 = E.d_route_spin_n;
                 hostl0 = E.d_host_layer_ms; hostln0 = E.d_host_layer_n;
-                hmix0 = E.d_h_mixer_ms; hbeg0 = E.d_h_begin_ms; hloc0 = E.d_h_local_ms;
+                hmix0 = E.d_h_mixer_ms; hbeg0 = E.d_h_begin_ms; hloc0 = E.d_h_local_ms; hsh0 = E.d_h_shared_ms;
                 hcpu0 = E.d_h_cpu_ms; hfin0 = E.d_h_finish_ms;
                 for (int j = 0; j < Engine::kGsegN; ++j) g0[j] = E.gseg_ms[j];
                 span0 = E.gspan_ms; resid0 = E.gp_resid_ms;
@@ -7247,7 +7331,7 @@ int strata::qwen35::run(int argc, char** argv) {
             long long r_pn = 0, r_sn = 0;
             double r_hostl = 0;
             long long r_hostln = 0;
-            double r_hmix = 0, r_hbeg = 0, r_hloc = 0, r_hcpu = 0, r_hfin = 0;
+            double r_hmix = 0, r_hbeg = 0, r_hloc = 0, r_hsh = 0, r_hcpu = 0, r_hfin = 0;
             double r_gseg[Engine::kGsegN] = {}, r_span = 0, r_resid = 0, r_emb = 0, r_head = 0;
             long long r_gn = 0, r_drop = 0;
             if (helper_timing) {
@@ -7274,6 +7358,7 @@ int strata::qwen35::run(int argc, char** argv) {
                 r_hmix = E.d_h_mixer_ms - hmix0;
                 r_hbeg = E.d_h_begin_ms - hbeg0;
                 r_hloc = E.d_h_local_ms - hloc0;
+                r_hsh = E.d_h_shared_ms - hsh0;
                 r_hcpu = E.d_h_cpu_ms - hcpu0;
                 r_hfin = E.d_h_finish_ms - hfin0;
                 for (int j = 0; j < Engine::kGsegN; ++j) {
@@ -7324,13 +7409,13 @@ int strata::qwen35::run(int argc, char** argv) {
                 std::fprintf(stderr,
                              "strata-q36 PHASE3 bench %d primary: %.3f ms/tok wall | prebegin_sync=%.3f "
                              "ms/tok (%lld calls) route_spin=%.3f ms/tok (%lld calls) host_layer=%.3f "
-                             "ms/tok (%lld calls) host_own=%.3f | host mixer=%.3f begin=%.3f local=%.3f "
+                             "ms/tok (%lld calls) host_own=%.3f | host mixer=%.3f begin=%.3f local=%.3f shared=%.3f "
                              "cpu=%.3f finish=%.3f (per ms/tok)\n",
                              rep, per_tok, r_pre / (double) bench_tg, r_pn,
                              r_spin / (double) bench_tg, r_sn, r_hostl / (double) bench_tg, r_hostln,
                              (r_hostl - r_pre) / (double) bench_tg, r_hmix / (double) bench_tg,
-                             r_hbeg / (double) bench_tg, r_hloc / (double) bench_tg, r_hcpu / (double) bench_tg,
-                             r_hfin / (double) bench_tg);
+                             r_hbeg / (double) bench_tg, r_hloc / (double) bench_tg, r_hsh / (double) bench_tg,
+                             r_hcpu / (double) bench_tg, r_hfin / (double) bench_tg);
             if (helper_timing && bench_tg > 0 && E.gpu_timing) {
                 std::fprintf(stderr,
                              "strata-q36 PHASE3 bench %d GPU primary: %.3f ms/tok wall | layers=%lld tiles=%lld |",
