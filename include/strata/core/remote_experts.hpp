@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/remote_expert_opt.hpp"   // RemoteExpertOpt's definition: remote_opt_active() reads its active()
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -65,6 +66,10 @@ public:
         return slot >= 0 ? cache_.device_slot(slot) : nullptr;
     }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
+    /// Whether the remote-expert optimization is ACTIVE on this tier (its finish() then accumulates into a shared
+    /// buffer instead of scattering its own rows).  A caller that runs several tiers' finish() calls at the same
+    /// time must not: the accumulation is shared state.  Read-only: nothing about this class changes.
+    bool remote_opt_active() const { return remote_opt_ && remote_opt_->active(); }
     /// This tier's CUDA device ordinal (the one open() was given, -1 before open).  The accessor PeerExperts has
     /// (origin/main include/strata/core/peer_experts.hpp: `int device() const { return device_; }`), copied here so a
     /// caller running work on the helper's card asks the tier instead of reverse-engineering the device from the
