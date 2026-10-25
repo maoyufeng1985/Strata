@@ -2018,6 +2018,19 @@ struct Engine {
         }();
         return on;
     }
+    /// STRATA_Q36_MTP_VRAM=1 (opt-in): the MTP block's own layer keeps ALL of its experts in the PRIMARY's VRAM
+    /// (its 256 slots), so that layer is not hybrid: the CPU pool never touches it, and the MTP's mapped chain
+    /// (STRATA_Q36_MTP_MAPPED=1) is not refused because the block's layer is hybrid.  Measured 2026-10-25
+    /// (192.168.1.98): with the flag off the MTP layer's eight entries per draft step all fall to the CPU pool,
+    /// and that is most of the draft step's layer time (the layer 1.458 ms of a 2.725 ms step, the head's
+    /// 1.267 ms).  The cost is VRAM on the primary: the MTP layer's 256 experts, about 470 MiB.
+    static bool mtp_vram_flag() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_MTP_VRAM");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
     /// STRATA_Q36_MTP_HELPER=1 (opt-in): the MTP block's own layer's experts go to the helpers, like the main
     /// layers' do.  Off by default, and the reason is measured (2026-10-25, 192.168.1.98): with the flag off the
     /// MTP layer's experts are in no VRAM at all - the primary's slots cover the 40 main layers and the helpers'
@@ -5714,6 +5727,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
     int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
+    // STRATA_Q36_MTP_VRAM=1: the MTP block's layer keeps every expert in the primary's VRAM, so the main layers
+    // get what is left of the same budget.  (The other way to give that layer experts is
+    // STRATA_Q36_MTP_HELPER=1, which puts them on the helpers - but the helpers' caches are full, so that
+    // trade comes out of the MAIN layers' experts.)
+    const bool mtp_vram = m.has_mtp && !mtp_only && E.mtp_vram_flag();
+    if (mtp_vram) {
+        const size_t mtp_bytes = m.mtp.stride * (size_t) ne;
+        const size_t main_per_slot = per_slot > m.mtp.stride ? per_slot - m.mtp.stride : 0;
+        const size_t left = slot_bytes > mtp_bytes ? slot_bytes - mtp_bytes : 0;
+        S = (int) std::min<size_t>((size_t) ne, main_per_slot ? left / main_per_slot : 0);
+    }
     if (mtp_only) {   // the main layers all, the MTP block what is left
         const size_t left = budget2 > total_main ? budget2 - total_main : 0;
         S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
@@ -5724,7 +5748,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
         for (Layer* L : all) {
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
-            else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
+            else {
+                const int ns = (mtp_vram && L == &m.mtp) ? (int) ne : S;
+                need += (ns > 0 ? (size_t) ns * L->stride + kMmqTail : 0);
+            }
         }
         if (need > fr) {
             err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
@@ -5767,16 +5794,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         off += L.stride * (size_t) ne + kMmqTail;
         std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
         for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
-        L.n_slots = S;
-        if (S > 0) {
-            CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+        const int ns = (mtp_vram && &L == &m.mtp) ? (int) ne : S;
+        L.n_slots = ns;
+        if (ns > 0) {
+            CK(cudaMalloc(&L.blobs, L.stride * (size_t) ns + kMmqTail));
+            CK(cudaMemset(L.blobs, 0, L.stride * (size_t) ns + kMmqTail));
+            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) ns, cudaMemcpyHostToDevice));
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
-        H.exp_in_slot.assign((size_t) S, 0);
-        for (int s = 0; s < S; ++s) {
+        H.exp_in_slot.assign((size_t) ns, 0);
+        for (int s = 0; s < ns; ++s) {
             H.slot_of[(size_t) s] = s;
             H.exp_in_slot[(size_t) s] = s;
         }
@@ -6713,7 +6741,15 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
     // table covers the MAIN layers only: the MTP block's experts stay on the primary (its window is one draft
     // step), and expert_layout_set_native checks fmt.size() == n_layers - a table that also carried m.mtp
     // would be refused (41 != 40).  `all` still holds the MTP block, for the helper tier's own layer map below.
-    const bool mtp_helper = E.mtp_helper_flag() && m.has_mtp;
+    // STRATA_Q36_MTP_VRAM=1 (the other way to give the MTP block's layer a GPU: in the PRIMARY's own VRAM) wins
+    // over the helper way when both are on: it measured faster (the draft step's layer 0.369 ms against the
+    // helper's 0.531 ms, MEASURED 2026-10-25 on 192.168.1.98), and with both on the experts would be in two
+    // places at once - the primary's copy wasted, the helper's copy the one the run uses.
+    const bool mtp_vram = m.has_mtp && E.mtp_vram_flag();
+    const bool mtp_helper = E.mtp_helper_flag() && m.has_mtp && !mtp_vram;
+    if (mtp_vram && E.mtp_helper_flag())
+        std::fprintf(stderr, "strata-q36: STRATA_Q36_MTP_VRAM=1 wins over STRATA_Q36_MTP_HELPER=1 (the MTP block's layer "
+                     "stays in the primary's VRAM; the helpers do not take it)\n");
     const int64_t hl_layers = g.n_layers + (mtp_helper ? 1 : 0);
     fmt.reserve((size_t) hl_layers);
     layouts.reserve(fmt.capacity());
