@@ -2069,6 +2069,18 @@ struct Engine {
     long long d_prebegin_n = 0;
     double d_route_spin_ms = 0;
     long long d_route_spin_n = 0;
+    // The host's own time per layer (the enqueues, the host-side routing and the drain inside it).  The drain
+    // is d_prebegin_ms, so this minus d_prebegin_ms is the host's own work per layer.  Both are zero (and never
+    // read) with STRATA_Q36_HELPER_TIMING off.
+    double d_host_layer_ms = 0;
+    long long d_host_layer_n = 0;
+    // The host's own work per layer, split by the part it was spent in: the mixer's enqueues (the layer's entry
+    // to the routing's end), the helper dispatch (the begin calls after the drain), the local grouped kernel and
+    // the shared expert, the CPU pool's part, and the helper harvest (the finish calls and the merge).  Together
+    // they are d_host_layer_ms - d_prebegin_ms; the point of the split is to see WHICH part of the host's work is
+    // the critical path, because the whole decode step is host-bound on this box (MEASURED 2026-10-25: the host's
+    // own work is 282 us per layer, the GPU's timeline 427 us, and the GPU waits).
+    double d_h_mixer_ms = 0, d_h_begin_ms = 0, d_h_local_ms = 0, d_h_cpu_ms = 0, d_h_finish_ms = 0;
     // ---- STRATA_Q36_HELPER_TIMING=1 only: the PRIMARY GPU's own per-layer timeline, from cudaEvent on st.
     //
     // These are the segments the HOST counters cannot see (the ~14 ms/token of prebegin/route_spin/helper_wait
@@ -2204,8 +2216,12 @@ struct Engine {
     }
     /// cudaEventElapsedTime between two boundaries into the accumulator, and the pair's span into the tile.
     void gp_push(int a, int b, double ms) {
-        gseg_ms[b - a] += ms;
-        ++gseg_n[b - a];
+        // The segment is the FIRST boundary of the pair (a), not the distance between them: the caller
+        // passes (j, j + 1), so b - a is 1 for every segment and every span landed in slot 1 - the report
+        // called the whole tile "router" and printed 0.000 for the other seven.  Measured on the box
+        // 2026-10-25: the tile read 0.428 ms/tok with router=0.428 and the other six at 0.000.
+        gseg_ms[a] += ms;
+        ++gseg_n[a];
         gspan_ms += ms;
         ++gspan_n;
     }
@@ -2979,6 +2995,10 @@ struct Engine {
         // and the number being explained is the single-token decode step (T==1).  gp_open_this_forward is set by
         // forward() for the LAST layer only, so exactly one tile per forward is ever queued.
         if (gpu_timing && gpu_open_this_forward && !gpu_timing_hold) { gpu_timing_open = true; }
+        // STRATA_Q36_HELPER_TIMING=1: the host's time in the layer's own enqueues (the mixer, the router), measured
+        // from here to the routing's end.  Zero statements run with the flag off (the ternary takes Clock::now()
+        // only when the flag is on).
+        const auto t_mixer0 = helper_timing() ? Clock::now() : Clock::time_point{};
         ev_mark(kSegAttnEsm);
         // STRATA_Q36_PROMPT_TIMING=1: P0, the start of this layer's span, only for the MMQ branch of a prompt chunk.
         // Recorded on the primary stream next to the existing ev_mark(kSegAttnEsm) so it lines up with the attention
@@ -3175,9 +3195,16 @@ struct Engine {
             // helper's entries, moe_hybrid_cpu's h_miss skips them too).  With no helper this is the plain slots +
             // host pool split it always was.  Note this is a split of WORK, not of arithmetic: the helper and the
             // CPU pool are two different implementations, so their rows differ (see moe_helpers).
-            if (helpers_enabled() && helper_layer(li) && T <= strata::kernels::cpu::MAXT && !helper_failed)
+            if (helper_timing()) d_h_mixer_ms += ms_since(t_mixer0);   // the host's enqueues up to the routing
+        if (helpers_enabled() && helper_layer(li) && T <= strata::kernels::cpu::MAXT && !helper_failed)
                 moe_helpers(li, T, h_h, h_ids);   // the two copies are issued: stage from them, no D2H of its own
-            moe_hybrid_gpu(L, li, T, h_ids, h_h);   // the same copies feed the CPU pool: no D2H of its own either
+            if (helper_timing()) {   // the host's enqueues for the local grouped kernel and the shared expert
+                const auto t_local = Clock::now();
+                moe_hybrid_gpu(L, li, T, h_ids, h_h);
+                d_h_local_ms += ms_since(t_local);
+            } else {
+                moe_hybrid_gpu(L, li, T, h_ids, h_h);
+            }   // the same copies feed the CPU pool: no D2H of its own either
             ev_mark(kSegGrp);    // E3: the local grouped kernel follows
         } else if (T > kGemmT && use_mmq) {
             // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
@@ -3378,11 +3405,25 @@ struct Engine {
             mm(L.sh_down, shh, sy, T);
         }
         if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
-        if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
+        if (hy_rows) {   // the CPU pool's experts (while the GPU runs the rest), merged
+            if (helper_timing()) {
+                const auto t_cpu = Clock::now();
+                moe_hybrid_cpu(li, T);
+                d_h_cpu_ms += ms_since(t_cpu);
+            } else {
+                moe_hybrid_cpu(li, T);
+            }
+        }
         ev_mark(kSegCpu);       // E5: shared expert issued; the CPU pool's work follows on the same queue
         // STRATA_Q36_HELPER_ASYNC: deferred helper completion into eparts, after this layer's own work
         // (local grouped, shared expert, CPU pool) and before moe_end.  Flag-off / sync path: no-op.
-        moe_helpers_wait(li);
+        if (helper_timing()) {   // the helper harvest: the finish calls and the merge into eparts
+            const auto t_fin = Clock::now();
+            moe_helpers_wait(li);
+            d_h_finish_ms += ms_since(t_fin);
+        } else {
+            moe_helpers_wait(li);
+        }
         // STRATA_Q36_PROMPT_TIMING=1: P1b, right BEFORE peer_prefill_wait() and after the primary's own MMQ and
         // shared-expert launches.  The position matters and it is the whole point of this boundary.  What
         // peer_prefill_wait() does is issue a cudaStreamWaitEvent(st, m.ev) - a WAIT NODE INSERTED INTO st's queue.
@@ -3481,8 +3522,20 @@ struct Engine {
             // its MoE reads eparts the same way the others do, and the whole point is to know where the
             // decode step's time goes, which is the same story in every layer.
             gpu_open_this_forward = last && T == 1;
-            layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
-                  last ? hmain : h);
+            // STRATA_Q36_HELPER_TIMING=1: the host's own time per layer.  It covers the enqueues, the host-side
+            // routing and the drain (d_prebegin_ms) that waits for this layer's GPU work, so the difference is
+            // the host's own work per layer - the number that says whether the decode step is host-bound.
+            // The statement order is the same with the flag off: the timing calls are the only addition.
+            if (helper_timing()) {
+                const auto t_layer = Clock::now();
+                layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
+                      last ? hmain : h);
+                d_host_layer_ms += ms_since(t_layer);
+                ++d_host_layer_n;
+            } else {
+                layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
+                      last ? hmain : h);
+            }
         }
         gpu_open_this_forward = false;
         // STRATA_Q36_PROMPT_TIMING=1: close the record and drain ONCE.  The forward-end event is recorded, then a
@@ -3783,6 +3836,9 @@ struct Engine {
         // STRATA_Q36_HELPER_PARALLEL=1 this is what turns the striped "one helper per layer, the others idle"
         // into the row split Flash-Next already runs (expert_source.cpp calls begin() per helper in a loop).
         // On the default path nwin == 1 and this loop is one iteration - the same single begin() as before.
+        // STRATA_Q36_HELPER_TIMING=1: the host's part of the dispatch (the begin calls), measured here so the
+        // decode's host-bound time can be split by the part it was spent in.
+        const auto t_begin0 = helper_timing() ? Clock::now() : Clock::time_point{};
         for (int w = 0; w < nwin; ++w) {
             const int hi = win[w];
             if (helpers[(size_t) hi].begin((int64_t) li, h_helper_x, h_helper_ids, T, Kp, nullptr, nullptr, err))
@@ -3797,6 +3853,7 @@ struct Engine {
             CK(cudaMemcpyAsync(d_helper_mask, helper_mask.data(), (size_t) n_ent, cudaMemcpyHostToDevice, st));
             return false;
         }
+        if (helper_timing()) d_h_begin_ms += ms_since(t_begin0);   // the host's part of the dispatch
         if (helper_async()) {
             // STRATA_Q36_HELPER_ASYNC: the per-entry mask goes up now (the local grouped kernel and the
             // CPU pool read it and must keep the same split they always had), but the eparts upload of
@@ -5148,6 +5205,8 @@ struct Engine {
         hy_helper = 0;   // the warmup's helper work is not part of the batch counts
         hy_cpu_ms = 0;
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
+        d_host_layer_ms = 0; d_host_layer_n = 0;
+        d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: the GPU-segment accumulators reset with the host ones, or bench
                       // pass 1 would leak into pass 2 and into the AGG aggregate.
         pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason, for the prompt-chunk accumulators
@@ -5174,6 +5233,8 @@ struct Engine {
         hy_helper = 0;
         hy_cpu_ms = 0;
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
+        d_host_layer_ms = 0; d_host_layer_n = 0;
+        d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: same reason as in warmup()
         pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason
         row_ids.clear();
@@ -6864,6 +6925,9 @@ int strata::qwen35::run(int argc, char** argv) {
         double d_begin[3] = {}, d_wait[3] = {}, d_ovh[3] = {};
         double d_pre = 0, d_spin = 0;
         long long n_pre = 0, n_spin = 0;
+        // The host's own time per layer (STRATA_Q36_HELPER_TIMING=1): the aggregate of the per-pass deltas.
+        double d_hostl = 0;
+        long long n_hostl = 0;
         // STRATA_Q36_PROMPT_TIMING=1: the prompt-chunk probe's per-pass and 3-pass-aggregate accumulators.  The GPU
         // spans are EIGHT per-layer segments summed across every layer AND every chunk (process() breaks a long
         // prompt into chunks of tmax each); the host totals are the five wall-clock pieces the probe measures on the
@@ -6942,6 +7006,9 @@ int strata::qwen35::run(int argc, char** argv) {
             double begin0[3] = {}, wait0[3] = {}, ovh0[3] = {};
             double pre0 = 0, spin0 = 0;
             long long pn0 = 0, sn0 = 0;
+            double hostl0 = 0;
+            long long hostln0 = 0;
+            double hmix0 = 0, hbeg0 = 0, hloc0 = 0, hcpu0 = 0, hfin0 = 0;
             double g0[Engine::kGsegN] = {}, span0 = 0, resid0 = 0, emb0 = 0, head0 = 0;
             long long gn0 = 0, drop0 = 0;
             if (helper_timing) {
@@ -6952,6 +7019,9 @@ int strata::qwen35::run(int argc, char** argv) {
                 }
                 pre0 = E.d_prebegin_ms; spin0 = E.d_route_spin_ms;
                 pn0 = E.d_prebegin_n; sn0 = E.d_route_spin_n;
+                hostl0 = E.d_host_layer_ms; hostln0 = E.d_host_layer_n;
+                hmix0 = E.d_h_mixer_ms; hbeg0 = E.d_h_begin_ms; hloc0 = E.d_h_local_ms;
+                hcpu0 = E.d_h_cpu_ms; hfin0 = E.d_h_finish_ms;
                 for (int j = 0; j < Engine::kGsegN; ++j) g0[j] = E.gseg_ms[j];
                 span0 = E.gspan_ms; resid0 = E.gp_resid_ms;
                 emb0 = E.gp_embed_ms; head0 = E.gp_head_ms;
@@ -6969,6 +7039,9 @@ int strata::qwen35::run(int argc, char** argv) {
             double r_begin[3] = {}, r_wait[3] = {}, r_ovh[3] = {};
             double r_pre = 0, r_spin = 0;
             long long r_pn = 0, r_sn = 0;
+            double r_hostl = 0;
+            long long r_hostln = 0;
+            double r_hmix = 0, r_hbeg = 0, r_hloc = 0, r_hcpu = 0, r_hfin = 0;
             double r_gseg[Engine::kGsegN] = {}, r_span = 0, r_resid = 0, r_emb = 0, r_head = 0;
             long long r_gn = 0, r_drop = 0;
             if (helper_timing) {
@@ -6988,6 +7061,15 @@ int strata::qwen35::run(int argc, char** argv) {
                 d_spin += r_spin;
                 n_pre += r_pn;
                 n_spin += r_sn;
+                r_hostl = E.d_host_layer_ms - hostl0;
+                r_hostln = E.d_host_layer_n - hostln0;
+                d_hostl += r_hostl;
+                n_hostl += r_hostln;
+                r_hmix = E.d_h_mixer_ms - hmix0;
+                r_hbeg = E.d_h_begin_ms - hbeg0;
+                r_hloc = E.d_h_local_ms - hloc0;
+                r_hcpu = E.d_h_cpu_ms - hcpu0;
+                r_hfin = E.d_h_finish_ms - hfin0;
                 for (int j = 0; j < Engine::kGsegN; ++j) {
                     r_gseg[j] = E.gseg_ms[j] - g0[j];
                     d_gseg[j] += r_gseg[j];
@@ -7035,9 +7117,14 @@ int strata::qwen35::run(int argc, char** argv) {
             if (helper_timing && bench_tg > 0)
                 std::fprintf(stderr,
                              "strata-q36 PHASE3 bench %d primary: %.3f ms/tok wall | prebegin_sync=%.3f "
-                             "ms/tok (%lld calls) route_spin=%.3f ms/tok (%lld calls)\n",
+                             "ms/tok (%lld calls) route_spin=%.3f ms/tok (%lld calls) host_layer=%.3f "
+                             "ms/tok (%lld calls) host_own=%.3f | host mixer=%.3f begin=%.3f local=%.3f "
+                             "cpu=%.3f finish=%.3f (per ms/tok)\n",
                              rep, per_tok, r_pre / (double) bench_tg, r_pn,
-                             r_spin / (double) bench_tg, r_sn);
+                             r_spin / (double) bench_tg, r_sn, r_hostl / (double) bench_tg, r_hostln,
+                             (r_hostl - r_pre) / (double) bench_tg, r_hmix / (double) bench_tg,
+                             r_hbeg / (double) bench_tg, r_hloc / (double) bench_tg, r_hcpu / (double) bench_tg,
+                             r_hfin / (double) bench_tg);
             if (helper_timing && bench_tg > 0 && E.gpu_timing) {
                 std::fprintf(stderr,
                              "strata-q36 PHASE3 bench %d GPU primary: %.3f ms/tok wall | layers=%lld tiles=%lld |",
@@ -7163,8 +7250,9 @@ int strata::qwen35::run(int argc, char** argv) {
                              d_wait[r] / (double) tokens, d_ovh[r], d_ovh[r] / (double) tokens, tokens);
             }
             std::fprintf(stderr,
-                         "strata-q36 PHASE3 AGG benches 0-2 primary: prebegin_sync=%.1f (%.3f ms/tok, %lld calls) route_spin=%.1f (%.3f ms/tok, %lld calls) tokens=%d\n",
+                         "strata-q36 PHASE3 AGG benches 0-2 primary: prebegin_sync=%.1f (%.3f ms/tok, %lld calls) route_spin=%.1f (%.3f ms/tok, %lld calls) host_layer=%.1f (%.3f ms/tok, %lld calls) host_own=%.3f ms/tok tokens=%d\n",
                          d_pre, d_pre / (double) tokens, n_pre, d_spin, d_spin / (double) tokens, n_spin,
+                         d_hostl, d_hostl / (double) tokens, n_hostl, (d_hostl - d_pre) / (double) tokens,
                          tokens);
             if (E.gpu_timing) {
                 std::fprintf(stderr, "strata-q36 PHASE3 AGG GPU primary: layers=%lld dropped=%lld |", d_gn, d_dropped);
