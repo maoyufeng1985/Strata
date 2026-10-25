@@ -377,6 +377,112 @@ helper 里有两套行号：
 ② 换了算术 ⇒ **peer 的数字会变**（不再是逐字节相同）；
 ③ 要单独一轮，不能和别的混在一起。
 
+### 3.13 这一轮：主卡自己那 39 个专家走 fused FP16（书面大纲，2026-10-26）
+
+**为什么是它**：前向 15.14 ms/层里，主卡自己占 11.4 ms（mixer 6.767 + primary_work 4.609），
+peer 路径自己只剩 3.3 ms。mixer 在第三方 llama.cpp 里（不动），primary_work 是我们的文件。
+§3.12 的探针量到主卡那侧快了 **1.5 ms/层**（4.668 → 3.091），但探针的行号是错的 ⇒ 路由变了 ⇒ 答不了净收益。
+
+**做法（只编 CUDA）**：给 fused 的 down 核加一张「排序行 → 计划行」的表（ids），
+主卡侧把 `!peer_here` 的限制去掉，让 served layer 也走 fused。
+
+| 步 | 改哪里 | 做什么 |
+|---|---|---|
+| 1 | `src/prefill/moe_f16_kq_cuda.cuh` | down 核多一个 `ids`（可空）：写 `out[ids[row]*n_out+col]`，空则和现在一样 |
+| 2 | `src/prefill/moe_f16_kq_cuda.cu/.hpp` | 加 CUDA 专用的 `f16kqc::down_rows(...)`（**不动共享的 moe_f16_kq.hpp** ⇒ HIP 那个文件一个字都不用碰）|
+| 3 | `src/qwen35/q36_engine.cu` | fused 的调用点改用 `down_rows(..., lid, ...)`，并去掉 `!peer_here`；非 peer 时 `lid = ident` ⇒ 逐字节不变 |
+| 4 | 箱子上 | 编 CUDA（没有 ROCm，**HIP 没编**）、A/B 测、跑验收门 |
+
+**要记住的坑**：
+- `lid` 在 peer 上是 `peer_lid_map`（计划行），在非 peer 上是 `ident`（恒等）⇒ 同一个调用点两边都对。
+- 换了算术（fp16 FMA vs int8 DP4A）⇒ **peer 的文字会动**（和 int8 那条一样，不是逐字节相同）。
+- 开了 `STRATA_PF_F16_CUDA` 会多占 ~16 MB 显存（f16 的缓冲）⇒ 专家的分配会变 ⇒ A/B 的
+  「主卡 entry/层」要一起读（探针会打印），别把它当成噪声。
+
+**先撤掉的**：§3.11 之后试的「window 走自己的 stream + 先小后大」—— **两轮都没动**（840.3 vs 842.0，
+前向 15.166 vs 15.135）⇒ 撤掉，记在这里。
+
+### 3.14 做了：served layer 也走 fused FP16（`STRATA_PF_F16_CUDA=1` + peer 旗标）
+
+改了四处（**只编 CUDA**）：`src/prefill/moe_f16_kq_cuda.cuh` 的 down 核多一个 `ids`（行表），
+`moe_f16_kq_cuda.cu/.hpp` 加一个 CUDA 专用的 `f16kqc::down_rows(...)`（**共享的 moe_f16_kq.hpp 一个字没动**
+⇒ gfx11 那份看不到），`src/qwen35/q36_engine.cu` 的调用点改用 `down_rows(..., lid, ...)` 并去掉 `!peer_here`。
+非 peer 时 `lid = ident`（恒等）⇒ **逐字节不变**（旗标关着时默认路径也不变：parity `gen: 220`）。
+
+**量到的（MEASURED，2026-10-26，同一个二进制 `bin/strata-q36.f16`，旗标是唯一的差别）**：
+
+| | pp512（bench 2）| 前向 ms/层 | primary_work | helper_wait | plan |
+|---|---:|---:|---:|---:|---:|
+| F1 走 MMQ（对照）| 839.7 | 15.177 | 4.608 | 0.985 | 2.331 |
+| **F2 走 fused FP16**| **875.9**（+4.3%）| **14.545** | **3.115** | 2.000 | 2.176 |
+
+⇒ **主卡自己那 39 个专家/层的确快了 1.49 ms/层**（4.608 → 3.115，-32%），
+和 §3.12 的探针（4.668 → 3.091）几乎一样 ⇒ 探针量的那 1.5 ms 是真的。
+⇒ **但整层只快了 0.63 ms（-4.2%）**：省下的 1.49 ms 里有 **1.02 ms 被 helper_wait 吃掉了**
+（0.985 → 2.000）—— **helper 那条链才是临界路径**（§3.15）。
+
+⇒ 「每层 entry 数」没变（primary 631.6 / CUDA1 1068.7 / CUDA2 1182.2 / CUDA3 1213.4）⇒
+旗标带来的那 16 MB 缓冲没有动专家的分配 ⇒ 这次 A/B 是干净的。
+
+**代价**：换了算术（fp16 FMA vs int8 DP4A）⇒ **peer 的文字会动**（和 int8 那条一样）。
+
+### 3.15 前向 14.545 ms/层 现在是什么（MEASURED，2026-10-26，F2）
+
+| 段 | ms/层 | 在谁身上 |
+|---|---:|---|
+| mixer（GDN/attention 的投影、conv、SSM）| **6.778** | 主卡（第三方 llama.cpp + 共享的 gemm.cu）|
+| router + route D2H | 0.264 | 主卡 |
+| plan（主机侧：记账 0.34 + prepare 0.34 + 等 helper 的行计划 ~1.5）| 2.176 | 主机在等，**GPU 空着** |
+| primary_work（主卡自己那 39 个专家，fused FP16）| 3.115 | 主卡 |
+| helper_wait（等 helper 的行回来）| **2.000** | 主机在等 |
+| combine | 0.212 | 主卡 |
+
+⇒ **主卡自己的活 = 6.778 + 3.115 + 0.48 = 10.4 ms；helper 那条链 ≈ 7.5 ms**
+（从 plan 开始到 helper 的行落地：主机 0.68 + window 上行 1.4 + 行计划 0.1 + 算术 ~3.4 + 下行 1.9）。
+⇒ **整层 = 主卡开头的 7.04 + max(plan 2.18 + primary_work 3.115 + combine 0.21, 链 7.5) = 14.5**。
+⇒ **helper 那条链是墙**（7.5 ms），主卡自己的 10.4 ms 里有 2.9 ms（primary_work 的一部分）在链的影子里。
+
+⇒ **能动的只剩两处**：
+1. **helper 那条链（7.5 ms）**：window 上行 1.4（q8_1，1.08 MB @ 0.81 GB/s）+
+   算术 ~3.4（helper 的 native int8 MMQ）+ 下行 1.9（1.08 MB @ 0.58 GB/s）。
+   算术那 3.4 里 **1.18 是权重流量**（每层每 helper 读 85 个专家 × 3.1 MB = 264 MB @ 224 GB/s），
+   每专家的行数只有 ~13.6 ⇒ 形状很瘦 ⇒ 数学效率只有 int8 峰值的 35%。
+2. **mixer（6.778 ms）**：dense 投影走 `prefill::Gemm::native`（Q4_K → FP16 的 scratch + **一次
+   `cublasGemmEx`，`CUBLAS_GEMM_DEFAULT`**）⇒ **cuBLAS 的默认算法没被挑过**
+   （gfx11 那边有 tune_hipblaslt 的算法表，CUDA 这边没有）⇒ 下一个要量的就是它。
+
+**mixer 的形状（从 gguf 的头读出来的，`.run/ggufshapes.py`）**：
+GDN 层：`attn_qkv` 2048×8192、`attn_gate` 2048×4096、`ssm_out` 4096×2048；
+attention 层：`attn_q` 2048×8192、`attn_k`/`attn_v` 2048×512、`attn_output` 4096×2048。
+⇒ 一层 28-34 GFLOP，512 token ⇒ **mixer 那 6.778 ms/层 ≈ 4.4 TFLOP/s**。
+⇒ P100 的 FP16：向量 9.3 TFLOP/s、张量核（FP32 累加）9.3、（FP16 累加）18.7
+⇒ **cuBLAS 现在大概是向量路径的一半**：要么它已经在用张量核（47%），
+要么向量路径就是 47% ⇒ **下一个实验：把 cuBLAS 的 24 个算法 + 两种累加方式都量一遍**
+（`.run/gemmprobe-20261026.cu`）。
+
+### 3.12 探针：fused FP16 的核在主卡上到底快不快（**量到了，但结论是「探针答不了」**）
+
+§3.7 的那条路（fused FP16 的 K-quant 核）在 served layer 上是关着的（`!peer_here`），
+因为它写的是**排序行**而 combine 读的是**plan 的行**。**先量一下值不值得做**：
+临时去掉 `!peer_here`（**行号没重排 ⇒ 答案是错的，只量时间**），同一个二进制两趟：
+
+| | pp512（bench 2）| 前向 ms/层 | primary_work | helper_wait | 主卡自己的 entry/层 |
+|---|---:|---:|---:|---:|---:|
+| P1 MMQ 那条路（对照）| 737.6 | 17.287 | 4.668 | 3.080 | 642.6 |
+| P2 fused FP16（**行号错的探针**）| 745.9 | 17.094 | **3.091** | **4.621** | 630 左右 |
+
+⇒ **主卡那侧确实快了**：primary_work 4.668 → 3.091 ms/层（-34%），而两边的活是同一份
+（主卡的 entry 642.6 → 630，差 2%）⇒ **fused 那个核在专家在显存里的时候是快的**。
+⇒ **但 helper 那侧慢了同样多**（helper_wait 3.080 → 4.621）⇒ 前向只动了 0.19 ms。
+⇒ **而「helper 为什么慢」没有答案**：探针的行号是错的 ⇒ 隐藏状态是错的 ⇒ **路由变了**
+（entry 的分布变了，虽然总数一样）⇒ **helper 做的不是同一份活**，两个效应分不开。
+⇒ **⇒ 这个探针量不了净收益**（它只证明了「主卡那侧快 1.5 ms/层」）。
+⇒ **要做就得做对**：行号的重排（主卡侧一个 scatter 核：fused 写排序行，scatter 把它搬到 plan 的行）
+⇒ 行号对了，路由就一样，A/B 才干净。**那个核在引擎自己的文件里** ⇒ **只编 CUDA**
+（fused 那条路整个在 `#if !defined(__HIPCC__)` 里）。
+⇒ 代价还是那两条：**peer 的算术会变**（文字会动），**而且要单独一轮**。
+
+
 
 
 ## 4. 下一步：解码（tg64 58.9）

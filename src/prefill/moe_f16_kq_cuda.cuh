@@ -27,6 +27,10 @@
 // The dequant subtracts 1024 before the packed FMA: the bias -(1024*d*s + dmin*m) is an
 // fp16 of magnitude 1024*d*s, where the fp16 spacing is d*s (one quantization step), so
 // that bias alone would carry half a step into the weight.
+//
+// The down kernel takes an optional row map: the value of the SORTED row (the routing's order)
+// goes to `ids[row]`.  Null is the identity; the peer path passes its plan's map, because the
+// plan numbers the rows in the entry order and the combine reads that order.
 #pragma once
 
 #include <cstdint>
@@ -319,7 +323,8 @@ __global__ __launch_bounds__(THREADS) void down_fp16(const Batch b, const int32_
                                                      const int32_t* __restrict__ off,
                                                      const uint8_t* __restrict__ h,
                                                      float* __restrict__ out, int n_out, int n_in,
-                                                     size_t d_row, size_t down_off) {
+                                                     size_t d_row, size_t down_off,
+                                                     const int32_t* __restrict__ ids) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int c64 = lane >> 3;             // the 64-value group inside the superblock
@@ -409,13 +414,18 @@ __global__ __launch_bounds__(THREADS) void down_fp16(const Batch b, const int32_
     for (int r = 0; r < RWB; ++r) {
         const int row = rbase + r;
         if (row > last) break;
+        // THE ROW MAP.  `row` is the SORTED row (the routing's order) and the value belongs to the row
+        // `ids[row]`: the identity without a helper, the PLAN's row on a served layer (the peer path's
+        // plan numbers its rows in the entry order, and the combine reads that order).  Null is the
+        // identity, so the map is optional and the common case pays nothing.
+        const int drow = (ids != nullptr) ? ids[row] : row;
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
             __half2 p = acc[r][c];
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1) p = __hadd2(p, __shfl_xor_sync(0xffffffffu, p, off));
             const float2 t = __half22float2(p);
-            if (lane == 0) out[(size_t) row * n_out + col + c] = t.x + t.y;
+            if (lane == 0) out[(size_t) drow * n_out + col + c] = t.x + t.y;
         }
     }
 }

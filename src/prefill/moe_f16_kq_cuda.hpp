@@ -26,4 +26,10 @@ bool requested();
 void build_tiles(const int32_t* bounds, int e0, int e1, int n_local, int2* tiles, int max_tiles, int32_t* ts,
                  int32_t* off, cudaStream_t s);
 
+/// The down with the ROW MAP: the value of the SORTED row (the routing's order) goes to `ids[row]`.
+/// The identity is `ids == nullptr` - the same as f16kq::down, which is the shared interface and stays
+/// as it is (the gfx11 build implements that one; this one is CUDA-only).
+void down_rows(const Batch& b, const NativeGeom& g, const int32_t* ts, const int2* tiles, const int32_t* off, int64_t n,
+               int n_expert, int64_t work_bound, const uint8_t* h, float* dm, const int32_t* ids, cudaStream_t s);
+
 }  // namespace strata::prefill::fused::f16kqc
