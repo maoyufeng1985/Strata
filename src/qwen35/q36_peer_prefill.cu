@@ -69,6 +69,30 @@ static bool peer_f16() {
     return on;
 }
 
+/// STRATA_Q36_PEER_I8=1: the DOWN LEG (the helper's rows on their way back to the primary) travels as int8 with one
+/// fp32 scale per 128 values, instead of fp16.  MEASURED on 192.168.1.98 (2026-10-26): the down leg is 8.13 ms of
+/// the prompt's 21.6 ms per layer - 38% of the whole prompt - because the helpers' links carry it at 0.58 GB/s
+/// (the same binary with the rows as fp32 instead of fp16 runs at 418 tok/s against 590).  Half the bytes is half
+/// that time.  The rows themselves are unchanged: same count, same order, same meaning - only the width of an
+/// element on the wire, and the precision that comes with it.
+///
+/// OFF by default: with the variable unset not one byte and not one kernel changes.  When BOTH this and
+/// STRATA_Q36_PEER_F16 are set, this one wins (it is the narrower transport) and the fp16 buffers are not even
+/// allocated.
+static bool peer_i8() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_Q36_PEER_I8");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
+/// The bytes one row takes in the int8 transport: the values (one byte each) and the scales (one fp32 per 128
+/// values).  The same number on both sides of the link - the primary unpacks with it.
+static size_t i8_row_bytes(int64_t n_cols) {
+    return (size_t) n_cols + (size_t) (n_cols / 128) * sizeof(float);
+}
+
 /// Switches the calling thread to `dev` and back.  The engine's own thread lives on the primary device, so every
 /// CUDA call that must run on the helper is inside one of these.
 struct On {
@@ -220,6 +244,58 @@ __global__ void k_pack_f16(const float* __restrict__ src, __half* __restrict__ d
     atomicMax(max_rel, rbits);
 }
 
+/// STRATA_Q36_PEER_I8=1: the down leg's packing.  A row's values become one byte each, and every block of 128
+/// values gets one fp32 scale (the block's largest magnitude over 127), so the row travels in n_cols bytes plus
+/// n_cols/128 scales - about half of what fp16 costs on the helpers' 0.58 GB/s links (192.168.1.98, 2026-10-26).
+///
+/// It also MEASURES what the packing cost, and the measure is the one that means something: the largest error
+/// RELATIVE TO THE BLOCK'S OWN MAGNITUDE.  A per-element relative error would be dominated by the values nearest
+/// zero (where any absolute error is a huge fraction of a tiny number) and would say nothing about the
+/// transport; the block-relative one is the fraction of the signal the quantization can throw away.
+///
+/// One warp per row: the block's largest magnitude and the largest error are warp reductions (shuffles), and the
+/// 128 values of a block are four per lane.
+__global__ void k_pack_i8(const float* __restrict__ src, uint8_t* __restrict__ dst, int n_rows, int n_cols,
+                           unsigned int* __restrict__ max_abs, unsigned int* __restrict__ max_err_rel) {
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= n_rows) return;
+    const int lane = threadIdx.x;
+    const int nblk = n_cols / 128;
+    const float* s = src + (size_t) row * (size_t) n_cols;
+    uint8_t* d = dst + (size_t) row * ((size_t) n_cols + (size_t) nblk * sizeof(float));
+    float* scale = (float*)(d + n_cols);
+    for (int b = 0; b < nblk; ++b) {
+        const float* v = s + b * 128;
+        float mx = 0.f;
+        for (int j = lane; j < 128; j += 32) mx = fmaxf(mx, fabsf(v[j]));
+        for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        // 127, not 128: the scale stays positive and the zero point stays at zero, so the packed byte is the
+        // value's sign and magnitude (a signed int8 with -128 unused).
+        const float sc = mx > 0.f ? mx / 127.f : 1.f;
+        const float inv = 1.f / sc;
+        if (lane == 0) scale[b] = sc;
+        uint8_t* q = d + b * 128;
+        float worst = 0.f;
+        for (int j = lane; j < 128; j += 32) {
+            const float x = v[j] * inv;
+            int qi = (int) lrintf(x);
+            qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+            q[j] = (uint8_t)(int8_t) qi;
+            worst = fmaxf(worst, fabsf((float) qi * sc - v[j]));
+        }
+        for (int o = 16; o > 0; o >>= 1) worst = fmaxf(worst, __shfl_xor_sync(0xffffffffu, worst, o));
+        if (lane == 0) {
+            const float rel = mx > 0.f ? worst / mx : 0.f;
+            unsigned int bits;
+            std::memcpy(&bits, &rel, sizeof bits);
+            atomicMax(max_err_rel, bits);
+            unsigned int abits;
+            std::memcpy(&abits, &mx, sizeof abits);
+            atomicMax(max_abs, abits);
+        }
+    }
+}
+
 }  // namespace
 
 struct PeerPrefill36::Impl {
@@ -254,14 +330,23 @@ struct PeerPrefill36::Impl {
     unsigned int* h_f16max = nullptr;   // [1] its pinned copy, read back once per layer
     unsigned int* d_f16rel = nullptr;   // [1] the largest RELATIVE error of the fp16 round trip
     unsigned int* h_f16rel = nullptr;   // [1] its pinned copy
+    // STRATA_Q36_PEER_I8=1: the same run as int8 (one scale per 128 values).  d_out_i8 is the packed image on the
+    // helper, h_out_i8 the pinned staging the D2H writes, and the two counters are what the packing measured.
+    uint8_t* d_out_i8 = nullptr;   // [cap][i8 row bytes] the packed run, on the helper
+    uint8_t* h_out_i8 = nullptr;   // [cap][i8 row bytes] the packed run, on its way back
+    unsigned int* d_i8max = nullptr;   // [1] the largest magnitude the int8 packing saw
+    unsigned int* h_i8max = nullptr;   // [1] its pinned copy, read back once per layer
+    unsigned int* d_i8err = nullptr;   // [1] the largest error, as a fraction of the block's own magnitude
+    unsigned int* h_i8err = nullptr;   // [1] its pinned copy
     // What a host-route launch() left in h_out, and where it belongs.  It is remembered rather than uploaded at once
     // because wait() is the only method the caller hands the PRIMARY's stream to, and the upload has to be ordered
     // against the primary's own work there.
     float* pending_eparts = nullptr;
     int64_t pending_base = 0, pending_n = 0;
-    // STRATA_Q36_PEER_F16=1: whether the rows waiting to go back are the packed ones.  The up leg's shape is decided
-    // in launch() (which route the rows took) and read back here.
+    // STRATA_Q36_PEER_F16=1 / STRATA_Q36_PEER_I8=1: whether the rows waiting to go back are the packed ones, and in
+    // which format.  The down leg's shape is decided in launch() (which route the rows took) and read back here.
     bool pending_f16 = false;
+    bool pending_i8 = false;
 
     // everything below is allocated on `device`
     float* d_x = nullptr;      // [cap][n_embd] the staged activations
@@ -564,12 +649,26 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
     // STRATA_Q36_PEER_F16=1: the fp16 up leg's buffers.  Allocated ONLY when the flag is on, so a default run's
     // allocation list is exactly the one above.  d_out16 is the packed image on the helper, d_f16max the slot the
     // packing kernel measures the largest magnitude into (one unsigned int).
-    if (peer_f16()) {
+    if (peer_f16() && !peer_i8()) {
         const bool fok =
             ck(cudaMalloc((void**) &m.d_out16, nf * (size_t) n_embd * sizeof(__half)), "packed result run", err) &&
             ck(cudaMalloc((void**) &m.d_f16max, sizeof(unsigned int)), "packed magnitude", err) &&
             ck(cudaMalloc((void**) &m.d_f16rel, sizeof(unsigned int)), "packed relative error", err);
         if (!fok) {
+            close();
+            return false;
+        }
+    }
+    // STRATA_Q36_PEER_I8=1: the int8 down leg's buffers.  The packed image is a row of n_embd bytes plus one fp32
+    // scale per 128 values; the two counters are what the packing measured.  Allocated only when the flag is on, so
+    // a default run's allocation list is exactly the one above.
+    if (peer_i8()) {
+        const size_t rb = i8_row_bytes(n_embd);
+        const bool iok =
+            ck(cudaMalloc((void**) &m.d_out_i8, nf * rb), "packed int8 result run", err) &&
+            ck(cudaMalloc((void**) &m.d_i8max, sizeof(unsigned int)), "packed int8 magnitude", err) &&
+            ck(cudaMalloc((void**) &m.d_i8err, sizeof(unsigned int)), "packed int8 error", err);
+        if (!iok) {
             close();
             return false;
         }
@@ -595,7 +694,7 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
         // STRATA_Q36_PEER_F16=1: the pinned staging for the packed up leg, and the slot the packing kernel's
         // measurement comes back through.  Only when the flag is on, so a default run's host allocations are the
         // three above and nothing else.
-        if (peer_f16()) {
+        if (peer_f16() && !peer_i8()) {
             const bool fok =
                 ck(cudaHostAlloc((void**) &m.h_out16, nf * (size_t) n_embd * sizeof(__half), cudaHostAllocDefault),
                    "pinned packed result rows", err) &&
@@ -604,6 +703,23 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
                 ck(cudaHostAlloc((void**) &m.h_f16rel, sizeof(unsigned int), cudaHostAllocDefault),
                    "pinned packed relative error", err);
             if (!fok) {
+                close();
+                return false;
+            }
+        }
+        // STRATA_Q36_PEER_I8=1: the pinned staging for the int8 down leg, and the slots the packing kernel's
+        // measurements come back through.  Only when the flag is on, so a default run's host allocations are the
+        // three above and nothing else.
+        if (peer_i8()) {
+            const size_t rb = i8_row_bytes(n_embd);
+            const bool iok =
+                ck(cudaHostAlloc((void**) &m.h_out_i8, nf * rb, cudaHostAllocDefault),
+                   "pinned packed int8 result rows", err) &&
+                ck(cudaHostAlloc((void**) &m.h_i8max, sizeof(unsigned int), cudaHostAllocDefault),
+                   "pinned packed int8 magnitude", err) &&
+                ck(cudaHostAlloc((void**) &m.h_i8err, sizeof(unsigned int), cudaHostAllocDefault),
+                   "pinned packed int8 error", err);
+            if (!iok) {
                 close();
                 return false;
             }
@@ -649,7 +765,8 @@ void PeerPrefill36::close() {
         m.mctx.reset();   // its pool belongs to the helper: destroy it there
         void* frees[] = {m.d_x,  m.d_x8, m.d_gu, m.d_h,       m.d_out, m.d_ys,   m.d_xq,     m.d_hq,
                          m.d_ids, m.d_ident, m.d_src, m.d_map, m.d_rank, m.d_pos, m.d_cnt,   m.d_cur,
-                         m.d_bounds, m.d_maxr, m.d_owned, m.d_out16, m.d_f16max, m.d_f16rel};
+                         m.d_bounds, m.d_maxr, m.d_owned, m.d_out16, m.d_f16max, m.d_f16rel,
+                         m.d_out_i8, m.d_i8max, m.d_i8err};
         for (void* p : frees)
             if (p != nullptr) cudaFree(p);
         if (m.ev != nullptr) cudaEventDestroy(m.ev);
@@ -661,7 +778,8 @@ void PeerPrefill36::close() {
     // the one handle it can drain is the device's).  Both routes clear the pointers, so a close() of a link box leaves
     // nothing to confuse the next open().
     if (m.primary >= 0 && (m.h_x != nullptr || m.h_ids != nullptr || m.h_out != nullptr || m.h_plan != nullptr ||
-                           m.h_out16 != nullptr || m.h_f16max != nullptr)) {
+                           m.h_out16 != nullptr || m.h_f16max != nullptr || m.h_out_i8 != nullptr ||
+                           m.h_i8max != nullptr)) {
         On onp(m.primary);
         cudaDeviceSynchronize();
         if (m.h_x != nullptr) cudaFreeHost(m.h_x);
@@ -671,6 +789,9 @@ void PeerPrefill36::close() {
         if (m.h_out16 != nullptr) cudaFreeHost(m.h_out16);
         if (m.h_f16max != nullptr) cudaFreeHost(m.h_f16max);
         if (m.h_f16rel != nullptr) cudaFreeHost(m.h_f16rel);
+        if (m.h_out_i8 != nullptr) cudaFreeHost(m.h_out_i8);
+        if (m.h_i8max != nullptr) cudaFreeHost(m.h_i8max);
+        if (m.h_i8err != nullptr) cudaFreeHost(m.h_i8err);
         cudaGetLastError();
     }
     m.device = -1;
@@ -683,9 +804,14 @@ void PeerPrefill36::close() {
     m.h_out16 = nullptr;
     m.h_f16max = nullptr;
     m.h_f16rel = nullptr;
+    m.h_out_i8 = nullptr;
+    m.h_i8max = nullptr;
+    m.h_i8err = nullptr;
     m.pending_eparts = nullptr;
     m.pending_base = 0;
     m.pending_n = 0;
+    m.pending_f16 = false;
+    m.pending_i8 = false;
     m.stream = nullptr;
     m.ev = nullptr;
     m.d_x = m.d_gu = m.d_h = m.d_out = m.d_ys = nullptr;
@@ -1060,6 +1186,33 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
         if (!ck(cudaMemcpyPeerAsync(eparts_primary + eparts_row_base * m.n_embd, m.primary, m.d_out, m.device,
                                     (size_t) n * (size_t) m.n_embd * sizeof(float), m.stream), "copy the run", err))
             return false;
+    } else if (peer_i8()) {
+        // STRATA_Q36_PEER_I8=1: the int8 down leg.  The rows are packed to one byte a value (a scale per 128 values)
+        // on the helper, and the copy that follows moves about half of what fp16 moves - on a link that measured
+        // 0.58 GB/s, where the down leg was 8.13 ms of the prompt's 21.6 ms per layer (192.168.1.98, 2026-10-26).
+        // The packing also MEASURES what it cost: the largest magnitude it saw and the largest error relative to
+        // the block's own magnitude.  The rows themselves are unchanged: same count, same order, same meaning.
+        const size_t rb = i8_row_bytes(m.n_embd);
+        if (!ck(cudaMemsetAsync(m.d_i8max, 0, sizeof(unsigned int), m.stream), "clear packed int8 magnitude", err) ||
+            !ck(cudaMemsetAsync(m.d_i8err, 0, sizeof(unsigned int), m.stream), "clear packed int8 error", err))
+            return false;
+        // One warp per row: 8 rows a block, 32 lanes a warp.
+        k_pack_i8<<<dim3(1, (unsigned) ((n + 7) / 8)), dim3(32, 8), 0, m.stream>>>(
+            m.d_out, m.d_out_i8, (int) n, (int) m.n_embd, m.d_i8max, m.d_i8err);
+        if (!ck(cudaGetLastError(), "pack the run as int8", err)) return false;
+        if (!ck(cudaMemcpyAsync(m.h_out_i8, m.d_out_i8, (size_t) n * rb, cudaMemcpyDeviceToHost, m.stream),
+                "copy the int8 run to host staging", err))
+            return false;
+        // The measurements come back with the same copy: 4 bytes next to the rows, read on the helper's stream.
+        if (!ck(cudaMemcpyAsync(m.h_i8max, m.d_i8max, sizeof(unsigned int), cudaMemcpyDeviceToHost, m.stream),
+                "read the packed int8 magnitude", err) ||
+            !ck(cudaMemcpyAsync(m.h_i8err, m.d_i8err, sizeof(unsigned int), cudaMemcpyDeviceToHost, m.stream),
+                "read the packed int8 error", err))
+            return false;
+        m.pending_eparts = eparts_primary;
+        m.pending_base = eparts_row_base;
+        m.pending_n = n;
+        m.pending_i8 = true;
     } else if (peer_f16()) {
         // STRATA_Q36_PEER_F16=1: the packed up leg.  The rows are packed to half on the helper (which also MEASURES
         // the largest magnitude it saw, so the question "can fp16 carry these values" is answered by a number and
@@ -1097,7 +1250,7 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
     return ck(cudaGetLastError(), "helper launches", err);
 }
 
-bool PeerPrefill36::wait(cudaStream_t st_primary, void* fp16_stage, std::string& err) {
+bool PeerPrefill36::wait(cudaStream_t st_primary, void* packed_stage, std::string& err) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: wait() on a closed executor"; return false; }
     if (st_primary == nullptr) { err = "q36 peer prefill: wait() without a primary stream"; return false; }
@@ -1117,15 +1270,27 @@ bool PeerPrefill36::wait(cudaStream_t st_primary, void* fp16_stage, std::string&
         const int64_t n = m.pending_n;
         m.pending_n = 0;
         On onp(m.primary);   // `eparts` and the stream are the primary's: the copy runs on its device
-        if (m.pending_f16) {
+        if (m.pending_i8) {
+            // STRATA_Q36_PEER_I8=1: the int8 rows land in the PRIMARY's staging, NOT in eparts - the caller unpacks
+            // them into eparts on the same stream, so `eparts` still holds floats when the combine reads it.  The
+            // staging is the caller's: it knows where the rows belong (the row base this helper was given).
+            const size_t rb = i8_row_bytes(m.n_embd);
+            if (packed_stage == nullptr) {
+                err = "q36 peer prefill: the int8 down leg needs a staging buffer on the primary";
+                return false;
+            }
+            if (!ck(cudaMemcpyAsync(packed_stage, m.h_out_i8, (size_t) n * rb, cudaMemcpyHostToDevice, st_primary),
+                    "copy the int8 run to the primary", err))
+                return false;
+        } else if (m.pending_f16) {
             // STRATA_Q36_PEER_F16=1: the packed rows land in the PRIMARY's staging, NOT in eparts - the caller
             // unpacks them into eparts on the same stream, so `eparts` still holds floats when the combine reads it.
             // The staging is the caller's: it knows where the rows belong (the row base this helper was given).
-            if (fp16_stage == nullptr) {
+            if (packed_stage == nullptr) {
                 err = "q36 peer prefill: the packed up leg needs a staging buffer on the primary";
                 return false;
             }
-            if (!ck(cudaMemcpyAsync(fp16_stage, m.h_out16, (size_t) n * (size_t) m.n_embd * sizeof(__half),
+            if (!ck(cudaMemcpyAsync(packed_stage, m.h_out16, (size_t) n * (size_t) m.n_embd * sizeof(__half),
                                     cudaMemcpyHostToDevice, st_primary), "copy the packed run to the primary", err))
                 return false;
         } else if (!ck(cudaMemcpyAsync(m.pending_eparts + m.pending_base * m.n_embd, m.h_out,
@@ -1164,5 +1329,24 @@ double PeerPrefill36::last_f16_max_rel() const {
 }
 double PeerPrefill36::last_prepare_sync_ms() const { return impl_->prep_sync_ms; }
 int64_t PeerPrefill36::last_prepare_calls() const { return impl_->prep_calls; }
+
+// STRATA_Q36_PEER_I8=1: what the int8 packing measured.  The first is the largest magnitude the rows carried (the
+// same number the fp16 leg reports, so the two transports can be compared); the second is the largest error the
+// packing made, as a fraction of the block's own magnitude - the precision the transport costs, scale-free.
+double PeerPrefill36::last_i8_max_abs() const {
+    if (impl_->h_i8max == nullptr) return 0.0;
+    unsigned int bits = *impl_->h_i8max;
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return (double) f;
+}
+
+double PeerPrefill36::last_i8_max_rel() const {
+    if (impl_->h_i8err == nullptr) return 0.0;
+    unsigned int bits = *impl_->h_i8err;
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return (double) f;
+}
 
 }  // namespace strata::qwen35
