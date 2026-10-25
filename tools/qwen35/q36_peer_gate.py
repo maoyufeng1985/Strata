@@ -135,7 +135,7 @@ def main():
     # gate would then compare the peer path with itself, which every check would pass.  The peer flags are
     # cleared here; the peer arm gets them from --peer-env, which is explicit.
     for k in ("STRATA_Q36_PREFILL_PEERS", "STRATA_Q36_PREFILL_PEERS_HOST", "STRATA_Q36_PEER_F16",
-              "STRATA_Q36_PEER_I8", "STRATA_Q36_PEER_KEEP_RESIDENT"):
+              "STRATA_Q36_PEER_I8", "STRATA_Q36_PEER_SUM", "STRATA_Q36_PEER_KEEP_RESIDENT"):
         os.environ.pop(k, None)
     print("the prompts: %d of %d tokens (the peer path needs more than %d)" % (len(prompts), a.width, MIN_WIDTH - 1),
           flush=True)
