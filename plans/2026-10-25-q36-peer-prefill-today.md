@@ -73,24 +73,35 @@ peer 路径则是每张 helper 算自己显存里的专家、只把结果行（f
 
 ## 3. 数值：peer 路径和默认路径**不是**逐字节相同
 
-（今天重做 10-24 §4 O5 的那道检查，那道题当时比的是「编码修复 vs 它自己的对照」，
-今天比的是「peer 开 vs peer 关」。）
+**先说清楚今天的两次比较，哪一次算数（`--tokens` 后面跟的是一串 id，`parse_ids` 把它切成一条
+prompt；`--force` 是被强制的**生成**序列，不是 prompt）：**
 
-MEASURED（2026-10-25，同一个二进制，`--tokens 1 --force <37 个 id>`，dump 全 logits）：
+**（一）无效的那次**（`--tokens 1 --force <37 个 id>`）：prompt 只有 **1 个 token**，
+而 peer 路径只对宽于 hybrid_t(128 行) 的 prompt chunk 生效 ⇒ **peer 的算术根本没跑**。
+那次量到的「37 行里 36 行 argmax 相同、max|diff| 0.837」只是**专家放置的差别**
+（peer 开 = 主卡每层留 39 个专家，关 = 40 个）⇒ decode 的数值路径变了 ⇒ 一个 token 不同。
 
-| | 结果 |
-|---|---|
-| 非有限值 | 0 |
-| 37 行的 argmax 相同 | **36/37** |
-| 最大 \|diff\| | **0.837189** |
-| token 流 | 35 个相同，第 34 个不同（peer 出 `9392`，默认出 `38540`） |
+**（二）算数的那次**（`--tokens <216 个 id> --n 32`，peer 路径真的跑了 ——
+stderr：`3 helper(s) serve prompt chunks (8680 experts held by helpers, 40 layers served …)`）：
+
+| | prompt 216 token | 生成 32 token | 文字 |
+|---|---:|---:|---|
+| peer 关 | 3273.8 ms（66.0 tok/s）| 567.6 ms（56.4 tok/s）| `… 2972 **6065 220 17 25 498 …**` |
+| peer 开 | **543.4 ms（397.5 tok/s）** | 535.8 ms（59.7 tok/s）| `… 2972 **38663 25 2972 198 256 471 …**` |
+
+**⇒ 这个 prompt 上 peer 路径快 6 倍（66.0 → 397.5 tok/s），而生成的文字从第 10 个 token 起分叉。**
+（比文字更硬的那道数：两条路各自跑两次，dump 出来的 32 行 logits **逐字节相同**（max|diff| = 0，
+确定性 ✓）；两条路**互相**比，32 行里只有 9 行的 argmax 相同，max|diff| = 34.47，**第 0 行就不同**
+—— prompt 的专家由 helper 算，KV 从第一行起就不是同一个。）
 
 **原因（已知的那类，不是新缺陷）**：peer 路径里 prompt 的专家由 helper 算（q8_1 激活 +
 `native_expert_grouped`），默认路径里由主卡的 MMQ int8 算 —— 两条数值路径不同，KV 因此差一点点，
 后面的 decode 就可能选到不同的 token。这跟 repo 里早就记着的「helper 路径与主卡路径的
-logits 逐行 RMS 差 1.5e-1~3.3e-1」是同一件事（`2026-10-20-q36-1p3h-optimal.md` §7 的纪律 3）。
+logits 逐行 RMS 差 1.5e-1~3.3e-1」是同一件事（`q36_engine.cu:4081-4092`，
+`2026-10-20-q36-1p3h-optimal.md` §7 的纪律 3）。
 
 **⇒ peer 路径不能承诺逐字节相同**；要拿它做默认，得先有一条「与默认路径逐字节相同」的验收门。
+（这条缺陷的来龙去脉在 `2026-10-25-q36-peer-decode-defect.md`。）
 
 ## 4. 现在的状态（未合并的东西）
 
