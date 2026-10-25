@@ -2930,6 +2930,35 @@ template<typename dst_t> __device__ __forceinline__ dst_t cvt(float v);
 template<> __device__ __forceinline__ float cvt<float>(float v) { return v; }
 template<> __device__ __forceinline__ __half cvt<__half>(float v) { return __float2half(v); }
 
+// Two or four values of dst_t in one store.  The values are the same, the store is one wide: the
+// narrow stores of a warp cover a sector only half each time, so the same bytes cost several
+// transactions (the Q4_K gate/up dequant: 71 -> 27 us per expert on a P100, measured).
+// The engine's buffers are 256-byte aligned, but the parity tests and the embedding path can hand
+// over an unaligned pointer, so the wide store is guarded and falls back to the single stores.
+template<typename dst_t>
+__device__ __forceinline__ void put4(dst_t* p, dst_t a, dst_t b, dst_t c, dst_t d) {
+    if constexpr (std::is_same_v<dst_t, __half>) {
+        union { __half h[4]; uint2 u; } w;
+        w.h[0] = a; w.h[1] = b; w.h[2] = c; w.h[3] = d;
+        if ((((uintptr_t) p) & 7) == 0) { *(uint2*) p = w.u; return; }
+    } else {
+        if ((((uintptr_t) p) & 15) == 0) { *(float4*) p = make_float4(a, b, c, d); return; }
+    }
+    p[0] = a; p[1] = b; p[2] = c; p[3] = d;
+}
+
+template<typename dst_t>
+__device__ __forceinline__ void put2(dst_t* p, dst_t a, dst_t b) {
+    if constexpr (std::is_same_v<dst_t, __half>) {
+        union { __half h[2]; uint u; } w;
+        w.h[0] = a; w.h[1] = b;
+        if ((((uintptr_t) p) & 3) == 0) { *(uint*) p = w.u; return; }
+    } else {
+        if ((((uintptr_t) p) & 7) == 0) { *(float2*) p = make_float2(a, b); return; }
+    }
+    p[0] = a; p[1] = b;
+}
+
 template<typename dst_t>
 __device__ void dq_iq2_xxs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_iq2_xxs* x = (const block_iq2_xxs*) vx;
@@ -2941,7 +2970,9 @@ __device__ void dq_iq2_xxs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const uint32_t aux32 = q2[2] | (q2[3] << 16);
     const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
-    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    auto v = [&](int j) { return cvt<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f)); };
+    put4(y,     v(0), v(1), v(2), v(3));
+    put4(y + 4, v(4), v(5), v(6), v(7));
 }
 template<typename dst_t>
 __device__ void dq_iq2_xs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -2952,7 +2983,9 @@ __device__ void dq_iq2_xs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const uint8_t* grid = (const uint8_t*) (iq2xs_grid + (q2[il] & 511));
     const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
     const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
-    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    auto v = [&](int j) { return cvt<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f)); };
+    put4(y,     v(0), v(1), v(2), v(3));
+    put4(y + 4, v(4), v(5), v(6), v(7));
 }
 template<typename dst_t>
 __device__ void dq_iq2_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -2962,7 +2995,9 @@ __device__ void dq_iq2_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const uint8_t* grid = (const uint8_t*) (iq2s_grid + (x[ibs].qs[4 * ib + il] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 0x300)));
     const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
     const uint8_t signs = x[ibs].qs[QK_K / 8 + 4 * ib + il];
-    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    auto v = [&](int j) { return cvt<dst_t>(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f)); };
+    put4(y,     v(0), v(1), v(2), v(3));
+    put4(y + 4, v(4), v(5), v(6), v(7));
 }
 template<typename dst_t>
 __device__ void dq_iq3_xxs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -2976,10 +3011,10 @@ __device__ void dq_iq3_xxs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const uint32_t aux32 = gas[0] | (gas[1] << 16);
     const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
-    for (int j = 0; j < 4; ++j) {
-        y[j + 0] = cvt<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f));
-        y[j + 4] = cvt<dst_t>(d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f));
-    }
+    auto v1 = [&](int j) { return cvt<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f)); };
+    auto v2 = [&](int j) { return cvt<dst_t>(d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f)); };
+    put4(y,     v1(0), v1(1), v1(2), v1(3));
+    put4(y + 4, v2(0), v2(1), v2(2), v2(3));
 }
 template<typename dst_t>
 __device__ void dq_iq3_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -2991,10 +3026,10 @@ __device__ void dq_iq3_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const uint8_t* grid2 = (const uint8_t*) (iq3s_grid + (qs[2 * il + 1] | ((x[ibs].qh[ib] << (7 - 2 * il)) & 256)));
     const float d = (float) x[ibs].d * (1 + 2 * ((x[ibs].scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
     const uint8_t signs = x[ibs].signs[4 * ib + il];
-    for (int j = 0; j < 4; ++j) {
-        y[j + 0] = cvt<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f));
-        y[j + 4] = cvt<dst_t>(d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f));
-    }
+    auto v1 = [&](int j) { return cvt<dst_t>(d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f)); };
+    auto v2 = [&](int j) { return cvt<dst_t>(d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f)); };
+    put4(y,     v1(0), v1(1), v1(2), v1(3));
+    put4(y + 4, v2(0), v2(1), v2(2), v2(3));
 }
 template<typename dst_t>
 __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3012,7 +3047,9 @@ __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     grid32[0] = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((x[ibs].qh[2 * ib + il / 2] >> 4 * (il % 2)) & 7) << 8)];
     grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
     grid32[0] &= 0x0f0f0f0f;
-    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
+    auto v = [&](int j) { return cvt<dst_t>(d * (q[j] + delta)); };
+    put4(y,     v(0), v(1), v(2), v(3));
+    put4(y + 4, v(4), v(5), v(6), v(7));
 }
 template<typename dst_t>
 __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3021,10 +3058,10 @@ __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     dst_t* y = yy + 32 * ib + 4 * il;
     const uint8_t* q4 = x[ib].qs + 4 * il;
     const float d = (float) x[ib].d;
-    for (int j = 0; j < 4; ++j) {
-        y[j + 0] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
-        y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
-    }
+    auto v1 = [&](int j) { return cvt<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]); };
+    auto v2 = [&](int j) { return cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]); };
+    put4(y,      v1(0), v1(1), v1(2), v1(3));
+    put4(y + 16, v2(0), v2(1), v2(2), v2(3));
 }
 // Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
 template<typename dst_t>
@@ -3045,7 +3082,8 @@ __device__ void dq_q3_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         dst_t* y = yy + 128 * n + 32 * j;
         const uint8_t* q = x->qs + 32 * n;
         const uint8_t* hm = x->hmask;
-        for (int l = l0; l < l0 + 4; ++l) y[l] = cvt<dst_t>(dl * ((int8_t) ((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+        auto v = [&](int l) { return cvt<dst_t>(dl * ((int8_t) ((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4))); };
+        put4(y + l0, v(l0), v(l0 + 1), v(l0 + 2), v(l0 + 3));
     }
 }
 template<typename dst_t>
@@ -3055,10 +3093,10 @@ __device__ void dq_iq4_xs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     dst_t* y = yy + 32 * ib + 4 * il;
     const uint8_t* q4 = x->qs + 16 * ib + 4 * il;
     const float d = (float) x->d * ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
-    for (int j = 0; j < 4; ++j) {
-        y[j + 0] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]);
-        y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
-    }
+    auto v1 = [&](int j) { return cvt<dst_t>(d * kvalues_iq4nl[q4[j] & 0xf]); };
+    auto v2 = [&](int j) { return cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]); };
+    put4(y,      v1(0), v1(1), v1(2), v1(3));
+    put4(y + 16, v2(0), v2(1), v2(2), v2(3));
 }
 template<typename dst_t>
 __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3066,7 +3104,7 @@ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_q2_0* x = (const block_q2_0*) vx + ibs * 4;
     const int b = tid / 8, part = tid % 8;          // block 0..3, 8 values each
     const float d = (float) x[b].d;
-    for (int j = 0; j < 8; ++j) {
+    auto val = [&](int j) {
         const int i = part * 8 + j;
         const int code = (x[b].qs[i / 4] >> ((i % 4) * 2)) & 3;
 #if defined(__HIPCC__)
@@ -3075,13 +3113,14 @@ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         // report (#1540).  Preserve the scale's sign, as the FP32/CPU paths do: value-identical where the fold never happens.
         if constexpr (std::is_same_v<dst_t, __half>) {
             if (code == 1) {
-                yy[b * 64 + i] = __ushort_as_half(__half_as_ushort(x[b].d) & 0x8000u);
-                continue;
+                return __ushort_as_half(__half_as_ushort(x[b].d) & 0x8000u);
             }
         }
 #endif
-        yy[b * 64 + i] = cvt<dst_t>(d * (float) (code - 1));
-    }
+        return cvt<dst_t>(d * (float) (code - 1));
+    };
+    put4(yy + b * 64 + part * 8,     val(0), val(1), val(2), val(3));
+    put4(yy + b * 64 + part * 8 + 4, val(4), val(5), val(6), val(7));
 }
 
 // llama.cpp's dequantize_q4_K / dequantize_q5_K (dequantize.cuh; q5_K's 64 threads folded onto 32) and the 32-value
@@ -3094,6 +3133,19 @@ __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_
         m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
     }
 }
+
+// The same, on the block's 12 scale bytes read in three words: three loads instead of twelve byte
+// loads, and the branch on j < 4 (taken by half the lanes of a warp and not by the other half) gone.
+__device__ __forceinline__ void get_scale_min_k4(uint32_t w0, uint32_t w1, uint32_t w2, int j, uint8_t& d, uint8_t& m) {
+    const uint32_t wa = j < 4 ? w0 : (j < 8 ? w1 : w2);   // the word that holds the byte j
+    const uint32_t wb = j < 4 ? w1 : w2;                 // the word that holds the byte j + 4
+    const uint8_t a0 = (uint8_t) (wa >> ((j & 3) * 8));
+    const uint8_t a1 = (uint8_t) (wb >> (((j + 4) & 3) * 8));
+    const bool hi = (j >= 4);
+    const uint8_t a3 = hi ? (uint8_t) (w0 >> ((j - 4) * 8)) : 0;   // the byte j - 4 is in the first word
+    d = hi ? (uint8_t) ((a1 & 0xF) | ((a3 >> 6) << 4)) : (uint8_t) (a0 & 63);
+    m = hi ? (uint8_t) ((a1 >>  4) | ((a0 >> 6) << 4)) : (uint8_t) (a1 & 63);
+}
 template<typename dst_t>
 __device__ void dq_q4_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_q4_K* x = (const block_q4_K*) vx;
@@ -3104,14 +3156,18 @@ __device__ void dq_q4_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const float dmin = __high2half(x[ibs].dm);
     const uint8_t* q = x[ibs].qs + 32 * il + n * ir;
     uint8_t sc, m;
-    get_scale_min_k4((int) is + 0, x[ibs].scales, sc, m);
+    const uint32_t w0 = *((const uint32_t*) &x[ibs].scales[0]);
+    const uint32_t w1 = *((const uint32_t*) &x[ibs].scales[4]);
+    const uint32_t w2 = *((const uint32_t*) &x[ibs].scales[8]);
+    get_scale_min_k4(w0, w1, w2, (int) is + 0, sc, m);
     const float d1 = dall * sc, m1 = dmin * m;
-    get_scale_min_k4((int) is + 1, x[ibs].scales, sc, m);
+    get_scale_min_k4(w0, w1, w2, (int) is + 1, sc, m);
     const float d2 = dall * sc, m2 = dmin * m;
-    for (int l = 0; l < n; ++l) {
-        y[l + 0] = cvt<dst_t>(d1 * (q[l] & 0xF) - m1);
-        y[l + 32] = cvt<dst_t>(d2 * (q[l] >> 4) - m2);
-    }
+    // the four values of a group in one store each (the two runs of four are 8-byte aligned)
+    put4(y + 0, cvt<dst_t>(d1 * (q[0] & 0xF) - m1), cvt<dst_t>(d1 * (q[1] & 0xF) - m1),
+                cvt<dst_t>(d1 * (q[2] & 0xF) - m1), cvt<dst_t>(d1 * (q[3] & 0xF) - m1));
+    put4(y + 32, cvt<dst_t>(d2 * (q[0] >> 4) - m2), cvt<dst_t>(d2 * (q[1] >> 4) - m2),
+                 cvt<dst_t>(d2 * (q[2] >> 4) - m2), cvt<dst_t>(d2 * (q[3] >> 4) - m2));
 }
 template<typename dst_t>
 __device__ void dq_q5_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3124,16 +3180,19 @@ __device__ void dq_q5_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         const uint8_t* ql = x[ibs].qs + 32 * il + 2 * ir;
         const uint8_t* qh = x[ibs].qh + 2 * ir;
         uint8_t sc, m;
-        get_scale_min_k4(is + 0, x[ibs].scales, sc, m);
+        const uint32_t w0 = *((const uint32_t*) &x[ibs].scales[0]);
+        const uint32_t w1 = *((const uint32_t*) &x[ibs].scales[4]);
+        const uint32_t w2 = *((const uint32_t*) &x[ibs].scales[8]);
+        get_scale_min_k4(w0, w1, w2, is + 0, sc, m);
         const float d1 = dall * sc, m1 = dmin * m;
-        get_scale_min_k4(is + 1, x[ibs].scales, sc, m);
+        get_scale_min_k4(w0, w1, w2, is + 1, sc, m);
         const float d2 = dall * sc, m2 = dmin * m;
         uint8_t hm = (uint8_t) (1 << (2 * il));
-        y[0] = cvt<dst_t>(d1 * ((ql[0] & 0xF) + (qh[0] & hm ? 16 : 0)) - m1);
-        y[1] = cvt<dst_t>(d1 * ((ql[1] & 0xF) + (qh[1] & hm ? 16 : 0)) - m1);
+        put2(y, cvt<dst_t>(d1 * ((ql[0] & 0xF) + (qh[0] & hm ? 16 : 0)) - m1),
+                cvt<dst_t>(d1 * ((ql[1] & 0xF) + (qh[1] & hm ? 16 : 0)) - m1));
         hm <<= 1;
-        y[32] = cvt<dst_t>(d2 * ((ql[0] >> 4) + (qh[0] & hm ? 16 : 0)) - m2);
-        y[33] = cvt<dst_t>(d2 * ((ql[1] >> 4) + (qh[1] & hm ? 16 : 0)) - m2);
+        put2(y + 32, cvt<dst_t>(d2 * ((ql[0] >> 4) + (qh[0] & hm ? 16 : 0)) - m2),
+                     cvt<dst_t>(d2 * ((ql[1] >> 4) + (qh[1] & hm ? 16 : 0)) - m2));
     }
 }
 template<typename dst_t>
@@ -3145,13 +3204,14 @@ __device__ void dq_q5_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     uint32_t qh;
     memcpy(&qh, x[ib].qh, sizeof(qh));
     dst_t* y = yy + 32 * ib;
-    for (int j = 0; j < 4; ++j) {
-        const int iqs = 4 * il + j;
-        const int xh_0 = ((qh >> (iqs + 0)) << 4) & 0x10;
-        const int xh_1 = ((qh >> (iqs + 12))) & 0x10;
-        y[iqs] = cvt<dst_t>(((float) ((x[ib].qs[iqs] & 0xf) | xh_0) - 16.0f) * d);
-        y[iqs + 16] = cvt<dst_t>(((float) ((x[ib].qs[iqs] >> 4) | xh_1) - 16.0f) * d);
-    }
+    put4(y + 4 * il, cvt<dst_t>(((float) ((x[ib].qs[4 * il + 0] & 0xf) | (((qh >> (4 * il + 0)) << 4) & 0x10)) - 16.0f) * d),
+                  cvt<dst_t>(((float) ((x[ib].qs[4 * il + 1] & 0xf) | (((qh >> (4 * il + 1)) << 4) & 0x10)) - 16.0f) * d),
+                  cvt<dst_t>(((float) ((x[ib].qs[4 * il + 2] & 0xf) | (((qh >> (4 * il + 2)) << 4) & 0x10)) - 16.0f) * d),
+                  cvt<dst_t>(((float) ((x[ib].qs[4 * il + 3] & 0xf) | (((qh >> (4 * il + 3)) << 4) & 0x10)) - 16.0f) * d));
+    put4(y + 4 * il + 16, cvt<dst_t>(((float) ((x[ib].qs[4 * il + 0] >> 4) | ((qh >> (4 * il + 0 + 12)) & 0x10)) - 16.0f) * d),
+                     cvt<dst_t>(((float) ((x[ib].qs[4 * il + 1] >> 4) | ((qh >> (4 * il + 1 + 12)) & 0x10)) - 16.0f) * d),
+                     cvt<dst_t>(((float) ((x[ib].qs[4 * il + 2] >> 4) | ((qh >> (4 * il + 2 + 12)) & 0x10)) - 16.0f) * d),
+                     cvt<dst_t>(((float) ((x[ib].qs[4 * il + 3] >> 4) | ((qh >> (4 * il + 3 + 12)) & 0x10)) - 16.0f) * d));
 }
 template<typename dst_t>
 __device__ void dq_q4_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3159,11 +3219,14 @@ __device__ void dq_q4_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const int ib = tid % 8, il = tid / 8;
     const float d = __half2float(x[ib].d);
     dst_t* y = yy + 32 * ib;
-    for (int j = 0; j < 4; ++j) {
-        const int iqs = 4 * il + j;                   // llama.cpp's dequantize_q4_0 for value pairs iqs, iqs + 16
-        y[iqs] = cvt<dst_t>(((float) (x[ib].qs[iqs] & 0xf) - 8.0f) * d);
-        y[iqs + 16] = cvt<dst_t>(((float) (x[ib].qs[iqs] >> 4) - 8.0f) * d);
-    }
+    put4(y + 4 * il, cvt<dst_t>(((float) (x[ib].qs[4 * il + 0] & 0xf) - 8.0f) * d),
+                  cvt<dst_t>(((float) (x[ib].qs[4 * il + 1] & 0xf) - 8.0f) * d),
+                  cvt<dst_t>(((float) (x[ib].qs[4 * il + 2] & 0xf) - 8.0f) * d),
+                  cvt<dst_t>(((float) (x[ib].qs[4 * il + 3] & 0xf) - 8.0f) * d));
+    put4(y + 4 * il + 16, cvt<dst_t>(((float) (x[ib].qs[4 * il + 0] >> 4) - 8.0f) * d),
+                     cvt<dst_t>(((float) (x[ib].qs[4 * il + 1] >> 4) - 8.0f) * d),
+                     cvt<dst_t>(((float) (x[ib].qs[4 * il + 2] >> 4) - 8.0f) * d),
+                     cvt<dst_t>(((float) (x[ib].qs[4 * il + 3] >> 4) - 8.0f) * d));
 }
 template<typename dst_t>
 __device__ void dq_q4_1(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3171,11 +3234,14 @@ __device__ void dq_q4_1(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const int ib = tid % 8, il = tid / 8;
     const float2 dm = __half22float2(x[ib].dm);
     dst_t* y = yy + 32 * ib;
-    for (int j = 0; j < 4; ++j) {
-        const int iqs = 4 * il + j;                   // llama.cpp's dequantize_q4_1 for value pairs iqs, iqs + 16
-        y[iqs] = cvt<dst_t>((float) (x[ib].qs[iqs] & 0xf) * dm.x + dm.y);
-        y[iqs + 16] = cvt<dst_t>((float) (x[ib].qs[iqs] >> 4) * dm.x + dm.y);
-    }
+    put4(y + 4 * il, cvt<dst_t>((float) (x[ib].qs[4 * il + 0] & 0xf) * dm.x + dm.y),
+                  cvt<dst_t>((float) (x[ib].qs[4 * il + 1] & 0xf) * dm.x + dm.y),
+                  cvt<dst_t>((float) (x[ib].qs[4 * il + 2] & 0xf) * dm.x + dm.y),
+                  cvt<dst_t>((float) (x[ib].qs[4 * il + 3] & 0xf) * dm.x + dm.y));
+    put4(y + 4 * il + 16, cvt<dst_t>((float) (x[ib].qs[4 * il + 0] >> 4) * dm.x + dm.y),
+                     cvt<dst_t>((float) (x[ib].qs[4 * il + 1] >> 4) * dm.x + dm.y),
+                     cvt<dst_t>((float) (x[ib].qs[4 * il + 2] >> 4) * dm.x + dm.y),
+                     cvt<dst_t>((float) (x[ib].qs[4 * il + 3] >> 4) * dm.x + dm.y));
 }
 template<typename dst_t>
 __device__ void dq_q5_1(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3185,13 +3251,15 @@ __device__ void dq_q5_1(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     uint32_t qh;
     memcpy(&qh, x[ib].qh, sizeof(qh));
     dst_t* y = yy + 32 * ib;
-    for (int j = 0; j < 4; ++j) {
-        const int iqs = 4 * il + j;                   // llama.cpp's dequantize_q5_1 for value pairs iqs, iqs + 16
-        const int xh_0 = ((qh >> (iqs + 0)) << 4) & 0x10;
-        const int xh_1 = ((qh >> (iqs + 12))) & 0x10;
-        y[iqs] = cvt<dst_t>((float) ((x[ib].qs[iqs] & 0xf) | xh_0) * dm.x + dm.y);
-        y[iqs + 16] = cvt<dst_t>((float) ((x[ib].qs[iqs] >> 4) | xh_1) * dm.x + dm.y);
-    }
+    // llama.cpp's dequantize_q5_1 for value pairs iqs, iqs + 16, the two runs of four in wide stores
+    put4(y + 4 * il, cvt<dst_t>((float) ((x[ib].qs[4 * il + 0] & 0xf) | (((qh >> (4 * il + 0)) << 4) & 0x10)) * dm.x + dm.y),
+                  cvt<dst_t>((float) ((x[ib].qs[4 * il + 1] & 0xf) | (((qh >> (4 * il + 1)) << 4) & 0x10)) * dm.x + dm.y),
+                  cvt<dst_t>((float) ((x[ib].qs[4 * il + 2] & 0xf) | (((qh >> (4 * il + 2)) << 4) & 0x10)) * dm.x + dm.y),
+                  cvt<dst_t>((float) ((x[ib].qs[4 * il + 3] & 0xf) | (((qh >> (4 * il + 3)) << 4) & 0x10)) * dm.x + dm.y));
+    put4(y + 4 * il + 16, cvt<dst_t>((float) ((x[ib].qs[4 * il + 0] >> 4) | ((qh >> (4 * il + 0 + 12)) & 0x10)) * dm.x + dm.y),
+                     cvt<dst_t>((float) ((x[ib].qs[4 * il + 1] >> 4) | ((qh >> (4 * il + 1 + 12)) & 0x10)) * dm.x + dm.y),
+                     cvt<dst_t>((float) ((x[ib].qs[4 * il + 2] >> 4) | ((qh >> (4 * il + 2 + 12)) & 0x10)) * dm.x + dm.y),
+                     cvt<dst_t>((float) ((x[ib].qs[4 * il + 3] >> 4) | ((qh >> (4 * il + 3 + 12)) & 0x10)) * dm.x + dm.y));
 }
 template<typename dst_t>
 __device__ void dq_q6_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3219,14 +3287,18 @@ __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const int ib = tid % 8, il = tid / 8;
     const float d = __half2float(x[ib].d);
     dst_t* y = yy + 32 * ib + 8 * il;
-    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>((float) x[ib].qs[8 * il + j] * d);
+    auto v = [&](int j) { return cvt<dst_t>((float) x[ib].qs[8 * il + j] * d); };
+    put4(y,     v(0), v(1), v(2), v(3));
+    put4(y + 4, v(4), v(5), v(6), v(7));
 }
 
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py): 8 values per thread.
 template<typename dst_t>
 __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const uint16_t* x = (const uint16_t*) vx + ibs * 256 + tid * 8;
-    for (int j = 0; j < 8; ++j) yy[tid * 8 + j] = cvt<dst_t>(__uint_as_float((uint32_t) x[j] << 16));
+    auto v = [&](int j) { return cvt<dst_t>(__uint_as_float((uint32_t) x[j] << 16)); };
+    put4(yy + tid * 8,     v(0), v(1), v(2), v(3));
+    put4(yy + tid * 8 + 4, v(4), v(5), v(6), v(7));
 }
 
 // NVFP4: one "superblock" = 256 values = 4 blocks of 64; thread tid writes 8 values of block tid / 8.
@@ -3235,12 +3307,14 @@ template<typename dst_t>
 __device__ void dq_nvfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_nvfp4* x = (const block_nvfp4*) vx + ibs * 4;
     const int b = tid / 8, part = tid % 8;
-    for (int j = 0; j < 8; ++j) {
+    auto val = [&](int j) {
         const int i = part * 8 + j, s = i / 16, k = i % 16;
         const uint8_t byte = x[b].qs[s * 8 + (k & 7)];
         const int code = k < 8 ? (byte & 0x0F) : (byte >> 4);
-        yy[b * 64 + i] = cvt<dst_t>((float) kvalues_fp4[code] * ue4m3_to_f32_half(x[b].d[s]));
-    }
+        return cvt<dst_t>((float) kvalues_fp4[code] * ue4m3_to_f32_half(x[b].d[s]));
+    };
+    put4(yy + b * 64 + part * 8,     val(0), val(1), val(2), val(3));
+    put4(yy + b * 64 + part * 8 + 4, val(4), val(5), val(6), val(7));
 }
 
 // APR trellis types: one 256-value call = two 128-blocks; thread tid decodes block tid/16, lane (tid/2)%8, steps
@@ -3257,10 +3331,7 @@ __device__ void dq_tq(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int i = 0; i < 2; ++i) {
         float2 a, c;
         tq_step(s[2 * half + i], a, c);
-        y[4 * i + 0] = cvt<dst_t>(d * a.x);
-        y[4 * i + 1] = cvt<dst_t>(d * a.y);
-        y[4 * i + 2] = cvt<dst_t>(d * c.x);
-        y[4 * i + 3] = cvt<dst_t>(d * c.y);
+        put4(y + 4 * i, cvt<dst_t>(d * a.x), cvt<dst_t>(d * a.y), cvt<dst_t>(d * c.x), cvt<dst_t>(d * c.y));
     }
 }
 

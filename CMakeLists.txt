@@ -2277,6 +2277,12 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_f16_kq_cuda_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_f16_kq_cuda_test COMMAND prefill_f16_kq_cuda_test)
       set_tests_properties(prefill_f16_kq_cuda_test PROPERTIES TIMEOUT 300)
+      # the dequantizer's wide stores (iq_kernels.cu's put4): the values against ggml's and
+      # llama.cpp's, and the aligned and the unaligned destination (the guarded fallback)
+      add_executable(iq_dequant_store_test tests/cuda/iq_dequant_store_test.cu)
+      target_link_libraries(iq_dequant_store_test PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME iq_dequant_store_test COMMAND iq_dequant_store_test)
+      set_tests_properties(iq_dequant_store_test PROPERTIES TIMEOUT 300)
       # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
       # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
       add_executable(prefill_mmq_scatter_test tests/cuda/prefill_mmq_scatter_test.cpp)
