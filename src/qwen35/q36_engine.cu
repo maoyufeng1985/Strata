@@ -3392,7 +3392,7 @@ struct Engine {
     void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
                const float* wn, float* hout) {
         const auto& g = m->g;
-        const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
+        const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff;
         // STRATA_Q36_HELPER_TIMING=1: E0, the start of this layer's tile.  Only opens a tile when the probe is on
         // and no graph is being captured; every other mark below is a no-op unless this one opened it.
         // Only ONE layer of ONE forward carries a tile: the 8 shared events cannot survive 40 layers of records,
