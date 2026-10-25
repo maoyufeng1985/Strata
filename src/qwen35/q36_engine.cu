@@ -2108,14 +2108,16 @@ struct Engine {
         const float* x = nullptr;
         const int32_t* ids = nullptr;
         float* out = nullptr;
-        bool have = false;       // a job is waiting for the worker
+        std::atomic<bool> have{false};   // a job is waiting for the worker (the worker spins on this)
         std::atomic<bool> done{false};   // the job is finished (the result is under mu)
         bool ok = true;
         std::string err;
     };
-    // One worker per helper after the first (the main thread takes helper 0 itself).  A std::array, not a vector:
-    // a Marshal owns a std::thread, which is neither copyable nor movable.
-    std::array<Marshal, 2> marshal_;
+    // One worker per helper (the main thread takes NO helper's begin: while the workers dispatch, the main thread
+    // issues the primary's own work - the local grouped kernel, the shared expert, the CPU pool).  A std::array, not
+    // a vector: a Marshal owns a std::thread, which is neither copyable nor movable.
+    std::array<Marshal, 3> marshal_;
+    int marshal_workers_ = 0;   // the workers started (one per helper, up to three)
     bool marshal_on = false;
     static bool marshal_flag() {
         static const bool v = [] {
@@ -2135,7 +2137,7 @@ struct Engine {
     }
     /// The workers' loop: take a job, run it, hand the result back.
     void marshal_loop(int r) {
-        Marshal& m = marshal_[(size_t) r - 1];
+        Marshal& m = marshal_[(size_t) r];
         // The worker's own device: the helper's card, set once.  RemoteExperts::begin's own DeviceScope then
         // finds the device already current, so its cudaSetDevice calls are the runtime's cheap no-op path.
         {
@@ -2149,11 +2151,21 @@ struct Engine {
             const float* x = nullptr;
             const int32_t* ids = nullptr;
             float* out = nullptr;
+            // SPIN FIRST, THEN SLEEP.  The job takes tens of microseconds and a condition variable's wake-up
+            // costs more than the wait itself: the wake-up sat BETWEEN the main thread's post and the worker's
+            // begin, on the critical path (the helper's kernels are queued only after the worker wakes).
+            // Measured on 192.168.1.98 (2026-10-25): the wake-up was ~20 us of the ~58 us between the post and
+            // the helper's first kernel.
             {
-                std::unique_lock<std::mutex> lk(m.mu);
-                m.cv.wait(lk, [&] { return m.have; });
+                int spins = 0;
+                while (!m.have.load(std::memory_order_acquire)) {
+                    if (++spins < 40000) { cpu_relax(); continue; }
+                    std::unique_lock<std::mutex> lk(m.mu);
+                    m.cv.wait(lk, [&] { return m.have.load(std::memory_order_acquire); });
+                }
+                std::lock_guard<std::mutex> lk(m.mu);
                 kind = m.kind; li = m.li; T = m.T; Kp = m.Kp; x = m.x; ids = m.ids; out = m.out;
-                m.have = false;
+                m.have.store(false, std::memory_order_release);
             }
             if (kind == 0) return;   // the stop
             std::string err;
@@ -2171,13 +2183,15 @@ struct Engine {
             m.cv.notify_one();
         }
     }
-    /// Start the workers (once, after the helpers are open) and stop them with the engine.
+    /// Start the workers (once, after the helpers are open) and stop them with the engine.  One worker per helper:
+    /// the main thread takes none of them, so it can issue the primary's own work while the dispatches run.
     void marshal_start() {
         if (!marshal_flag() || helpers.size() < 2) return;
         marshal_on = true;
-        for (size_t i = 0; i < marshal_.size(); ++i) {
-            marshal_[i].helper = (int) i + 1;
-            marshal_[i].th = std::thread([this, i] { marshal_loop((int) i + 1); });
+        marshal_workers_ = (int) std::min<size_t>(marshal_.size(), helpers.size());
+        for (int i = 0; i < marshal_workers_; ++i) {
+            marshal_[(size_t) i].helper = i;
+            marshal_[(size_t) i].th = std::thread([this, i] { marshal_loop(i); });
         }
     }
     void marshal_stop() {
@@ -2185,7 +2199,7 @@ struct Engine {
             {
                 std::lock_guard<std::mutex> lk(m.mu);
                 m.kind = 0;
-                m.have = true;
+                m.have.store(true, std::memory_order_release);
             }
             m.cv.notify_one();
             if (m.th.joinable()) m.th.join();
@@ -2193,23 +2207,23 @@ struct Engine {
         marshal_on = false;
     }
     ~Engine() { marshal_stop(); }
-    /// Hand a job to a worker.  The worker owns helper r (r >= 1); the main thread takes helper 0 itself.
+    /// Hand a job to a worker.  The worker owns helper r (r is the helper's index in helpers[]).
     void marshal_post(int r, int kind, size_t li, int T, int Kp, const float* x, const int32_t* ids, float* out) {
-        Marshal& m = marshal_[(size_t) r - 1];
+        Marshal& m = marshal_[(size_t) r];
         {
             std::lock_guard<std::mutex> lk(m.mu);
             // done=false under the lock, before have=true: the worker can only take the job after the unlock, so
             // it cannot set done=true before this clears it.
             m.done.store(false, std::memory_order_relaxed);
             m.kind = kind; m.li = li; m.T = T; m.Kp = Kp; m.x = x; m.ids = ids; m.out = out;
-            m.have = true;
+            m.have.store(true, std::memory_order_release);
         }
         m.cv.notify_one();
     }
     /// Wait for a worker's job.  A short spin first: the job takes tens of microseconds, and a condition
     /// variable's wake-up would cost more than the wait itself.
     bool marshal_wait(int r, std::string& err) {
-        Marshal& m = marshal_[(size_t) r - 1];
+        Marshal& m = marshal_[(size_t) r];
         for (int i = 0; i < 4000 && !m.done.load(std::memory_order_acquire); ++i) {
         }
         for (int i = 0; i < 4000 && !m.done.load(std::memory_order_acquire); ++i) std::this_thread::yield();
@@ -3979,30 +3993,35 @@ struct Engine {
         // STRATA_Q36_HELPER_TIMING=1: the host's part of the dispatch (the begin calls), measured here so the
         // decode's host-bound time can be split by the part it was spent in.
         const auto t_begin0 = helper_timing() ? Clock::now() : Clock::time_point{};
-        // STRATA_Q36_HELPER_PARALLEL_MARSHAL=1: the helpers after the first are begun on their own workers, so
-        // the three dispatches overlap.  The main thread begins the first helper itself, then waits for the
-        // workers.  The work and its order are unchanged (each worker owns one helper).
+        // STRATA_Q36_HELPER_ASYNC: the per-entry mask, computed BEFORE the begins.
+        //
+        // The entries the helpers take are the ones whose expert a helper holds in its VRAM cache - the rule
+        // RemoteExperts::begin_slot applies (its kind and primary_res are null here, so the cache is the whole
+        // rule).  It is read from the CACHE and the routing, not from the window's owned_ array, because with
+        // STRATA_Q36_HELPER_PARALLEL_MARSHAL the begins run on the workers and write owned_ there: reading it
+        // here would race, and a mask that misses entries hands them to the CPU pool (measured 2026-10-25: the
+        // pool took 12.8% of the entries and the decode fell from 60 to 40 tok/s).
+        if (helper_async()) {
+            for (int64_t i = 0; i < n_ent; ++i) {
+                const int32_t e = h_helper_ids[i];
+                if (e < 0 || e >= (int32_t) m->g.n_expert) continue;
+                bool own = false;
+                for (int w = 0; w < nwin && !own; ++w) own = helpers[(size_t) win[w]].holds((int64_t) li, e);
+                if (!own) continue;
+                helper_mask[(size_t) i] = 1;
+                ++hy_helper;
+            }
+        }
+        // STRATA_Q36_HELPER_PARALLEL_MARSHAL=1: EVERY helper's begin goes to its own worker, so the three
+        // dispatches overlap AND the main thread is free to issue the primary's own work (the local grouped
+        // kernel, the shared expert, the CPU pool) while they run.  The work and its order are unchanged (each
+        // worker owns one helper); only the wall clock of the dispatch is.
+        // The harvest waits for the begins before it harvests: a begin that failed is reported there and ends the
+        // run, because this layer's local launches are already queued against the helpers' mask - the same
+        // reasoning the deferred harvest's failure already follows.
         if (marshal_ok() && nwin > 1) {
-            // The workers take the helpers whose index is not 0 (worker r owns helper r); the main thread takes
-            // helper 0 itself, so the three dispatches overlap.
             for (int w = 0; w < nwin; ++w)
-                if (win[w] != 0) marshal_post(win[w], 1, li, T, Kp, h_helper_x, h_helper_ids, nullptr);
-            int bad = -1;
-            for (int w = 0; w < nwin; ++w)
-                if (win[w] == 0 && !helpers[0].begin((int64_t) li, h_helper_x, h_helper_ids, T, Kp, nullptr, nullptr, err))
-                    bad = 0;
-            for (int w = 0; w < nwin; ++w) {
-                if (win[w] == 0) continue;
-                std::string werr;
-                if (!marshal_wait(win[w], werr)) { err = werr; bad = win[w]; }
-            }
-            if (bad >= 0) {
-                std::fprintf(stderr, "strata-q36: helper CUDA%d, layer %zu: %s\n", bad + 1, li, err.c_str());
-                helper_failed = true;
-                helper_mask_li = (int) li;
-                CK(cudaMemcpyAsync(d_helper_mask, helper_mask.data(), (size_t) n_ent, cudaMemcpyHostToDevice, st));
-                return false;
-            }
+                marshal_post(win[w], 1, li, T, Kp, h_helper_x, h_helper_ids, nullptr);
         } else
         for (int w = 0; w < nwin; ++w) {
             const int hi = win[w];
@@ -4026,18 +4045,10 @@ struct Engine {
             // work has been issued.  Each helper already computed the entries it holds, so only its own
             // rows are uploaded (merged over the mask), never overwriting a row a local path owns.
             //
-            // The mask is the UNION over the window's helpers.  The ownerships are disjoint - an expert blob is
-            // claimed by exactly one helper at open time - so the union is a partition of this window between the
-            // helpers and the local paths, and one whole-window upload + one k_merge_helper under it covers every
-            // helper's rows whatever the window holds.  With nwin == 1 the union is that helper's own mask, so the
-            // statements below are the ones this path always issued.
-            for (int64_t i = 0; i < n_ent; ++i) {
-                bool own = false;
-                for (int w = 0; w < nwin && !own; ++w) own = helpers[(size_t) win[w]].owns(i);
-                if (!own) continue;
-                helper_mask[(size_t) i] = 1;
-                ++hy_helper;
-            }
+            // The mask is the UNION over the window's helpers, and it was computed above (before the begins).
+            // The ownerships are disjoint - an expert blob is claimed by exactly one helper at open time - so the
+            // union is a partition of this window between the helpers and the local paths, and one whole-window
+            // upload + one k_merge_helper under it covers every helper's rows whatever the window holds.
             CK(cudaMemcpyAsync(d_helper_mask, helper_mask.data(), (size_t) n_ent, cudaMemcpyHostToDevice, st));
             helper_mask_li = (int) li;
             helper_wait_n = nwin;
@@ -4058,6 +4069,12 @@ struct Engine {
     /// entries of the same staging buffer).  Returns the helper that failed, or -1.
     int finish_window(const int* win, int nwin, float* out, std::string& err) {
         if (marshal_ok() && nwin > 1) {
+            // The begins ran on the workers while the primary issued its own work: they must be done before the
+            // harvests (the same worker slots), and a begin that failed is reported here.
+            for (int w = 0; w < nwin; ++w) {
+                std::string werr;
+                if (!marshal_wait(win[w], werr)) { err = werr; return win[w]; }
+            }
             for (int w = 0; w < nwin; ++w)
                 if (win[w] != 0) marshal_post(win[w], 2, 0, 0, 0, nullptr, nullptr, out);
             int bad = -1;
@@ -4131,7 +4148,8 @@ struct Engine {
             // the run ends here, with the reason.
             std::fprintf(stderr, "strata-q36: helper CUDA%d, layer %zu: %s\n", bad + 1, li, err.c_str());
             std::fprintf(stderr, "strata-q36: STRATA_Q36_HELPER_ASYNC defers the helper's wait past this "
-                                 "layer's local launches, so a deferred helper failure ends the run\n");
+                                 "layer's local launches, and STRATA_Q36_HELPER_PARALLEL_MARSHAL begins the helpers "
+                                 "on their own workers, so a helper that fails ends the run here\n");
             std::exit(1);
         }
         // Stage the helpers' sparse rows, then merge them into eparts where the mask marks them.
