@@ -411,11 +411,15 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
 /// __threadfence_system(): that fence is what orders the token store (a device input read by the NEXT launch) before
 /// the mapped store (a host-visible byte), so the host's spin can never see a draft whose token has not landed.
 /// One thread: the draft step is one row.
+///
+/// The pick is a TOKEN ID, and the argmax's fallback (nothing in the row beat -inf - a row of NaNs) is 0x7fffffff,
+/// which is not one.  The next step embeds this value as a row index, so the DEVICE is given a valid id; the
+/// report keeps the raw value, so the host can still see that the row was not finite.
 __global__ void k_chain_publish(int32_t* __restrict__ tok_next, const int32_t* __restrict__ pick,
-                                volatile int32_t* out_host, int d) {
+                                volatile int32_t* out_host, int d, int n_vocab) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     const int32_t v = *pick;
-    *tok_next = v;
+    *tok_next = (v >= 0 && v < n_vocab) ? v : 0;
     __threadfence_system();
     out_host[d] = v;
 }
