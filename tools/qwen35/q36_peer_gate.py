@@ -34,7 +34,7 @@ The box's GPU lock wraps the whole call (the engine is a child of this process, 
 cover it):  flock /data/gpu.lock -c 'python3 tools/qwen35/q36_peer_gate.py ...'
 """
 from pathlib import Path
-import argparse, json, re, shlex, sys
+import argparse, json, os, re, shlex, sys
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0] if "/" in __file__ else ".")
 from q36_harness import Eng, load_prompts
@@ -130,6 +130,13 @@ def main():
     base = env_dict(a.base_env)
     peer = dict(base)
     peer.update(env_dict(a.peer_env))
+    # THE BASE ARM MUST BE THE DEFAULT PATH.  Eng() starts from this process's own environment, so a peer flag
+    # that happens to be exported (a shell that had it set) would make the "default" arm the peer path - and the
+    # gate would then compare the peer path with itself, which every check would pass.  The peer flags are
+    # cleared here; the peer arm gets them from --peer-env, which is explicit.
+    for k in ("STRATA_Q36_PREFILL_PEERS", "STRATA_Q36_PREFILL_PEERS_HOST", "STRATA_Q36_PEER_F16",
+              "STRATA_Q36_PEER_KEEP_RESIDENT"):
+        os.environ.pop(k, None)
     print("the prompts: %d of %d tokens (the peer path needs more than %d)" % (len(prompts), a.width, MIN_WIDTH - 1),
           flush=True)
     print("the peer arm's env: " + " ".join("%s=%s" % kv for kv in sorted(peer.items())), flush=True)
