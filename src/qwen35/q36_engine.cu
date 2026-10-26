@@ -2777,6 +2777,16 @@ struct Engine {
         return n;
     }
     static bool quest_on() { return quest_k() > 0; }
+    // STRATA_Q36_QUEST_TIMING=1 (opt-in): the Quest kernels' own times.  The selection pass is the Quest path's
+    // fixed cost, and it was measured at 13 ms per token at a 32k context (the dense path minus the Quest path
+    // with every chunk kept: 23.7 against 34.3 tok/s).  Which of its three kernels that is has to be measured,
+    // not guessed: four events per layer mark the bounds' start and end and the selection's and the pick's end.
+    // The events are read once, after the bench's passes (the last decode step's values), so the probe adds no
+    // synchronization to the decode itself.
+    bool q_timing = false;
+    std::vector<cudaEvent_t> q_ev;   // 4 per layer: [0] before the bounds, [1] after, [2] after the select, [3] after the pick
+    double q_bounds_ms = 0, q_sel_ms = 0;
+    long long q_n = 0;
     bool gpu_timing = false;      // helper_timing() and every event exists (see open_engine)
     // STRATA_Q36_MIXER_SPLIT=1: the mixer's two branches timed apart - the attention layers and the GDN layers.
     // The 8-segment decode timeline has one "attn_ssm" segment that covers both (30 GDN layers and 10 attention
@@ -3873,9 +3883,11 @@ struct Engine {
                 const int nnew = (int) ((p0 + T + kChunkCells - 1) / kChunkCells);
                 const int c0 = (int) (p0 / kChunkCells);
                 if (nnew > c0) {
+                    if (q_timing) CK(cudaEventRecord(q_ev[4 * li + 0], st));
                     k_quest_bounds<<<dim3(HKV, nnew - c0), HD, 0, st>>>(kc8[li], qkmin[li], qkmax[li], ks8[li],
                                                                         qksmax[li], ctx, n_chunk, HD, kKVG, c0,
                                                                         (int) (p0 + T));
+                    if (q_timing) CK(cudaEventRecord(q_ev[4 * li + 1], st));
                 }
             }
             if (T > kGemmT) {
@@ -3944,7 +3956,9 @@ struct Engine {
                         const int nblk = std::max(1, std::min<int>((56 + rows - 1) / rows, std::max(1, nc / 4)));
                         k_quest_sel<<<dim3(nblk, rows), HD, 0, st>>>(q, qkmin[li], qkmax[li], qksmax[li], dpos, t0, H,
                                                                       HKV, ctx, n_chunk, d_rowsel, rs, HD, kKVG);
+                        if (q_timing) CK(cudaEventRecord(q_ev[4 * li + 2], st));
                         k_quest_pick<<<rows, 32, 0, st>>>(dpos, t0, H, d_rowsel, d_sel, rs, n_chunk, quest_k());
+                        if (q_timing) CK(cudaEventRecord(q_ev[4 * li + 3], st));
                         selm = d_sel;
                     }
                     kv4([&](auto k8c, auto v8c) {
@@ -6601,6 +6615,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             E.gpu_timing = true;
         }
     }
+    // STRATA_Q36_QUEST_TIMING=1: the Quest kernels' own events (four per layer).  Created only under that gate, so
+    // a flag-off run allocates and records nothing it did not have before.
+    {
+        const char* qt = std::getenv("STRATA_Q36_QUEST_TIMING");
+        if (qt && qt[0] == '1' && qt[1] == '\0' && E.quest_on()) {
+            E.q_ev.resize(4 * E.m->layers.size());
+            for (auto& e : E.q_ev) CK(cudaEventCreate(&e));
+            E.q_timing = true;
+        }
+    }
     // STRATA_Q36_MIXER_SPLIT=1: the two events that time the mixer's two branches apart (the attention layers and
     // the GDN layers), created only under that gate, so a flag-off run allocates and records nothing it did not before.
     {
@@ -8507,6 +8531,22 @@ int strata::qwen35::run(int argc, char** argv) {
                 std::fprintf(stderr, " | tile=%.3f segsum=%.3f resid=%.3f embed=%.3f head=%.3f (per ms/tok)\n",
                              d_span / (double) tokens, segsum / (double) tokens, d_resid / (double) tokens,
                              d_emb / (double) tokens, d_head / (double) tokens);
+            }
+            // STRATA_Q36_QUEST_TIMING=1: the Quest kernels' own times, from the events of the last decode step.
+            // The four events per layer hold one step's times, so the sums over the layers ARE the per-token cost.
+            if (E.q_timing) {
+                CK(cudaStreamSynchronize(E.st));
+                double qb = 0, qs = 0;
+                long long qn = 0;
+                for (size_t li = 0; li < E.m->layers.size(); ++li) {
+                    float x = 0.f, y = 0.f;
+                    if (cudaEventElapsedTime(&x, E.q_ev[4 * li + 0], E.q_ev[4 * li + 1]) == cudaSuccess) { qb += x; ++qn; }
+                    if (cudaEventElapsedTime(&y, E.q_ev[4 * li + 1], E.q_ev[4 * li + 2]) == cudaSuccess) qs += y;
+                }
+                std::fprintf(stderr,
+                             "strata-q36 PHASE3 AGG QUEST: the bounds %.3f ms/token, the select+pick %.3f ms/token "
+                             "(%lld layers with bounds)\n",
+                             qb, qs, qn);
             }
         }
         // STRATA_Q36_MIXER_SPLIT=1: the mixer's two branches, timed apart, over the three bench passes.  The
