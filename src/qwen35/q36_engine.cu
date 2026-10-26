@@ -796,14 +796,30 @@ __global__ void k_attn_part_gqa(const float* q, const void* kc, const void* vc, 
 /// With codes c and their group scale s (one per kKVG codes, so s is the same for a whole dim across a cell but
 /// varies cell to cell) the true term is q[i] * c[i] * s(cell), so bounding c per dim while taking the LARGEST s
 /// in the page keeps the bound valid.  Doing it on the stored codes therefore needs no extra assumption.
-__global__ void k_quest_bounds(const int8_t* kc, int8_t* lo, int8_t* hi, const __half* ks, int ctx, int n_chunk,
-                               int HD, int kKVG_, int c0, int nwritten) {
+__global__ void k_quest_bounds(const int8_t* kc, int8_t* lo, int8_t* hi, const __half* ks, float* smax, int ctx,
+                               int n_chunk, int HD, int kKVG_, int c0, int nwritten) {
     const int kh = blockIdx.x, c = c0 + blockIdx.y, d = threadIdx.x;   // c is the ABSOLUTE chunk index
     const int p0 = c * kChunkCells;
     // Only the cells that have actually been written are scanned: a chunk past the end of the KV written so far
     // would otherwise bound uninitialized codes (harmless for a read, but the bounds would be meaningless and the
     // selection would then rank noise).
     const int n = max(0, min(kChunkCells, nwritten - p0));
+    // The page's largest group scale.  It belongs to (page, KV head) only, so it is found HERE, when the page is
+    // written: the selection used to find it again for every row, and eight rows share a page, so the same scan ran
+    // eight times per layer and was the selection pass's whole cost.  A max is exact, so the value is the same.
+    const int nsg = HD / kKVG_;
+    const __half* ksp = ks + ((size_t) kh * ctx + p0) * nsg;
+    float sm = 0.f;
+    for (int x = d; x < n * nsg; x += HD) sm = fmaxf(sm, __half2float(ksp[x]));
+    __shared__ float sred[8];   // HD is always 256 here, so 8 warps (the shared array cannot be a VLA)
+    for (int st = 16; st > 0; st >>= 1) sm = fmaxf(sm, __shfl_xor_sync(0xffffffffu, sm, st));
+    if ((d & 31) == 0) sred[d >> 5] = sm;
+    __syncthreads();
+    if (d == 0) {
+        float m = 0.f;
+        for (int w = 0; w < HD / 32; ++w) m = fmaxf(m, sred[w]);
+        smax[(size_t) kh * n_chunk + c] = m;
+    }
     int mn = 127, mx = -127;
     for (int k = 0; k < n; ++k) {
         const int v = (int) kc[((size_t) kh * ctx + p0 + k) * HD + d];
@@ -826,15 +842,13 @@ __global__ void k_quest_bounds(const int8_t* kc, int8_t* lo, int8_t* hi, const _
 /// [0, exp(bound - m)] for ANY m at or above the true max, so ordering pages by this bound orders them by the most
 /// they can possibly add - a page that is not in the top K by this measure cannot hold the largest score unless
 /// another page's bound overestimates more than it does.  That is the approximation the flag buys: it is not exact.
-__global__ void k_quest_sel(const float* q, const int8_t* lo, const int8_t* hi, const __half* ks,
-                            const int32_t* pos0, int t0, int H, int HKV, int ctx, int n_chunk, int keep,
-                            uint8_t* sel, int32_t* rowsel, RowSel rs, int HD, int kKVG_) {
-    const int row = blockIdx.x;
+__global__ void k_quest_sel(const float* q, const int8_t* lo, const int8_t* hi, const float* smax,
+                            const int32_t* pos0, int t0, int H, int HKV, int ctx, int n_chunk,
+                            int32_t* rowsel, RowSel rs, int HD, int kKVG_) {
+    const int row = blockIdx.y, blk = blockIdx.x;
     const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV), d = threadIdx.x;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     const int nc = (npos + kChunkCells - 1) / kChunkCells;
-    const int nk = min(keep, nc);
-    const int nsg = HD / kKVG_;
     const int lane = d & 31, warp = d >> 5, nwarp = blockDim.x >> 5;
     __shared__ float qs[256];
     __shared__ float wsum[32];
@@ -846,16 +860,17 @@ __global__ void k_quest_sel(const float* q, const int8_t* lo, const int8_t* hi, 
     // __syncthreads per chunk instead of nc barriers and a 256-level tree.
     // (The first version ran a 256-level tree per chunk with every thread scanning every cell's scale for smax:
     // nc tree reductions plus nc barriers per layer per row, measured 3x slower than the dense read it saves.)
-    for (int c = 0; c < nc; ++c) {
-        const int p0 = c * kChunkCells;
-        const int n = min(kChunkCells, npos - p0);
-        // The page's largest scale: it depends on (chunk, kv head) only.  Scanned by the WHOLE warp (32 lanes
-        // cover the cells, then one __shfl reduction) - one lane walking all 1024 scales was 32x slower and
-        // measured worse than the dense path it was meant to beat.
-        const __half* ksp = ks + ((size_t) kvh * ctx + p0) * nsg;
-        float sm = 0.f;
-        for (int x = lane; x < n * nsg; x += 32) sm = fmaxf(sm, __half2float(ksp[x]));
-        for (int st = 16; st > 0; st >>= 1) sm = fmaxf(sm, __shfl_xor_sync(0xffffffffu, sm, st));
+    //
+    // The chunks are split over gridDim.x blocks: one token is nt*H rows (16 for a single token), so one block per
+    // row would leave most of the card idle.  The score does not change: the block still owns dim d and still sums
+    // the 8 warp totals in the same order.
+    const int per = (nc + gridDim.x - 1) / gridDim.x;
+    const int cb = blk * per, ce = min(nc, cb + per);
+    for (int c = cb; c < ce; ++c) {
+        // The page's largest scale: it belongs to (page, KV head) only, so it was found once, when the page was
+        // written (k_quest_bounds).  The selection used to scan it here, for every row - eight rows share a page,
+        // so the same scan ran eight times per layer and was the selection pass's whole cost.
+        const float sm = smax[(size_t) kvh * n_chunk + c];
         // This thread's share of the bound: blockDim is HD == 256, so thread d owns exactly dim d, and the block
         // reduces 8 warp totals (each warp's 32 dims summed through __shfl).
         (void) nwarp;
@@ -867,27 +882,37 @@ __global__ void k_quest_sel(const float* q, const int8_t* lo, const int8_t* hi, 
         if (d == 0) {
             float b = 0.f;
             for (int w = 0; w < nwarp; ++w) b += wsum[w];
-            rowsel[row * n_chunk + c] = __float_as_int(b);
+            rowsel[(size_t) row * n_chunk + c] = __float_as_int(b);
         }
         __syncthreads();   // wsum is reused by the next chunk
     }
-    // The mask: thread 0 of the block walks the row's bounds and keeps the nk largest.  nc is at most 1024 at the
-    // longest context this engine supports, so one thread's insertion is cheap next to the block work above.
-    if (d == 0) {
-        uint8_t* s = sel + (size_t) row * n_chunk;
-        for (int c = 0; c < n_chunk; ++c) s[c] = 0;
-        const int32_t* b = rowsel + (size_t) row * n_chunk;
-        for (int j = 0; j < nk; ++j) {
-            int best = -1;
-            float bv = -INFINITY;
-            for (int c = 0; c < nc; ++c) {
-                if (s[c]) continue;
-                const float v = __int_as_float(b[c]);
-                if (v > bv) { bv = v; best = c; }
-            }
-            if (best < 0) break;
-            s[best] = 1;
+}
+
+/// Quest's pick: the row's best `keep` chunks, from the scores the selection wrote.  grid (n_rows), block 32.
+/// The mask is the row's per-chunk keep list; the attention kernels skip the chunks whose mask is 0.
+__global__ void k_quest_pick(const int32_t* pos0, int t0, int H, const int32_t* rowsel, uint8_t* sel, RowSel rs,
+                             int n_chunk, int keep) {
+    const int row = blockIdx.x;
+    const int t = t0 + row / H;
+    const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
+    const int nc = (npos + kChunkCells - 1) / kChunkCells;
+    const int nk = min(keep, nc);
+    if (threadIdx.x != 0) return;
+    // The mask: one thread walks the row's scores and keeps the nk largest.  nc is at most 1024 at the longest
+    // context this engine supports, so one thread's insertion is cheap next to the block work above.
+    uint8_t* s = sel + (size_t) row * n_chunk;
+    for (int c = 0; c < n_chunk; ++c) s[c] = 0;
+    const int32_t* b = rowsel + (size_t) row * n_chunk;
+    for (int j = 0; j < nk; ++j) {
+        int best = -1;
+        float bv = -INFINITY;
+        for (int c = 0; c < nc; ++c) {
+            if (s[c]) continue;
+            const float v = __int_as_float(b[c]);
+            if (v > bv) { bv = v; best = c; }
         }
+        if (best < 0) break;
+        s[best] = 1;
     }
 }
 
@@ -1943,6 +1968,8 @@ struct Engine {
     int32_t* d_rowsel = nullptr;
     // the per-(chunk, kv head, dim) K bounds of the CURRENT session (load_cur picks the session's)
     std::vector<int8_t*> qkmin, qkmax;
+    // and the per-(chunk, KV head) largest group scale, found when the page was written (k_quest_bounds)
+    std::vector<float*> qksmax;
     int32_t* ami;
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
@@ -2083,6 +2110,11 @@ struct Engine {
         std::fprintf(stderr, "strata-q36: STRATA_Q36_SHARED_GRAPH: %zu layer shared-expert graphs captured\n", n);
     }
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
+    // The host's own time per layer, for the two paths: the graph's launch and the eager mixer it falls back to.
+    // This is the number the feature is after - the decode's host is the critical path (16.3 ms a token, 7.6 of
+    // it the mixer's own enqueues).
+    double mixer_ge_host_ms = 0, mixer_ge_eager_ms = 0;
+    long long mixer_ge_host_n = 0, mixer_ge_eager_n = 0;
 
     // ---- --mtp-adaptive (opt-in): the learned per-depth draft cost and acceptance (EMA), and the D the next
     // speculative step drafts with.  With the flag unset every member below stays at its zero/0.9 value and no
@@ -2172,6 +2204,9 @@ struct Engine {
         // so they are found by scanning a chunk once after it is written, not from the values at store time.
         // Both null unless the flag is on.
         std::vector<int8_t*> qkmin, qkmax;
+        // STRATA_Q36_QUEST=1: per state index, the K cache's per-(chunk, KV head) largest group scale.  It belongs to
+        // the page, not to a row, so it is found once when the page is written; the selection reads it.
+        std::vector<float*> qksmax;
         float* hlast = nullptr;
         int64_t pos = 0;
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
@@ -2940,6 +2975,7 @@ struct Engine {
                 ss.vs8.push_back(nullptr);
                 ss.qkmin.push_back(nullptr);
                 ss.qkmax.push_back(nullptr);
+                ss.qksmax.push_back(nullptr);
                 return;
             }
             ss.kc.push_back(kv_k8 ? nullptr : dalloc(ncells));
@@ -2956,6 +2992,8 @@ struct Engine {
             const size_t nch = (size_t) ((ctx + kChunkCells - 1) / kChunkCells);
             ss.qkmin.push_back(qk ? dalloc_t<int8_t>((size_t) g.n_head_kv * nch * g.head_dim) : nullptr);
             ss.qkmax.push_back(qk ? dalloc_t<int8_t>((size_t) g.n_head_kv * nch * g.head_dim) : nullptr);
+            // the page's largest group scale: one float per (chunk, KV head)
+            ss.qksmax.push_back(qk ? dalloc_t<float>((size_t) g.n_head_kv * nch) : nullptr);
         };
         for (const Layer& L : m->layers) {
             if (L.attn) {
@@ -2987,7 +3025,7 @@ struct Engine {
         Sess& ss = sess[(size_t) cur];
         conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc;
         kc8 = ss.kc8; vc8 = ss.vc8; ks8 = ss.ks8; vs8 = ss.vs8;
-        qkmin = ss.qkmin; qkmax = ss.qkmax;
+        qkmin = ss.qkmin; qkmax = ss.qkmax; qksmax = ss.qksmax;
         hlast = ss.hlast;
         pos = ss.pos;
         ss.used = ++use_clock;
@@ -3835,8 +3873,9 @@ struct Engine {
                 const int nnew = (int) ((p0 + T + kChunkCells - 1) / kChunkCells);
                 const int c0 = (int) (p0 / kChunkCells);
                 if (nnew > c0) {
-                    k_quest_bounds<<<dim3(HKV, nnew - c0), HD, 0, st>>>(kc8[li], qkmin[li], qkmax[li], ks8[li], ctx,
-                                                                        n_chunk, HD, kKVG, c0, (int) (p0 + T));
+                    k_quest_bounds<<<dim3(HKV, nnew - c0), HD, 0, st>>>(kc8[li], qkmin[li], qkmax[li], ks8[li],
+                                                                        qksmax[li], ctx, n_chunk, HD, kKVG, c0,
+                                                                        (int) (p0 + T));
                 }
             }
             if (T > kGemmT) {
@@ -3899,8 +3938,13 @@ struct Engine {
                     // reads every cell, so a request that is still being prompted is unaffected.
                     const uint8_t* selm = nullptr;
                     if (quest_on() && kv_k8) {
-                        k_quest_sel<<<nt * H, HD, 0, st>>>(q, qkmin[li], qkmax[li], ks8[li], dpos, t0, H, HKV, ctx,
-                                                           n_chunk, quest_k(), d_sel, d_rowsel, rs, HD, kKVG);
+                        // the chunks are split over nblk blocks so that the card is not left idle: one token is
+                        // nt*H rows (16 for a single token) and the card has 56 SMs.
+                        const int rows = nt * H;
+                        const int nblk = std::max(1, std::min<int>((56 + rows - 1) / rows, std::max(1, nc / 4)));
+                        k_quest_sel<<<dim3(nblk, rows), HD, 0, st>>>(q, qkmin[li], qkmax[li], qksmax[li], dpos, t0, H,
+                                                                      HKV, ctx, n_chunk, d_rowsel, rs, HD, kKVG);
+                        k_quest_pick<<<rows, 32, 0, st>>>(dpos, t0, H, d_rowsel, d_sel, rs, n_chunk, quest_k());
                         selm = d_sel;
                     }
                     kv4([&](auto k8c, auto v8c) {
