@@ -848,6 +848,88 @@ bool grow(uint16_t*& p, int64_t& have, int64_t want) {   // `have`, `want`: 2-by
     return true;
 }
 constexpr int64_t kXSliceElems = 16ll << 20;   // 32 MiB of FP16 activations per slice (64 MiB as fp32)
+// Y's rows, written by an FP16-out GEMM as FP16 at the start of each FP32 row (ldc = 2 ldy halves), widened in place
+// (STRATA_DENSE_F16_ACC).  Float c overwrites halves 2c and 2c+1, so a row is walked from its end in blocks: a
+// block's halves are read into registers, the block syncs, then writes its floats - which only cover halves of
+// blocks already read.
+__global__ void widen_rows_f16_cuda(float* __restrict__ Y, int64_t n, int64_t ldy) {
+    float* y = Y + (int64_t) blockIdx.x * ldy;
+    const __half* h = reinterpret_cast<const __half*>(y);
+    const int64_t nb = (n + blockDim.x - 1) / blockDim.x;
+    for (int64_t b = nb - 1; b >= 0; --b) {
+        const int64_t c = b * blockDim.x + threadIdx.x;
+        const float v = c < n ? __half2float(h[c]) : 0.0f;
+        __syncthreads();
+        if (c < n) y[c] = v;
+        __syncthreads();
+    }
+}
+// STRATA_DENSE_F16_ACC=1: the dense projections accumulate in FP16.  On a Pascal card the tensor cores run that
+// product at twice the FP32-accumulate rate, and the dense projections are the prompt's biggest block.
+// MEASURED on a P100 (CUDA 12.8, the model's own shapes, 2026-10-26): 11.5-15.5 TFLOP/s against the engine's
+// 6.5-7.5 (gemmacc-rank).  The same probe series found NO FP32-accumulate kernel faster than cuBLAS's default (the
+// tensor-core algorithm and cuBLASLt's heuristics both land on it, bit for bit), so this is the only prompt-side GEMM
+// lever there is.
+//
+// THE PRICE IS THE ACCUMULATION'S PRECISION: 0.36-0.38% rms against the fp32-accumulate result on the same operands,
+// and the output is FP16 too (cuBLAS takes no FP32 output with an FP16 compute) - the widening below turns it back
+// into floats, which is the output's own rounding and is small beside that.
+//
+// Off by default: with it off the products are the ones the fp32-accumulate path has always made.  Pascal only -
+// the cards below that lack the FP16 tensor cores, and above it the fp32-accumulate call already runs at the
+// same rate (its tensor cores have both).
+bool dense_f16_acc_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_DENSE_F16_ACC");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!env) return false;
+    const int cc = current_cc();
+    return cc >= 60 && cc < 70;
+}
+// The FP16-accumulate algorithm for a shape and a chunk size (kDenseAccNone: no entry, the ordinary path runs).
+//
+// MEASURED on a P100 (sm_60, CUDA 12.8, 2026-10-26, gemmacc-table): the fastest algorithm moves with the shape AND
+// the chunk size - and so does its ERROR.  The algorithms that split the K sum inside the FP16 accumulator (ALGO 1, 2,
+// 3) carry 1.2-1.35% rms against the fp32-accumulate result, and 15% on the K 4096 shape; ALGO 4, 5 and 6 carry the
+// 0.36% of a plain FP16 sum.  So only the latter are listed: the price of this path is that one error, and a bigger
+// one is not a trade worth making.
+//
+// Only the entries that beat the engine's own path are here; every other shape and chunk size keeps it.  The band is
+// the chunk size the entry was measured at; a chunk between two bands takes the smaller one's entry.
+constexpr int kDenseAccNone = -2;   // CUBLAS_GEMM_DEFAULT is -1 itself, so "no entry" needs its own value
+struct DenseAccEntry { int64_t n, k; int64_t t_min; cublasGemmAlgo_t algo; };
+const DenseAccEntry kDenseAcc[] = {
+    // T 512: the chunk the pp512 benchmark reads
+    {8192, 2048, 512, CUBLAS_GEMM_ALGO6},   // the GDN's attn_qkv, the attention's attn_q       (1.67x)
+    {4096, 2048, 512, CUBLAS_GEMM_ALGO6},   // the GDN's attn_gate, the attention's attn_output  (1.91x)
+    {2048, 4096, 512, CUBLAS_GEMM_ALGO6},   // the GDN's ssm_out                                 (1.77x)
+    {512, 2048, 512, CUBLAS_GEMM_ALGO4},    // the attention's attn_k / attn_v                    (1.22x)
+    // T 1024
+    {8192, 2048, 1024, CUBLAS_GEMM_ALGO6},  // 1.70x
+    {4096, 2048, 1024, CUBLAS_GEMM_ALGO6},  // 1.78x
+    {2048, 4096, 1024, CUBLAS_GEMM_ALGO6},  // 2.05x
+    {512, 2048, 1024, CUBLAS_GEMM_DEFAULT}, // 1.40x
+    // T 2048
+    {8192, 2048, 2048, CUBLAS_GEMM_ALGO6},  // 1.59x
+    {4096, 2048, 2048, CUBLAS_GEMM_ALGO6},  // 1.88x
+    {2048, 4096, 2048, CUBLAS_GEMM_ALGO6},  // 1.93x
+    {512, 2048, 2048, CUBLAS_GEMM_ALGO5},   // 1.66x
+    // T under 512: the shapes compress differently, and the narrow one loses on every algorithm
+    {8192, 2048, 128, CUBLAS_GEMM_ALGO5},   // 1.31x
+    {4096, 2048, 128, CUBLAS_GEMM_ALGO5},   // 1.29x
+    {2048, 4096, 128, CUBLAS_GEMM_ALGO5},   // 1.38x
+};
+int dense_acc_algo(int64_t N, int64_t K, int64_t T) {
+    int best = kDenseAccNone;
+    int64_t best_t = -1;
+    for (const DenseAccEntry& e : kDenseAcc) {
+        if (e.n != N || e.k != K || T < e.t_min || e.t_min <= best_t) continue;
+        best = (int) e.algo;
+        best_t = e.t_min;
+    }
+    return best;
+}
 
 #if defined(STRATA_EXPERIMENTAL_SM60)
 // ---- Pascal, opt-in (STRATA_DENSE_F32=1): the dense projections' FP16-operand GEMMs as cublasSgemm ----------------
@@ -1219,6 +1301,41 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     if (rdna2_sgemm(X, W, Y, T, N, K, ldy, beta, false)) return;
 #endif
 #if !defined(__HIPCC__)
+    // STRATA_DENSE_F16_ACC=1: THE DENSE PROJECTIONS ACCUMULATE IN FP16.  On a Pascal card the tensor cores run the
+    // FP32-accumulate product at half the FP16-accumulate rate, and the dense projections are the prompt's biggest
+    // block (the mixer's 6.8 ms of the layer's 14.5, measured 2026-10-26 on the P100).  With this the prompt's GEMMs
+    // run at 12-13 TFLOP/s instead of 6.5-7.3 - about twice as fast.
+    //
+    // THE PRICE IS PRECISION, and it is the accumulation's: 0.36-0.38% rms against the fp32-accumulate result on the
+    // model's own shapes (measured 2026-10-26, gemmacc-table).  The output is FP16 too (cuBLAS takes no FP32 output
+    // with an FP16 compute), which the in-place widening below turns back into floats - that part is the output's own
+    // rounding and is small beside that.
+    //
+    // So this is a flag for a user who wants the speed, not the default: with it off the products are the ones the
+    // fp32-accumulate path has always made.  The gfx11 path writes an FP16 output with an FP32 compute (the
+    // precision of the accumulation is not changed there); this one changes both.
+    //
+    // The algorithm is per shape and per chunk size (dense_acc_algo): the fastest one moves with both, and so does
+    // its error - the table keeps only the algorithms that carry the 0.36% error.
+    if (beta == 0.0f && dense_f16_acc_on()) {
+        const int algo = dense_acc_algo(N, K, T);
+        // The FP16 output has to land in the FP32 buffer Y, at the start of each row: ldc = 2 ldy halves.  That is
+        // only the row's own width when ldy is N - a padded row (the gfx11 path's ZV + ZV_PAD) has its next row's
+        // halves inside the stride, so those keep the ordinary path.
+        if (algo != kDenseAccNone && ldy == N) {
+            const __half hone = __float2half(1.0f), hzero = __float2half(0.0f);
+            const cublasStatus_t st = cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T,
+                                                    (int) K, &hone, W, CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K,
+                                                    &hzero, Y, CUDA_R_16F, (int) (2 * ldy), CUBLAS_COMPUTE_16F,
+                                                    (cublasGemmAlgo_t) algo);
+            if (st == CUBLAS_STATUS_SUCCESS) {
+                // the FP16 result sits at the start of each FP32 row; widen_rows_f16_cuda turns it back into floats
+                widen_rows_f16_cuda<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy);
+                return;
+            }
+            cudaGetLastError();   // this algorithm refused the shape: the ordinary path below
+        }
+    }
     const auto f16_gemm = [&](cublasGemmAlgo_t algo) {
         return cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha,
                             W, CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
