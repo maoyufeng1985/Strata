@@ -8738,20 +8738,21 @@ int strata::qwen35::run(int argc, char** argv) {
             }
             // STRATA_Q36_QUEST_TIMING=1: the Quest kernels' own times, from the events of the last decode step.
             // The four events per layer hold one step's times, so the sums over the layers ARE the per-token cost.
-            if (E.q_timing) {
-                CK(cudaStreamSynchronize(E.st));
-                double qb = 0, qs = 0;
-                long long qn = 0;
-                for (size_t li = 0; li < E.m->layers.size(); ++li) {
-                    float x = 0.f, y = 0.f;
-                    if (cudaEventElapsedTime(&x, E.q_ev[4 * li + 0], E.q_ev[4 * li + 1]) == cudaSuccess) { qb += x; ++qn; }
-                    if (cudaEventElapsedTime(&y, E.q_ev[4 * li + 1], E.q_ev[4 * li + 2]) == cudaSuccess) qs += y;
-                }
-                std::fprintf(stderr,
-                             "strata-q36 PHASE3 AGG QUEST: the bounds %.3f ms/token, the select+pick %.3f ms/token "
-                             "(%lld layers with bounds)\n",
-                             qb, qs, qn);
+            // This is OUTSIDE the helper timing block: the probe is its own flag and must work on its own.
+        }
+        if (E.q_timing && bench_tg > 0) {
+            CK(cudaStreamSynchronize(E.st));
+            double qb = 0, qs = 0;
+            long long qn = 0;
+            for (size_t li = 0; li < E.m->layers.size(); ++li) {
+                float x = 0.f, y = 0.f;
+                if (cudaEventElapsedTime(&x, E.q_ev[4 * li + 0], E.q_ev[4 * li + 1]) == cudaSuccess) { qb += x; ++qn; }
+                if (cudaEventElapsedTime(&y, E.q_ev[4 * li + 1], E.q_ev[4 * li + 2]) == cudaSuccess) qs += y;
             }
+            std::fprintf(stderr,
+                         "strata-q36 PHASE3 AGG QUEST: the bounds %.3f ms/token, the select+pick %.3f ms/token "
+                         "(%lld layers with bounds)\n",
+                         qb, qs, qn);
         }
         // STRATA_Q36_MIXER_SPLIT=1: the mixer's two branches, timed apart, over the three bench passes.  The
         // per-layer means are the sums divided by the branch's own call count, and the per-token means are the sums
