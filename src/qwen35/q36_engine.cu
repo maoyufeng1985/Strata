@@ -544,7 +544,7 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
 template <bool KI8, bool VI8>
 __global__ void k_attn_part(const float* q, const void* kc, const void* vc, const __half* ks, const __half* vs,
                             const int32_t* pos0, int t0, int H, int HKV, int ctx, float scale, int n_chunk,
-                            float* pacc, float* pm, float* pl, RowSel rs) {
+                            float* pacc, float* pm, float* pl, RowSel rs, const uint8_t* sel = nullptr) {
     constexpr int HD = 256;
     __shared__ float qs[HD], sc[kChunkCells], sh[kThreads];
     __shared__ float wv[HD / kKVG][kChunkCells];   // VI8: sc[k] * the V group's scale, once per block
@@ -565,6 +565,10 @@ __global__ void k_attn_part(const float* q, const void* kc, const void* vc, cons
     }
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
+    // STRATA_Q36_QUEST: a chunk the selection dropped is skipped here, before any K / V byte is read - this
+    // early return IS the whole saving (the grid is unchanged, the block simply reads nothing).  `sel` null,
+    // which is every run of the shipped default, leaves the test out.
+    if (sel && !sel[(size_t) row * n_chunk + c]) return;
     const int j = threadIdx.x;
     qs[j] = q[((size_t) t * H + h) * HD + j];
     __syncthreads();
@@ -641,7 +645,7 @@ __global__ void k_attn_part(const float* q, const void* kc, const void* vc, cons
 template <bool KI8, bool VI8, int GB>
 __global__ void k_attn_part_gqa(const float* q, const void* kc, const void* vc, const __half* ks, const __half* vs,
                                 const int32_t* pos0, int t0, int H, int HKV, int ctx, float scale, int n_chunk,
-                                float* pacc, float* pm, float* pl, RowSel rs) {
+                                float* pacc, float* pm, float* pl, RowSel rs, const uint8_t* sel = nullptr) {
     constexpr int HD = 256;
     // GB is the group's size: the block serves ALL the query heads of one KV head, so the group is exactly
     // GB heads and the query head of slot g is `kvh * GB + g` - the same numbering the one-head kernel used
@@ -667,11 +671,15 @@ __global__ void k_attn_part_gqa(const float* q, const void* kc, const void* vc, 
     }
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
-    const int j = threadIdx.x;
     // The partial accumulator, the max and the sum are indexed by the LOCAL row (the old kernel's `row` was
     // blockIdx.y, and k_attn_merge reads the same local index), so the row here must be the local one too:
     // the local token is `blockIdx.y / HKV` and the query head is `g0 + g`.
     const int lt = blockIdx.y / HKV;   // the local token
+    // STRATA_Q36_QUEST: same early return as the one-head kernel above.  The mask is per (query row, chunk) and
+    // k_quest_sel writes one row per query head, so the index is this block's FIRST query head's row - the other
+    // GB-1 heads of the group see the same KV head and so the same mask.
+    if (sel && !sel[(size_t) (lt * H + g0) * n_chunk + c]) return;
+    const int j = threadIdx.x;
 #pragma unroll
     for (int g = 0; g < GB; ++g) qs[g][j] = q[((size_t) t * H + g0 + g) * HD + j];
     __syncthreads();
@@ -780,17 +788,126 @@ __global__ void k_attn_part_gqa(const float* q, const void* kc, const void* vc, 
         }
     }
 }
-/// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
+/// Quest's per-page K bounds: for one (chunk, KV head), for every dim, the smallest and largest int8 code over the
+/// chunk's cells.  grid (n_kv_heads, n_chunk), block HD.  Runs after k_attn_prep has stored the chunk's codes, so
+/// the bounds describe what the attention will actually read (an int8 code, not the FP32 value it came from).
+///
+/// Why the codes and not the values: the score k_quest_sel computes is an upper bound on |q . k| over the page.
+/// With codes c and their group scale s (one per kKVG codes, so s is the same for a whole dim across a cell but
+/// varies cell to cell) the true term is q[i] * c[i] * s(cell), so bounding c per dim while taking the LARGEST s
+/// in the page keeps the bound valid.  Doing it on the stored codes therefore needs no extra assumption.
+__global__ void k_quest_bounds(const int8_t* kc, int8_t* lo, int8_t* hi, const __half* ks, int ctx, int n_chunk,
+                               int HD, int kKVG_, int c0, int nwritten) {
+    const int kh = blockIdx.x, c = c0 + blockIdx.y, d = threadIdx.x;   // c is the ABSOLUTE chunk index
+    const int p0 = c * kChunkCells;
+    // Only the cells that have actually been written are scanned: a chunk past the end of the KV written so far
+    // would otherwise bound uninitialized codes (harmless for a read, but the bounds would be meaningless and the
+    // selection would then rank noise).
+    const int n = max(0, min(kChunkCells, nwritten - p0));
+    int mn = 127, mx = -127;
+    for (int k = 0; k < n; ++k) {
+        const int v = (int) kc[((size_t) kh * ctx + p0 + k) * HD + d];
+        mn = min(mn, v);
+        mx = max(mx, v);
+    }
+    const size_t o = ((size_t) kh * n_chunk + c) * HD + d;
+    lo[o] = (int8_t) mn;
+    hi[o] = (int8_t) mx;
+}
+
+/// Quest's selection: for one query row, the upper bound of what each K chunk can contribute, then the top-K chunks
+/// kept.  grid (n_rows), block kThreads.
+///
+/// The bound (Quest, arXiv 2406.10774): for a page of codes bounded per dim by [lo, hi], the largest the score
+///   s = sum_i q[i] * code[i] * scale
+/// can be is  sum_i max(q[i] * lo[i], q[i] * hi[i]) * smax
+/// whatever the cell: that is the score's own definition bounded term by term.  smax is the largest group scale in
+/// the page, and taking the largest is what keeps the bound on the safe side.  The exponent then lies in
+/// [0, exp(bound - m)] for ANY m at or above the true max, so ordering pages by this bound orders them by the most
+/// they can possibly add - a page that is not in the top K by this measure cannot hold the largest score unless
+/// another page's bound overestimates more than it does.  That is the approximation the flag buys: it is not exact.
+__global__ void k_quest_sel(const float* q, const int8_t* lo, const int8_t* hi, const __half* ks,
+                            const int32_t* pos0, int t0, int H, int HKV, int ctx, int n_chunk, int keep,
+                            uint8_t* sel, int32_t* rowsel, RowSel rs, int HD, int kKVG_) {
+    const int row = blockIdx.x;
+    const int t = t0 + row / H, h = row % H, kvh = h / (H / HKV), d = threadIdx.x;
+    const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
+    const int nc = (npos + kChunkCells - 1) / kChunkCells;
+    const int nk = min(keep, nc);
+    const int nsg = HD / kKVG_;
+    const int lane = d & 31, warp = d >> 5, nwarp = blockDim.x >> 5;
+    __shared__ float qs[256];
+    __shared__ float wsum[32];
+    if (d < HD) qs[d] = q[((size_t) t * H + h) * HD + d];
+    __syncthreads();
+    const float qd = qs[d];
+    // The chunks are walked by the whole block, but each chunk's bound is a WARP reduction: every thread holds
+    // eight of the 256 dims (warp * 8), sums them itself, and the block only reduces 8 warp totals - one
+    // __syncthreads per chunk instead of nc barriers and a 256-level tree.
+    // (The first version ran a 256-level tree per chunk with every thread scanning every cell's scale for smax:
+    // nc tree reductions plus nc barriers per layer per row, measured 3x slower than the dense read it saves.)
+    for (int c = 0; c < nc; ++c) {
+        const int p0 = c * kChunkCells;
+        const int n = min(kChunkCells, npos - p0);
+        // The page's largest scale: it depends on (chunk, kv head) only.  Scanned by the WHOLE warp (32 lanes
+        // cover the cells, then one __shfl reduction) - one lane walking all 1024 scales was 32x slower and
+        // measured worse than the dense path it was meant to beat.
+        const __half* ksp = ks + ((size_t) kvh * ctx + p0) * nsg;
+        float sm = 0.f;
+        for (int x = lane; x < n * nsg; x += 32) sm = fmaxf(sm, __half2float(ksp[x]));
+        for (int st = 16; st > 0; st >>= 1) sm = fmaxf(sm, __shfl_xor_sync(0xffffffffu, sm, st));
+        // This thread's share of the bound: blockDim is HD == 256, so thread d owns exactly dim d, and the block
+        // reduces 8 warp totals (each warp's 32 dims summed through __shfl).
+        (void) nwarp;
+        const size_t o = ((size_t) kvh * n_chunk + c) * HD + d;
+        float part = fmaxf(qd * (float) lo[o], qd * (float) hi[o]);
+        for (int st = 16; st > 0; st >>= 1) part += __shfl_xor_sync(0xffffffffu, part, st);
+        if (lane == 0) wsum[warp] = part * sm;
+        __syncthreads();
+        if (d == 0) {
+            float b = 0.f;
+            for (int w = 0; w < nwarp; ++w) b += wsum[w];
+            rowsel[row * n_chunk + c] = __float_as_int(b);
+        }
+        __syncthreads();   // wsum is reused by the next chunk
+    }
+    // The mask: thread 0 of the block walks the row's bounds and keeps the nk largest.  nc is at most 1024 at the
+    // longest context this engine supports, so one thread's insertion is cheap next to the block work above.
+    if (d == 0) {
+        uint8_t* s = sel + (size_t) row * n_chunk;
+        for (int c = 0; c < n_chunk; ++c) s[c] = 0;
+        const int32_t* b = rowsel + (size_t) row * n_chunk;
+        for (int j = 0; j < nk; ++j) {
+            int best = -1;
+            float bv = -INFINITY;
+            for (int c = 0; c < nc; ++c) {
+                if (s[c]) continue;
+                const float v = __int_as_float(b[c]);
+                if (v > bv) { bv = v; best = c; }
+            }
+            if (best < 0) break;
+            s[best] = 1;
+        }
+    }
+}
+
+/// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.  `sel` null (the default) merges every chunk
+/// up to the row's position; under STRATA_Q36_QUEST it is the row's per-chunk keep mask and only the kept chunks
+/// are merged - the skipped chunks' pm is left as the previous call wrote it, so it must not be read.
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
-                             const int32_t* pos0, int t0, int H, int n_chunk, float* out, RowSel rs) {
+                             const int32_t* pos0, int t0, int H, int n_chunk, float* out, RowSel rs,
+                             const uint8_t* sel = nullptr) {
     constexpr int HD = 256;
     const int row = blockIdx.x, t = t0 + row / H, h = row % H, d = threadIdx.x;
     const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
     const int nc = (npos + kChunkCells - 1) / kChunkCells;
+    const uint8_t* s = sel ? sel + (size_t) row * n_chunk : nullptr;
     float M = -INFINITY;
-    for (int c = 0; c < nc; ++c) M = fmaxf(M, pm[(size_t) row * n_chunk + c]);
+    for (int c = 0; c < nc; ++c)
+        if (!s || s[c]) M = fmaxf(M, pm[(size_t) row * n_chunk + c]);
     float num = 0.f, den = 0.f;
     for (int c = 0; c < nc; ++c) {
+        if (s && !s[c]) continue;
         const size_t o = (size_t) row * n_chunk + c;
         const float w = expf(pm[o] - M);
         num += w * pacc[o * HD + d];
@@ -1820,6 +1937,12 @@ struct Engine {
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
     unsigned long long* grp_ptr;
     float *pacc, *pm, *pl, *amv;
+    // STRATA_Q36_QUEST: per attention call, the rows' per-chunk keep masks (d_sel) and the bounds the selection
+    // worked from (d_rowsel, only touched while the flag is on).  Both null unless the flag is set.
+    uint8_t* d_sel = nullptr;
+    int32_t* d_rowsel = nullptr;
+    // the per-(chunk, kv head, dim) K bounds of the CURRENT session (load_cur picks the session's)
+    std::vector<int8_t*> qkmin, qkmax;
     int32_t* ami;
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
@@ -2044,6 +2167,11 @@ struct Engine {
         // FP32 leaves its kc / vc pointing at the values and these null; an int8 store is the reverse.
         std::vector<int8_t*> kc8, vc8;
         std::vector<__half*> ks8, vs8;
+        // STRATA_Q36_QUEST=1: per state index, the K cache's per-(chunk, kv head, dim) int8 min and max.  Quest's
+        // page score is an upper bound on the page's contribution (see k_quest_sel); the bounds are on the CODES,
+        // so they are found by scanning a chunk once after it is written, not from the values at store time.
+        // Both null unless the flag is on.
+        std::vector<int8_t*> qkmin, qkmax;
         float* hlast = nullptr;
         int64_t pos = 0;
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
@@ -2598,6 +2726,22 @@ struct Engine {
     /// at ~8256 7.6%, at ~32832 50%.  The crossing sits between 576 and 4160; 2048 is the conservative side of it
     /// (the cost model's fit says 2048 is about break-even, and being wrong there costs ~1% rather than 3%).
     static constexpr int64_t kAttnGqaMinCells = 2048;
+    /// STRATA_Q36_QUEST=K (opt-in): the decode attention reads only the K chunks a cheap upper bound says can
+    /// matter, instead of every chunk up to the query's position.  K is how many chunks per query row (0 = off,
+    /// the shipped default and byte for byte the old path).  See k_quest_sel for the bound and the `sel` argument
+    /// of k_attn_part / k_attn_merge for how the mask is applied.  This is an APPROXIMATION - unlike the GQA
+    /// sharing it changes the numbers - so it is never on by default and the quality cost has to be measured
+    /// before it is used.
+    static int quest_k() {
+        static const int n = [] {
+            const char* v = std::getenv("STRATA_Q36_QUEST");
+            if (!v || v[0] == '\0') return 0;
+            const int x = std::atoi(v);
+            return x > 0 ? x : 0;
+        }();
+        return n;
+    }
+    static bool quest_on() { return quest_k() > 0; }
     bool gpu_timing = false;      // helper_timing() and every event exists (see open_engine)
     // STRATA_Q36_MIXER_SPLIT=1: the mixer's two branches timed apart - the attention layers and the GDN layers.
     // The 8-segment decode timeline has one "attn_ssm" segment that covers both (30 GDN layers and 10 attention
@@ -2794,6 +2938,8 @@ struct Engine {
                 ss.vc8.push_back(nullptr);
                 ss.ks8.push_back(nullptr);
                 ss.vs8.push_back(nullptr);
+                ss.qkmin.push_back(nullptr);
+                ss.qkmax.push_back(nullptr);
                 return;
             }
             ss.kc.push_back(kv_k8 ? nullptr : dalloc(ncells));
@@ -2802,6 +2948,14 @@ struct Engine {
             ss.vc8.push_back(kv_v8 ? dalloc_t<int8_t>(ncells) : nullptr);
             ss.ks8.push_back(kv_k8 ? dalloc_t<__half>(nscales) : nullptr);
             ss.vs8.push_back(kv_v8 ? dalloc_t<__half>(nscales) : nullptr);
+            // the Quest bounds: one int8 min and one int8 max per (chunk, kv head, dim); only with the flag on,
+            // and only for a K store whose codes they describe (an FP32 K has no codes to bound).
+            // n_chunk is (ctx + kChunkCells - 1) / kChunkCells and is set later in open_engine, so it is derived
+            // from the context here rather than read from the member.
+            const bool qk = quest_on() && kv_k8;
+            const size_t nch = (size_t) ((ctx + kChunkCells - 1) / kChunkCells);
+            ss.qkmin.push_back(qk ? dalloc_t<int8_t>((size_t) g.n_head_kv * nch * g.head_dim) : nullptr);
+            ss.qkmax.push_back(qk ? dalloc_t<int8_t>((size_t) g.n_head_kv * nch * g.head_dim) : nullptr);
         };
         for (const Layer& L : m->layers) {
             if (L.attn) {
@@ -2833,6 +2987,7 @@ struct Engine {
         Sess& ss = sess[(size_t) cur];
         conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc;
         kc8 = ss.kc8; vc8 = ss.vc8; ks8 = ss.ks8; vs8 = ss.vs8;
+        qkmin = ss.qkmin; qkmax = ss.qkmax;
         hlast = ss.hlast;
         pos = ss.pos;
         ss.used = ++use_clock;
@@ -2995,6 +3150,10 @@ struct Engine {
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
+        if (quest_on()) {   // the selection's mask and the bounds it works from, one entry per (row, chunk)
+            d_sel = dalloc_t<uint8_t>((size_t) att_rows * n_chunk);
+            d_rowsel = dalloc_t<int32_t>((size_t) att_rows * n_chunk);
+        }
         // The K / V caches belong to the sessions (alloc_session): conv / S / kc / vc / kc8 / vc8 / ks8 / vs8 are
         // the CURRENT session's, load_cur() swaps them.  Only the verify windows' GDN inputs are one set here,
         // whichever session runs.
@@ -3666,6 +3825,20 @@ struct Engine {
                     K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base,
                     m->eps, d_delta, mtab_now, rs);
             });
+            // STRATA_Q36_QUEST: refresh the K bounds of the chunks k_attn_prep just wrote, then (below, in the
+            // split-K branch) let each query row keep only the best `keep` chunks.  Only the chunks this call
+            // touched are rescanned: the ones before them were bounded by an earlier call and still hold.
+            // A prompt chunk lands here too (its K was just written), and its bounds are what the decode that
+            // follows reads, so they must be refreshed there as well - see the n below, which stops at the cells
+            // this call actually wrote.
+            if (quest_on() && kv_k8 && !rows_mode) {
+                const int nnew = (int) ((p0 + T + kChunkCells - 1) / kChunkCells);
+                const int c0 = (int) (p0 / kChunkCells);
+                if (nnew > c0) {
+                    k_quest_bounds<<<dim3(HKV, nnew - c0), HD, 0, st>>>(kc8[li], qkmin[li], qkmax[li], ks8[li], ctx,
+                                                                        n_chunk, HD, kKVG, c0, (int) (p0 + T));
+                }
+            }
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -3721,12 +3894,25 @@ struct Engine {
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
+                    // STRATA_Q36_QUEST: the rows of this batch keep their best `keep` chunks.  Only the decode side
+                    // (the split-K branch) uses the mask; a prompt chunk goes through the GEMM path above, which
+                    // reads every cell, so a request that is still being prompted is unaffected.
+                    const uint8_t* selm = nullptr;
+                    if (quest_on() && kv_k8) {
+                        k_quest_sel<<<nt * H, HD, 0, st>>>(q, qkmin[li], qkmax[li], ks8[li], dpos, t0, H, HKV, ctx,
+                                                           n_chunk, quest_k(), d_sel, d_rowsel, rs, HD, kKVG);
+                        selm = d_sel;
+                    }
                     kv4([&](auto k8c, auto v8c) {
                         constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
                         // STRATA_Q36_ATTN_GQA=N: the group-shared shape (one block per KV head, the group's N query
-                        // heads share the K / V read).  The old kernel is the default and stays byte for byte.
+                        // heads share the K / V read).  N unset or -1 is the automatic rule (the context the
+                        // decode will read decides), 0 forces the old kernel, 2/4/8 force the shared one.
                         // The shared kernel serves a WHOLE group, so it needs H == N * HKV; anything else falls
                         // back to the old kernel (the group would not divide).
+                        // The automatic rule reads the same `nc` the launch is about to use, so it is the actual
+                        // chunk count of this call, not the allocated context: the last chunk of a long context
+                        // and a short prompt both come out right.
                         const int cfg = attn_gqa();
                         const int gb = cfg == 0 ? 0
                                       : cfg > 0 ? cfg
@@ -3741,7 +3927,7 @@ struct Engine {
                                     V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
                                           : (rows_mode ? nullptr : (const void*) vc[li]),
                                     K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
-                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, selm);
                             } else if (gb == 4) {
                                 k_attn_part_gqa<K8, V8, 4><<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
                                     q, K8 ? (rows_mode ? nullptr : (const void*) kc8[li])
@@ -3749,7 +3935,7 @@ struct Engine {
                                     V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
                                           : (rows_mode ? nullptr : (const void*) vc[li]),
                                     K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
-                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, selm);
                             } else {
                                 k_attn_part_gqa<K8, V8, 8><<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
                                     q, K8 ? (rows_mode ? nullptr : (const void*) kc8[li])
@@ -3757,7 +3943,7 @@ struct Engine {
                                     V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
                                           : (rows_mode ? nullptr : (const void*) vc[li]),
                                     K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
-                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, selm);
                             }
                         } else {
                             k_attn_part<K8, V8><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(
@@ -3766,14 +3952,14 @@ struct Engine {
                                 V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
                                       : (rows_mode ? nullptr : (const void*) vc[li]),
                                 K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
-                                1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                                1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs, selm);
                         }
                     });
                     // STRATA_Q36_MIXER_SPLIT=1: the split kernel's exit, so the merge's own time can be told from
                     // the split kernel's.  The merge walks the chunks serially in one block per row, so at a long
                     // context it is a second cost beside the split kernel's.
                     if (mx_timing) CK(cudaEventRecord(mx_ev[2], st));
-                    k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
+                    k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs, selm);
                     if (mx_timing) {
                         CK(cudaEventRecord(mx_ev[3], st));
                         CK(cudaEventSynchronize(mx_ev[3]));
