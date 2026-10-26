@@ -7730,6 +7730,17 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
         else if (a == "--tokens") tokens = next();
+        else if (a == "--tokens-file") {
+            // The ids from a file instead of the command line: one argv slot holds 128 KB (MAX_ARG_STRLEN) and a
+            // long prompt's ids do not fit in that (32779 ids = 159 KB).  The file holds the same comma separated
+            // list --tokens takes.  Off unless asked for, so the default path is unchanged.
+            FILE* f = std::fopen(next().c_str(), "rb");
+            if (!f) { std::fprintf(stderr, "strata-q36: cannot read the tokens file\n"); return 2; }
+            char buf[4096];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) tokens.append(buf, n);
+            std::fclose(f);
+        }
         else if (a == "--n") n_gen = std::atoi(next().c_str());
         else if (a == "--force") force = next();
         else if (a == "--emb") emb_file = next();   // --tokens with pictures: a strata-vision file (the ids carry <|image_pad|> runs)
@@ -7784,8 +7795,8 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr,
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--kv fp32|int8|k8v32|"
                          "k32v8] [--no-graph]\n"
-                         "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
-                         "--bench-tg N)\n");
+                         "       (--serve | --tokens IDS | --tokens-file F [--n 64] [--force IDS] [--dump-full-logits F] | "
+                         "--bench-pp N --bench-tg N)\n");
             return 2;
         }
     }
