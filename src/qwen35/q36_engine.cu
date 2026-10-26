@@ -2110,6 +2110,123 @@ struct Engine {
         std::fprintf(stderr, "strata-q36: STRATA_Q36_SHARED_GRAPH: %zu layer shared-expert graphs captured\n", n);
     }
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
+    /// STRATA_Q36_MIXER_GRAPH=1 (opt-in): the mixer's kernels replayed from a per-layer CUDA graph.
+    ///
+    /// WHY IT EXISTS (MEASURED 2026-10-27, 192.168.1.98, the peer path on, --bench-pp 512 --bench-tg 64):
+    /// the decode's HOST is the critical path.  The host's own time is 16.3 ms per token (7.6 of it the mixer's
+    /// own enqueues, 191 us a layer) while the GPU's tile is 0.43 ms a layer, and the GPU waits 4.2 ms per token
+    /// for the host.  The whole forward cannot be one graph (the host has to read the route between the layers:
+    /// the helpers need it), but the mixer's kernels do not depend on the route - they are the same kernels with
+    /// the same shapes for every decode step, so they can be captured once per layer and replayed.
+    ///
+    /// WHAT IT DOES NOT CHANGE: the kernels, their order and their data are the eager path's, so the numbers are
+    /// the eager path's.  The graph is captured with graph_mode (the whole context's chunk grid, the past-the-end
+    /// chunks returning at once), which is what makes it position-independent.
+    ///
+    /// The per-session storage: the mixer's K / V / state pointers are the session's, so a graph belongs to the
+    /// session it was captured in.  The capture is lazy (the first decode step of a session) and per layer.
+    static bool mixer_graph_flag() {
+        static const bool v = [] {
+            const char* e = std::getenv("STRATA_Q36_MIXER_GRAPH");
+            return e && e[0] == '1' && e[1] == '\0';
+        }();
+        return v;
+    }
+    std::vector<std::vector<cudaGraphExec_t>> mixer_ge;   // [session][layer]
+    std::vector<std::vector<uint8_t>> mixer_ge_gr;        // [session][layer]: the captured grouped_by_route
+    std::vector<std::vector<uint8_t>> mixer_ge_ext;       // [session][layer]: the captured ext
+    std::vector<std::vector<uint8_t>> mixer_ge_xq;        // [session][layer]: the xq_ready the capture saw
+    std::vector<int> mixer_ge_step;                       // [session]: the decode steps done in it
+    std::vector<int> mixer_ge_nc;                         // [session]: the chunk count the graphs were captured with
+    /// The capture happens on the SECOND decode step of a session, not the first.  The reason is the lazy
+    /// allocations: the decode path's first step is the first use of its kernels (the MMQ's workspace, the
+    /// MMVQ's buffers), and a cudaMalloc inside a capture is an error - so the capture would fail on the first
+    /// step and the eager path would be used for the whole run.  The second step's kernels are the same, with
+    /// the same shapes, and the allocations have been made.
+    bool mixer_graph_capture_due(size_t s) const { return mixer_ge_step[s] >= 2; }
+    /// The chunk count a decode step at position p0 reads: the cells up to p0, in 256-cell chunks.  This is the
+    /// eager path's own number (the mixer's `nc` when graph_mode is off), and it is what the captured graph's grid
+    /// is sized by.
+    int mixer_graph_nc(int64_t p0) const {
+        return (int) std::min<int64_t>(n_chunk, (p0 + 1 + kChunkCells - 1) / kChunkCells);
+    }
+    /// Drop a session's graphs.  The chunk count changes every 256 positions, so a long decode re-captures now and
+    /// then; the graphs that are still running are released when their execution ends (the driver keeps them alive
+    /// until then), so no sync is needed here.
+    void mixer_graph_drop(size_t s) {
+        for (size_t i = 0; i < mixer_ge[s].size(); ++i) {
+            if (!mixer_ge[s][i]) continue;
+            cudaGraphExecDestroy(mixer_ge[s][i]);
+            mixer_ge[s][i] = nullptr;
+        }
+    }
+    /// Capture one layer's mixer.  The capture runs the mixer's own code with the decode's shape; the kernels do
+    /// not run during a capture, so the caller runs the mixer for real afterwards (it launches the graph it just
+    /// captured).  xq_ready is saved and put back: the capture consumes it (prep_in clears it) and the real run
+    /// must see the same state.
+    ///
+    /// The capture uses the EAGER grid (graph_mode off), not the whole context's: the mixer's chunk count depends
+    /// on the position, and so does the shape the attention kernel takes (the GQA rule reads the same chunk count:
+    /// one block per KV head once the decode reads 2048 cells, the old kernel below that).  Capturing the eager
+    /// grid keeps the graph's numbers the eager path's; the graph is dropped and captured again when the chunk
+    /// count changes (every 256 positions), so it never spans two different chunk counts.
+    ///
+    /// The host state the capture bakes in is recorded, so a replay can check it: `xq_ready` decides whether
+    /// prep_in quantizes the layer's input or reuses the image the layer before left, and the two are not the
+    /// same bytes (the norm kernel's own image and the quantizer's differ), so a replay whose xq_ready differs
+    /// from the capture's must not run the graph.
+    ///
+    /// A failure is NOT fatal: the flag is opt-in, so a capture that the driver refuses falls back to the eager
+    /// path (and says so once) instead of killing the run.
+    bool mixer_graph_ok = true;
+    bool capture_mixer_graph(size_t li, int64_t p0, const int32_t* dpos, bool hy_rows, bool* gr_out, bool* ext_out) {
+        cudaGraph_t g = nullptr;
+        const bool xq_save = xq_ready;
+        // The GPU timing probe's readings must not happen inside a capture (the records are legal, the readings are
+        // not), so the probe is held for the length of the capture.  The records themselves stay in, so the graph
+        // marks the mixer's boundaries when it is replayed and the probe's numbers are the eager path's.
+        const bool hold_save = gpu_timing_hold;
+        gpu_timing_hold = true;
+        cudaError_t e = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+        if (e != cudaSuccess) {
+            mixer_graph_ok = false;
+            ++mixer_ge_failed;
+            xq_ready = xq_save;
+            gpu_timing_hold = hold_save;
+            return false;
+        }
+        const bool ext = mixer(m->layers[li], li, 1, p0, dpos, false, false, hy_rows, false);
+        e = cudaStreamEndCapture(st, &g);
+        gpu_timing_hold = hold_save;
+        if (e != cudaSuccess || !g) {
+            std::fprintf(stderr, "strata-q36: the mixer graph's capture failed (%s); the eager path is used\n",
+                         cudaGetErrorString(e));
+            mixer_graph_ok = false;
+            ++mixer_ge_failed;
+            xq_ready = xq_save;
+            return false;
+        }
+        cudaGraphExec_t ge = nullptr;
+        e = cudaGraphInstantiate(&ge, g, 0);
+        cudaGraphDestroy(g);
+        if (e != cudaSuccess || !ge) {
+            std::fprintf(stderr, "strata-q36: the mixer graph's instantiate failed (%s); the eager path is used\n",
+                         cudaGetErrorString(e));
+            mixer_graph_ok = false;
+            ++mixer_ge_failed;
+            xq_ready = xq_save;
+            return false;
+        }
+        mixer_ge[(size_t) cur][li] = ge;
+        *gr_out = grouped_by_route;
+        *ext_out = ext;
+        // bit 0: the xq_ready the capture saw (prep_in's branch), bit 1: the xq_post the capture left.
+        mixer_ge_xq[(size_t) cur][li] = (uint8_t) ((xq_save ? 1 : 0) | (xq_post ? 2 : 0));
+        xq_ready = xq_save;
+        ++mixer_ge_captured;
+        return true;
+    }
+    int mixer_ge_captured = 0, mixer_ge_failed = 0;   // the captures that worked and the ones the driver refused
     // The host's own time per layer, for the two paths: the graph's launch and the eager mixer it falls back to.
     // This is the number the feature is after - the decode's host is the critical path (16.3 ms a token, 7.6 of
     // it the mixer's own enqueues).
@@ -2677,6 +2794,18 @@ struct Engine {
         marshal_stop();
         for (auto& gx : shared_ge)
             if (gx) { CK(cudaGraphExecDestroy(gx)); gx = nullptr; }
+        // STRATA_Q36_MIXER_GRAPH=1: the per-layer graphs go here, and the count is said here too, so a run that
+        // decoded without a single capture says so instead of looking like a run whose flag did nothing.
+        for (auto& sess_ge : mixer_ge)
+            for (auto& gx : sess_ge)
+                if (gx) { CK(cudaGraphExecDestroy(gx)); gx = nullptr; }
+        if (mixer_graph_flag())
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_MIXER_GRAPH: %d layer graphs captured, %d captures refused "
+                         "by the driver | the host's mixer: %.3f us a layer over %lld graph launches, %.3f us a layer "
+                         "over %lld eager fallbacks\n",
+                         mixer_ge_captured, mixer_ge_failed,
+                         mixer_ge_host_n ? mixer_ge_host_ms * 1000.0 / (double) mixer_ge_host_n : 0.0, mixer_ge_host_n,
+                         mixer_ge_eager_n ? mixer_ge_eager_ms * 1000.0 / (double) mixer_ge_eager_n : 0.0, mixer_ge_eager_n);
     }
     /// Hand a job to a worker.  The worker owns helper r (r is the helper's index in helpers[]).
     void marshal_post(int r, int kind, size_t li, int T, int Kp, const float* x, const int32_t* ids, float* out) {
@@ -3237,6 +3366,16 @@ struct Engine {
             }
         }
         for (Sess& ss : sess) alloc_session(ss);
+        // STRATA_Q36_MIXER_GRAPH=1: one graph slot per (session, layer).  The graphs themselves are captured
+        // lazily, at the first decode step of their session.
+        if (mixer_graph_flag()) {
+            mixer_ge.assign((size_t) n_sess, std::vector<cudaGraphExec_t>(m->layers.size(), nullptr));
+            mixer_ge_gr.assign((size_t) n_sess, std::vector<uint8_t>(m->layers.size(), 0));
+            mixer_ge_ext.assign((size_t) n_sess, std::vector<uint8_t>(m->layers.size(), 0));
+            mixer_ge_xq.assign((size_t) n_sess, std::vector<uint8_t>(m->layers.size(), 0));
+            mixer_ge_step.assign((size_t) n_sess, 0);
+            mixer_ge_nc.assign((size_t) n_sess, -1);
+        }
         if (m->has_mtp) {   // the MTP block's own buffers (its K / V went with the sessions, in alloc_session)
             mtp_cat = dalloc(T * 2 * N);
             hmtp = dalloc(T * N);
@@ -4091,7 +4230,63 @@ struct Engine {
         // the mixer's kernels: the GDN or the attention branch, the norm, the router and the top-k.  Its own
         // method, so the host's cost of it is one thing (the probe's "mixer" segment) and not a hundred lines
         // inside layer().
-        const bool ext = mixer(L, li, T, p0, dpos, graph_mode, verify, hy_rows, mmq_rows);
+        // STRATA_Q36_MIXER_GRAPH=1: the mixer's kernels come from this layer's graph instead of being launched one
+        // by one.  The conditions are the ones the capture assumed: one token, no verify window, no batch rows, no
+        // vision table, no Quest (its bounds' grid depends on the position), no probe (the probes' marks are
+        // host-side events a graph does not carry), and the forward itself not captured (a graph inside a capture
+        // is not a thing).
+        // The GPU timing probe does NOT combine: its events are recorded inside the mixer, and an event recorded
+        // inside a captured graph cannot be read back with cudaEventElapsedTime (the probe's drain fails).  So the
+        // flag and the probe are exclusive, and the graph's own host time is reported instead (mixer_ge_host_ms).
+        // The MTP block's layer is m->layers[m->layers.size()] (the layer index is one past the main layers), and the
+        // graph slots only cover the main layers, so the MTP layer never uses a graph.
+        const bool mg = mixer_graph_flag() && mixer_graph_ok && !mixer_ge.empty() && T == 1 && !verify && !rows_mode &&
+                        mtab_now == nullptr && !quest_on() && !gpu_timing && !mx_timing && !pp_gpu_timing &&
+                        !verify_k && !use_graph && li < m->layers.size();
+        bool ext;
+        if (mg) {
+            auto& gl = mixer_ge[(size_t) cur];
+            // The chunk count moves every 256 positions, and the captured grid is sized by it, so a graph that
+            // spans two chunk counts would read a different set of chunks than the eager path.  When it changes,
+            // the session's graphs are dropped and captured again (the layers do it as they are reached).
+            const int nc_now = mixer_graph_nc(p0);
+            if (mixer_ge_nc[(size_t) cur] != nc_now) {
+                mixer_graph_drop((size_t) cur);
+                mixer_ge_nc[(size_t) cur] = nc_now;
+            }
+            if (!gl[li] && mixer_graph_capture_due((size_t) cur)) {
+                bool gr = false, ex = false;
+                if (capture_mixer_graph(li, p0, dpos, hy_rows, &gr, &ex)) {
+                    mixer_ge_gr[(size_t) cur][li] = gr ? 1 : 0;
+                    mixer_ge_ext[(size_t) cur][li] = ex ? 1 : 0;
+                }
+            }
+            // the graph baked in the mixer's own host-side branches, so the host state must be the same as when it
+            // was captured: prep_in's xq_ready decides whether the layer's input is quantized (the two ways are
+            // not the same bytes) and add_rms_post's xq_post says the image is already there.  When the state
+            // differs the eager path runs for this layer and this step; the graph stays for the others.
+            const uint8_t xq = gl[li] ? mixer_ge_xq[(size_t) cur][li] : 0;
+            if (gl[li] && (((xq & 1) != 0) == xq_ready)) {
+                // the host's own cost of this layer's mixer: one graph launch instead of a dozen kernel launches
+                const auto t_ge = Clock::now();
+                CK(cudaGraphLaunch(gl[li], st));
+                mixer_ge_host_ms += ms_since(t_ge);
+                ++mixer_ge_host_n;
+                ext = mixer_ge_ext[(size_t) cur][li] != 0;
+                grouped_by_route = mixer_ge_gr[(size_t) cur][li] != 0;
+                // the host flags the graph's kernels cannot set: prep_in cleared xq_ready, add_rms_post left
+                // xq_post as the capture saw it.
+                xq_ready = false;
+                xq_post = (xq & 2) != 0;
+            } else {
+                const auto t_ge = Clock::now();
+                ext = mixer(L, li, T, p0, dpos, graph_mode, verify, hy_rows, mmq_rows);
+                mixer_ge_eager_ms += ms_since(t_ge);
+                ++mixer_ge_eager_n;
+            }
+        } else {
+            ext = mixer(L, li, T, p0, dpos, graph_mode, verify, hy_rows, mmq_rows);
+        }
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         helper_mask_li = -1;   // set below, when this layer's window actually goes to a helper
@@ -4421,6 +4616,11 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+        // STRATA_Q36_MIXER_GRAPH=1: count this session's decode steps.  The per-layer graphs are captured on the
+        // SECOND one: the first decode step is the first use of the decode path's kernels, and a cudaMalloc inside a
+        // capture is an error - so the capture would fail on the first step and the eager path would be used for the
+        // whole run.  The second step's kernels are the same, with the same shapes, and the allocations are made.
+        if (mixer_graph_flag() && T == 1 && !verify && !mixer_ge_step.empty()) ++mixer_ge_step[(size_t) cur];
         // STRATA_Q36_PREFILL_PEERS: the window this forward works on, recorded before stream_begin() consults it (see
         // peer_win_ent).  Flag-guarded, so no write happens at all in a default run and nothing reads it there either
         // (peer_layer() answers false on `!peer_prefill_on` alone).  It has to be recorded HERE rather than in the MMQ
@@ -8349,6 +8549,10 @@ int strata::qwen35::run(int argc, char** argv) {
             std::printf("bench %d: pp%d %.1f tok/s, tg%d %.1f tok/s\n", rep, (int) toks.size(),
                         (double) toks.size() / (pp_ms / 1000.0), bench_tg,
                         bench_tg > 0 ? (double) bench_tg / (tg_ms / 1000.0) : 0.0);
+            // STRATA_Q36_MIXER_GRAPH=1: what the flag did, so a run that shows no speed-up can say why.
+            if (E.mixer_graph_flag())
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_MIXER_GRAPH: %d layer graphs captured, %d captures "
+                             "refused by the driver\n", E.mixer_ge_captured, E.mixer_ge_failed);
             if (helper_timing && bench_tg > 0)
                 for (int r = 0; r < 3; ++r) {
                     if (E.helpers[(size_t) r].resident() <= 0) continue;
