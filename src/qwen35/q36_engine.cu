@@ -618,6 +618,168 @@ __global__ void k_attn_part(const float* q, const void* kc, const void* vc, cons
         pl[o] = l;
     }
 }
+/// Split-K attention with the GQA group SHARED, one block per (chunk of 256 cells, KV head): the block's
+/// `GB` query heads read the same K / V cells once and each keeps its own score, so the K / V traffic is
+/// `GB` times smaller than the one-head-per-block shape above (which reads the same cells H/HKV = 8 times).
+///
+/// WHY IT EXISTS (MEASURED 2026-10-26, 192.168.1.98): the one-head shape's cost is linear in the context but
+/// with a factor of eight: at 65536 cells the attention is 27.6 ms/token against a 16 ms/token decode, and
+/// extrapolated to 262144 cells it is ~108 ms/token.  The eight-fold read is the reason - the eight query heads
+/// of a GQA group share one KV head, and the old grid gave each of them its own block.
+///
+/// WHAT IS THE SAME: every head's score is computed from the same q, the same K codes and the same FMA order
+/// as before, so the numbers are bit for bit what the old kernel produced.  The partial accumulator, the max
+/// and the sum keep the same layout (`row = lt * H + h`, `lt` the LOCAL token, exactly the old kernel's
+/// `blockIdx.y`), so `k_attn_merge` is untouched.
+///
+/// The V side: the old kernel pre-multiplied `sc[k] * the group's scale` into a shared table (`wv`) and then
+/// did one `fmaf` per cell.  Here the scale table is read ONCE (`vsc`) and the eight heads multiply it by
+/// their own `sc`, so the V codes are read once for the whole group.
+///
+/// The reductions (the max and the sum over the block) run for all the heads at once: the same tree, the same
+/// order, one `__syncthreads` per level instead of one per head.
+template <bool KI8, bool VI8, int GB>
+__global__ void k_attn_part_gqa(const float* q, const void* kc, const void* vc, const __half* ks, const __half* vs,
+                                const int32_t* pos0, int t0, int H, int HKV, int ctx, float scale, int n_chunk,
+                                float* pacc, float* pm, float* pl, RowSel rs) {
+    constexpr int HD = 256;
+    // GB is the group's size: the block serves ALL the query heads of one KV head, so the group is exactly
+    // GB heads and the query head of slot g is `kvh * GB + g` - the same numbering the one-head kernel used
+    // (it derived `kvh = h / (H / HKV)`).
+    __shared__ float qs[GB][HD];
+    __shared__ float sc[GB][kChunkCells];
+    __shared__ float vsc[VI8 ? (HD / kKVG) * kChunkCells : 1];   // VI8: the V group's scale, once per block
+    const int c = blockIdx.x;
+    const int t = t0 + blockIdx.y / HKV, kvh = blockIdx.y % HKV;
+    const int g0 = kvh * GB;       // this block's first query head
+    const int npos = (rs.cell ? rs.cell[t] : *pos0 + t) + 1;
+    if (rs.kc) {
+        kc = rs.kc[rs.slot[t]];
+        vc = rs.vc[rs.slot[t]];
+    }
+    if (KI8 && rs.kc8) {
+        kc = rs.kc8[rs.slot[t]];
+        ks = rs.ks8[rs.slot[t]];
+    }
+    if (VI8 && rs.vc8) {
+        vc = rs.vc8[rs.slot[t]];
+        vs = rs.vs8[rs.slot[t]];
+    }
+    const int p0 = c * kChunkCells;
+    if (p0 >= npos) return;
+    const int j = threadIdx.x;
+    // The partial accumulator, the max and the sum are indexed by the LOCAL row (the old kernel's `row` was
+    // blockIdx.y, and k_attn_merge reads the same local index), so the row here must be the local one too:
+    // the local token is `blockIdx.y / HKV` and the query head is `g0 + g`.
+    const int lt = blockIdx.y / HKV;   // the local token
+#pragma unroll
+    for (int g = 0; g < GB; ++g) qs[g][j] = q[((size_t) t * H + g0 + g) * HD + j];
+    __syncthreads();
+    const int p = p0 + j;
+    float s[GB];
+#pragma unroll
+    for (int g = 0; g < GB; ++g) s[g] = -INFINITY;
+    if (p < npos) {
+        if (KI8) {
+            const int8_t* kp = ((const int8_t*) kc) + ((size_t) kvh * ctx + p) * HD;
+            const __half* ksp = ks + ((size_t) kvh * ctx + p) * (HD / kKVG);
+            float a[GB];
+#pragma unroll
+            for (int g = 0; g < GB; ++g) a[g] = 0.f;
+#pragma unroll 4
+            for (int i0 = 0; i0 < HD; i0 += 8) {   // one uint2 (8 int8 codes) and one scale per kKVG group
+                const uint2 raw = *reinterpret_cast<const uint2*>(kp + i0);
+                const int8_t* c8 = reinterpret_cast<const int8_t*>(&raw);
+                const float sg = __half2float(ksp[i0 / kKVG]);
+#pragma unroll
+                for (int x = 0; x < 8; ++x)
+#pragma unroll
+                    for (int g = 0; g < GB; ++g) a[g] = fmaf(qs[g][i0 + x] * sg, (float) c8[x], a[g]);
+            }
+#pragma unroll
+            for (int g = 0; g < GB; ++g) s[g] = a[g] * scale;
+        } else {
+            const float* kp = ((const float*) kc) + ((size_t) kvh * ctx + p) * HD;
+#pragma unroll
+            for (int g = 0; g < GB; ++g) {
+                float a = 0.f;
+                for (int i = 0; i < HD; ++i) a += qs[g][i] * kp[i];
+                s[g] = a * scale;
+            }
+        }
+    }
+    // The max and the sum over the block, for every head at once, IN PLACE in sc[g][].
+    //
+    // The old kernel kept the scores in sc[] and the tree in a separate sh[]; here the tree runs on sc[] itself,
+    // so the block needs no extra scratch (the old shape's 8 KB of sh[] would have cut the occupancy in half).
+    // The order is the old kernel's: the max first (the tree over the 256 cells' scores), then the sum (the tree
+    // over exp(s - max)).  fmaxf is exact whatever the order, and the sum tree is the same tree over the same
+    // values, so the sum is bit for bit what the old kernel computed.
+    float m[GB], l[GB];
+#pragma unroll
+    for (int g = 0; g < GB; ++g) sc[g][j] = s[g];
+    __syncthreads();
+    for (int st = kThreads / 2; st > 0; st >>= 1) {
+        if ((int) threadIdx.x < st)
+#pragma unroll
+            for (int g = 0; g < GB; ++g) sc[g][threadIdx.x] = fmaxf(sc[g][threadIdx.x], sc[g][threadIdx.x + st]);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int g = 0; g < GB; ++g) m[g] = sc[g][0];
+    __syncthreads();   // everybody has read sc[g][0]; the next store overwrites it
+    // the same expression the old kernel used, once per head
+#pragma unroll
+    for (int g = 0; g < GB; ++g) sc[g][j] = (p < npos ? expf(s[g] - m[g]) : 0.f);
+    __syncthreads();   // sc[g][k] is read by the thread that owns the V column k, not by its writer
+    const int n = min(kChunkCells, npos - p0);
+    float acc[GB];
+#pragma unroll
+    for (int g = 0; g < GB; ++g) acc[g] = 0.f;
+    if (VI8) {
+        const int8_t* vp = ((const int8_t*) vc) + ((size_t) kvh * ctx + p0) * HD;
+        const __half* vsp = vs + ((size_t) kvh * ctx + p0) * (HD / kKVG);
+        for (int x = j; x < (HD / kKVG) * n; x += kThreads) {
+            const int g = x / n, k = x - g * n;
+            vsc[g * kChunkCells + k] = __half2float(vsp[(size_t) k * (HD / kKVG) + g]);
+        }
+        __syncthreads();
+        const float* wr = vsc + (j / kKVG) * kChunkCells;
+        const int8_t* vj = vp + j;
+        for (int k = 0; k < n; ++k) {
+            const float vk = (float) vj[(size_t) k * HD];
+#pragma unroll
+            for (int g = 0; g < GB; ++g) acc[g] = fmaf(sc[g][k] * wr[k], vk, acc[g]);
+        }
+    } else {
+        const float* vp = ((const float*) vc) + ((size_t) kvh * ctx + p0) * HD + j;
+        for (int k = 0; k < n; ++k) {
+            const float vk = vp[(size_t) k * HD];
+#pragma unroll
+            for (int g = 0; g < GB; ++g) acc[g] += sc[g][k] * vk;
+        }
+    }
+    __syncthreads();   // the V part has read sc[]; the sum tree below overwrites it
+    // the sum tree, in place: the same tree over the same values as the old block_sum, so the same bits
+    for (int st = kThreads / 2; st > 0; st >>= 1) {
+        if ((int) threadIdx.x < st)
+#pragma unroll
+            for (int g = 0; g < GB; ++g) sc[g][threadIdx.x] += sc[g][threadIdx.x + st];
+        __syncthreads();
+    }
+#pragma unroll
+    for (int g = 0; g < GB; ++g) l[g] = sc[g][0];
+#pragma unroll
+    for (int g = 0; g < GB; ++g) {
+        const size_t row = (size_t) lt * H + g0 + g;
+        const size_t o = row * n_chunk + c;
+        pacc[o * HD + j] = acc[g];
+        if (j == 0) {
+            pm[o] = m[g];
+            pl[o] = l[g];
+        }
+    }
+}
 /// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
                              const int32_t* pos0, int t0, int H, int n_chunk, float* out, RowSel rs) {
@@ -2410,7 +2572,34 @@ struct Engine {
                         kSegShared = 4, kSegCpu = 5, kSegMerge = 6, kSegComb = 7;
     cudaEvent_t ev_seg_ev[kGsegN] = {};   // NOT ev_seg: that name is the marker below, and a member array
                                           // shadows a member function of the same name in this class.
+    /// STRATA_Q36_ATTN_GQA=N (opt-in): the decode attention reads each K / V cell ONCE for the whole GQA group
+    /// (the N query heads that share one KV head) instead of once per query head.  The one-head shape reads the
+    /// same cell eight times, which is why the decode's attention grows with the context faster than the decode
+    /// itself does (MEASURED 2026-10-26, 192.168.1.98: 1.81 ms/token at 2048 cells, 27.6 at 65536, extrapolated
+    /// ~108 at 262144, against a 16 ms/token decode).  N is the number of query heads per block: 2, 4 or 8.
+    /// 0 (the default) is the old kernel, byte for byte.
+    ///
+    /// The numbers are unchanged - each head's score is the same expression over the same q and the same K codes
+    /// in the same order - so this is a traffic change, not a numerical one.
+    static int attn_gqa() {
+        static const int n = [] {
+            const char* v = std::getenv("STRATA_Q36_ATTN_GQA");
+            if (!v || v[0] == '\0') return 0;
+            const int x = std::atoi(v);
+            return (x == 2 || x == 4 || x == 8) ? x : 0;
+        }();
+        return n;
+    }
     bool gpu_timing = false;      // helper_timing() and every event exists (see open_engine)
+    // STRATA_Q36_MIXER_SPLIT=1: the mixer's two branches timed apart - the attention layers and the GDN layers.
+    // The 8-segment decode timeline has one "attn_ssm" segment that covers both (30 GDN layers and 10 attention
+    // layers in this model), so it cannot say what a layer of one kind costs on its own.  This asks that question:
+    // two events, one at the branch's entry and one at its exit, and the elapsed time folded into the two
+    // accumulators.  Off by default: one getenv, nothing created, nothing recorded.
+    cudaEvent_t mx_ev[4] = {};    // [0] the branch's entry, [1] its exit, [2] after the split kernel, [3] after the merge
+    bool mx_timing = false;
+    double mx_attn_ms = 0, mx_gdn_ms = 0, mx_merge_ms = 0;
+    long long mx_attn_n = 0, mx_gdn_n = 0, mx_merge_n = 0;
     bool gpu_timing_open = false; // the events of one layer() call are still being recorded (do not read them yet)
     bool gpu_open_this_forward = false;  // forward() arms exactly one layer (the last) to carry the tile
     bool gpu_timing_hold = false; // a graph is being captured (event records are legal, readings are not)
@@ -3371,6 +3560,9 @@ struct Engine {
             if (mmq_here)
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 0], st));   // P0
         }
+        // STRATA_Q36_MIXER_SPLIT=1: the branch's entry.  Both branches' entry and exit are timed, and the elapsed
+        // time is folded into that branch's accumulator, so the two are separate numbers rather than one mixed one.
+        if (mx_timing) CK(cudaEventRecord(mx_ev[0], st));
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
             float* hc_b = verify ? v_hc[li] : hc;
@@ -3403,15 +3595,43 @@ struct Engine {
                 const int tiles = (fast_k && T > kGemmT && !verify) ? (T + kConvTile - 1) / kConvTile : 1;
                 k_conv_seq<<<dim3(C / 128, tiles), 128, 0, st>>>(conv[li], qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, T, !verify);
                 if (T > kGemmT && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
+                    // STRATA_Q36_GDNPROF=1: the recurrence's own time, once per run (the first prompt chunk).  The
+                    // mixer's span is 4.81 ms a layer and the three dense GEMMs were measured at 2.86 ms of it
+                    // (2026-10-26, P100); this says what the rest is.  Off by default: nothing of it runs.
+                    static const bool gdn_prof = std::getenv("STRATA_Q36_GDNPROF") != nullptr;
+                    static bool gdn_said = false;
+                    cudaEvent_t ge0 = nullptr, ge1 = nullptr;
+                    if (gdn_prof && !gdn_said) {
+                        CK(cudaEventCreate(&ge0)); CK(cudaEventCreate(&ge1));
+                        CK(cudaEventRecord(ge0, st));
+                    }
                     k_gdn_seq_cols<<<dim3(HV, kGdnColGroups), dim3(128 / kGdnColGroups, 16), 0, st>>>(S[li], hc_b, C, al_b,
                                                                                                       be_b, gdn_y, HK, HV, T);
                     k_gdn_norm<<<dim3(HV, T), 128, 0, st>>>(gdn_y, z, L.ssm_norm, m->eps, gdn_y, HV);
+                    if (gdn_prof && !gdn_said) {
+                        CK(cudaEventRecord(ge1, st));
+                        CK(cudaEventSynchronize(ge1));
+                        float ms = 0;
+                        CK(cudaEventElapsedTime(&ms, ge0, ge1));
+                        std::fprintf(stderr, "strata-q36 GDNPROF: the recurrence + the norm, T=%d: %.3f ms (one layer)\n",
+                                     T, ms);
+                        gdn_said = true;
+                    }
                 } else {   // decode, verify windows and commits: one kernel, so a window's rows are a decode step's rows
                     k_gdn_seq<<<HV, dim3(128, 4), 0, st>>>(S[li], hc_b, C, al_b, be_b, z, L.ssm_norm, m->eps, gdn_y, HK, HV,
                                                            T, !verify);
                 }
             }
             mm(L.ssm_out, gdn_y, y, T);
+            // STRATA_Q36_MIXER_SPLIT=1: the GDN branch's exit.
+            if (mx_timing) {
+                CK(cudaEventRecord(mx_ev[1], st));
+                CK(cudaEventSynchronize(mx_ev[1]));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, mx_ev[0], mx_ev[1]));
+                mx_gdn_ms += ms;
+                ++mx_gdn_n;
+            }
         } else {
             prep_in(T);
             apply(L.wq, xq, qg, T);
@@ -3495,18 +3715,74 @@ struct Engine {
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
                     kv4([&](auto k8c, auto v8c) {
                         constexpr bool K8 = decltype(k8c)::value, V8 = decltype(v8c)::value;
-                        k_attn_part<K8, V8><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(
-                            q, K8 ? (rows_mode ? nullptr : (const void*) kc8[li])
-                                  : (rows_mode ? nullptr : (const void*) kc[li]),
-                            V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
-                                  : (rows_mode ? nullptr : (const void*) vc[li]),
-                            K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
-                            1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                        // STRATA_Q36_ATTN_GQA=N: the group-shared shape (one block per KV head, the group's N query
+                        // heads share the K / V read).  The old kernel is the default and stays byte for byte.
+                        // The shared kernel serves a WHOLE group, so it needs H == N * HKV; anything else falls
+                        // back to the old kernel (the group would not divide).
+                        const int gb = attn_gqa();
+                        if (gb > 0 && H == gb * HKV) {
+                            if (gb == 2) {
+                                k_attn_part_gqa<K8, V8, 2><<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
+                                    q, K8 ? (rows_mode ? nullptr : (const void*) kc8[li])
+                                          : (rows_mode ? nullptr : (const void*) kc[li]),
+                                    V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
+                                          : (rows_mode ? nullptr : (const void*) vc[li]),
+                                    K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
+                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                            } else if (gb == 4) {
+                                k_attn_part_gqa<K8, V8, 4><<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
+                                    q, K8 ? (rows_mode ? nullptr : (const void*) kc8[li])
+                                          : (rows_mode ? nullptr : (const void*) kc[li]),
+                                    V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
+                                          : (rows_mode ? nullptr : (const void*) vc[li]),
+                                    K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
+                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                            } else {
+                                k_attn_part_gqa<K8, V8, 8><<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
+                                    q, K8 ? (rows_mode ? nullptr : (const void*) kc8[li])
+                                          : (rows_mode ? nullptr : (const void*) kc[li]),
+                                    V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
+                                          : (rows_mode ? nullptr : (const void*) vc[li]),
+                                    K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
+                                    1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                            }
+                        } else {
+                            k_attn_part<K8, V8><<<dim3(nc, nt * H), kChunkCells, 0, st>>>(
+                                q, K8 ? (rows_mode ? nullptr : (const void*) kc8[li])
+                                      : (rows_mode ? nullptr : (const void*) kc[li]),
+                                V8 ? (rows_mode ? nullptr : (const void*) vc8[li])
+                                      : (rows_mode ? nullptr : (const void*) vc[li]),
+                                K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, dpos, t0, H, HKV, ctx,
+                                1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl, rs);
+                        }
                     });
+                    // STRATA_Q36_MIXER_SPLIT=1: the split kernel's exit, so the merge's own time can be told from
+                    // the split kernel's.  The merge walks the chunks serially in one block per row, so at a long
+                    // context it is a second cost beside the split kernel's.
+                    if (mx_timing) CK(cudaEventRecord(mx_ev[2], st));
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att, rs);
+                    if (mx_timing) {
+                        CK(cudaEventRecord(mx_ev[3], st));
+                        CK(cudaEventSynchronize(mx_ev[3]));
+                        float ms = 0;
+                        CK(cudaEventElapsedTime(&ms, mx_ev[2], mx_ev[3]));
+                        mx_merge_ms += ms;
+                        ++mx_merge_n;
+                    }
                 }
             }
             mm(L.wo, att, y, T);
+            // STRATA_Q36_MIXER_SPLIT=1: the attention branch's exit.  The merge's own time was taken above
+            // (mx_ev[2] -> mx_ev[1], the event right after the merge), so the total here covers the whole branch
+            // (the q/k/v prep, the split kernel and the merge) and the difference is the rest.
+            if (mx_timing) {
+                CK(cudaEventRecord(mx_ev[1], st));
+                CK(cudaEventSynchronize(mx_ev[1]));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, mx_ev[0], mx_ev[1]));
+                mx_attn_ms += ms;
+                ++mx_attn_n;
+            }
         }
         // STRATA_Q36_PROMPT_TIMING=1: P0b, right where both the GDN branch and the attention branch have issued
         // everything (the if/else above closes here; add_rms_post and the router follow).  Span P0b-P0 is the layer's
@@ -4840,6 +5116,15 @@ struct Engine {
                 }
                 pp_maxr_dev[(size_t) r].push_back((int32_t) dev_maxr);
                 pp_maxr_host[(size_t) r].push_back((int32_t) host_maxr[(size_t) r]);
+                // STRATA_Q36_PEER_LAYER=1: one line per layer with each helper's entry count and its widest expert's
+                // rows.  The summed "entries per layer" line cannot say whether one layer's one expert holds the
+                // whole tail, which is what sizes the helper's launch grid.  Off by default: one getenv, nothing
+                // printed.
+                if (std::getenv("STRATA_Q36_PEER_LAYER") && r == 2)
+                    std::fprintf(stderr, "strata-q36 PEERLAYER %lld: rows %lld/%lld/%lld maxr %d/%d/%d\n",
+                                 (long long) li, (long long) rows[0], (long long) rows[1], (long long) rows[2],
+                                 (int) pp_maxr_dev[0].back(), (int) pp_maxr_dev[1].back(),
+                                 (int) pp_maxr_dev[2].back());
             }
             if (!peers[(size_t) r]->launch((int64_t) li, epartsd, base[(size_t) r], err)) return false;
             // Second witness of the ownership invariant, from the executor's side and at one integer's cost: rows()
@@ -5003,6 +5288,7 @@ struct Engine {
         std::string err;
         for (int i = 0; i < n; ++i) {
             const int r = hi[i];
+            const auto t_w = std::getenv("STRATA_Q36_PEER_WAIT") ? Clock::now() : Clock::time_point{};
             // STRATA_Q36_PEER_F16=1 / STRATA_Q36_PEER_I8=1: the packed rows land in the primary's staging and are
             // unpacked into `eparts` right after the copy that brought them, on the same stream - so the order is
             // copy, unpack, copy, unpack, and the combine below reads floats either way.  The staging is one
@@ -6070,6 +6356,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             for (int k = 0; k < Engine::kGsegN; ++k)
                 CK(cudaEventCreate(&E.ev_seg_ev[k]));
             E.gpu_timing = true;
+        }
+    }
+    // STRATA_Q36_MIXER_SPLIT=1: the two events that time the mixer's two branches apart (the attention layers and
+    // the GDN layers), created only under that gate, so a flag-off run allocates and records nothing it did not before.
+    {
+        const char* ms = std::getenv("STRATA_Q36_MIXER_SPLIT");
+        if (ms && ms[0] == '1' && ms[1] == '\0') {
+            for (int k = 0; k < 4; ++k) CK(cudaEventCreate(&E.mx_ev[k]));
+            E.mx_timing = true;
         }
     }
     // STRATA_Q36_MTP_TIMING=1: the draft step's three events (the step's start, the MTP layer's end, the head's end),
@@ -7575,6 +7870,9 @@ int strata::qwen35::run(int argc, char** argv) {
         double d_begin[3] = {}, d_wait[3] = {}, d_ovh[3] = {};
         double d_pre = 0, d_spin = 0;
         long long n_pre = 0, n_spin = 0;
+        // STRATA_Q36_MIXER_SPLIT=1: the mixer's two branches, timed apart, summed over the three bench passes.
+        double d_mx_attn = 0, d_mx_gdn = 0, d_mx_merge = 0;
+        long long d_mx_attn_n = 0, d_mx_gdn_n = 0, d_mx_merge_n = 0;
         // The host's own time per layer (STRATA_Q36_HELPER_TIMING=1): the aggregate of the per-pass deltas.
         double d_hostl = 0;
         long long n_hostl = 0;
@@ -7677,6 +7975,14 @@ int strata::qwen35::run(int argc, char** argv) {
                 emb0 = E.gp_embed_ms; head0 = E.gp_head_ms;
                 gn0 = E.gspan_n; drop0 = E.gseg_dropped;
             }
+            // STRATA_Q36_MIXER_SPLIT=1: the two branches' accumulators, sampled before the pass so the pass's own
+            // delta can be taken (the same per-pass / 3-pass-aggregate pattern the other probes use).
+            double mx_a0 = 0, mx_g0 = 0, mx_m0 = 0;
+            long long mx_an0 = 0, mx_gn0 = 0, mx_mn0 = 0;
+            if (E.mx_timing) {
+                mx_a0 = E.mx_attn_ms; mx_g0 = E.mx_gdn_ms; mx_m0 = E.mx_merge_ms;
+                mx_an0 = E.mx_attn_n; mx_gn0 = E.mx_gdn_n; mx_mn0 = E.mx_merge_n;
+            }
             const auto t1 = Clock::now();
             int nx = E.greedy();
             for (int i = 0; i < bench_tg; ++i) {
@@ -7731,6 +8037,15 @@ int strata::qwen35::run(int argc, char** argv) {
                 r_head = E.gp_head_ms - head0;  d_head += r_head;
                 r_gn = E.gspan_n - gn0;        d_gn += r_gn;
                 r_drop = E.gseg_dropped - drop0; d_dropped += r_drop;
+            }
+            // STRATA_Q36_MIXER_SPLIT=1: this pass's two branch deltas, folded into the 3-pass aggregate.
+            if (E.mx_timing) {
+                d_mx_attn += E.mx_attn_ms - mx_a0;
+                d_mx_gdn += E.mx_gdn_ms - mx_g0;
+                d_mx_merge += E.mx_merge_ms - mx_m0;
+                d_mx_attn_n += E.mx_attn_n - mx_an0;
+                d_mx_gdn_n += E.mx_gdn_n - mx_gn0;
+                d_mx_merge_n += E.mx_merge_n - mx_mn0;
             }
             // STRATA_Q36_PROMPT_TIMING=1: fold this pass's prompt spans into the 3-pass aggregate, the same
             // d_*-pattern the helper-timing probe uses.  Each d_pp_* is the total across all three bench passes;
@@ -7939,6 +8254,20 @@ int strata::qwen35::run(int argc, char** argv) {
                              d_span / (double) tokens, segsum / (double) tokens, d_resid / (double) tokens,
                              d_emb / (double) tokens, d_head / (double) tokens);
             }
+        }
+        // STRATA_Q36_MIXER_SPLIT=1: the mixer's two branches, timed apart, over the three bench passes.  The
+        // per-layer means are the sums divided by the branch's own call count, and the per-token means are the sums
+        // divided by the token count (bench_tg * 3) - the same way the helper-timing AGG line reads.
+        if (E.mx_timing && bench_tg > 0) {
+            const double tokens = bench_tg * 3;
+            std::fprintf(stderr,
+                         "strata-q36 PHASE3 AGG MIXER_SPLIT: the attention layers %.1f ms total (%.3f ms a layer, "
+                         "%.3f ms/tok over %lld calls) | the GDN layers %.1f ms total (%.3f ms a layer, %.3f ms/tok "
+                         "over %lld calls) | the merge alone %.1f ms (%.3f ms/tok over %lld calls)\n",
+                         d_mx_attn, d_mx_attn_n ? d_mx_attn / (double) d_mx_attn_n : 0.0,
+                         d_mx_attn / (double) tokens, d_mx_attn_n, d_mx_gdn,
+                         d_mx_gdn_n ? d_mx_gdn / (double) d_mx_gdn_n : 0.0, d_mx_gdn / (double) tokens, d_mx_gdn_n,
+                         d_mx_merge, d_mx_merge / (double) tokens, d_mx_merge_n);
         }
         // STRATA_Q36_PROMPT_TIMING=1: the 3-pass aggregate, the same way the helper-timing AGG line does it.  Per-layer
         // means are the sums across all three passes divided by the total layer count (d_pp_layers, which is the sum
