@@ -904,21 +904,26 @@ const DenseAccEntry kDenseAcc[] = {
     {8192, 2048, 512, CUBLAS_GEMM_ALGO6},   // the GDN's attn_qkv, the attention's attn_q       (1.67x)
     {4096, 2048, 512, CUBLAS_GEMM_ALGO6},   // the GDN's attn_gate, the attention's attn_output  (1.91x)
     {2048, 4096, 512, CUBLAS_GEMM_ALGO6},   // the GDN's ssm_out                                 (1.77x)
-    {512, 2048, 512, CUBLAS_GEMM_ALGO4},    // the attention's attn_k / attn_v                    (1.22x)
+    {512, 2048, 512, CUBLAS_GEMM_ALGO4},    // the attention's attn_k / attn_v, the shared       (1.22x)
+                                            // expert's gate/up: the same shape, both in the table
+    {2048, 512, 512, CUBLAS_GEMM_ALGO4},    // the shared expert's down                          (1.14x)
     // T 1024
     {8192, 2048, 1024, CUBLAS_GEMM_ALGO6},  // 1.70x
     {4096, 2048, 1024, CUBLAS_GEMM_ALGO6},  // 1.78x
     {2048, 4096, 1024, CUBLAS_GEMM_ALGO6},  // 2.05x
     {512, 2048, 1024, CUBLAS_GEMM_DEFAULT}, // 1.40x
+    {2048, 512, 1024, CUBLAS_GEMM_ALGO5},   // 1.47x
     // T 2048
     {8192, 2048, 2048, CUBLAS_GEMM_ALGO6},  // 1.59x
     {4096, 2048, 2048, CUBLAS_GEMM_ALGO6},  // 1.88x
     {2048, 4096, 2048, CUBLAS_GEMM_ALGO6},  // 1.93x
     {512, 2048, 2048, CUBLAS_GEMM_ALGO5},   // 1.66x
+    {2048, 512, 2048, CUBLAS_GEMM_ALGO5},   // 1.51x
     // T under 512: the shapes compress differently, and the narrow one loses on every algorithm
     {8192, 2048, 128, CUBLAS_GEMM_ALGO5},   // 1.31x
     {4096, 2048, 128, CUBLAS_GEMM_ALGO5},   // 1.29x
     {2048, 4096, 128, CUBLAS_GEMM_ALGO5},   // 1.38x
+    {2048, 512, 128, CUBLAS_GEMM_ALGO5},    // the shared expert's down, 1.12x
 };
 int dense_acc_algo(int64_t N, int64_t K, int64_t T) {
     int best = kDenseAccNone;

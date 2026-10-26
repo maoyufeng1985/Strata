@@ -586,6 +586,32 @@ rms(diff)/rms(logits) 平均 **0.085**（之前收下的 fused FP16 路径是 0.
 ⇒ 主卡自己真的在算的 273 µs/层（61%），**helper 的一个来回 ≈ 173 µs/层（39%）**。
 每个 helper 的 host 侧：ms_begin 45 µs/层、ms_wait 37、ms_sync_overhead 3.3。
 
+### 4.1b 在新二进制上复量（MEASURED，2026-10-26，`bin/strata-q36.acc`）
+
+`R-dec-acc`，全套旗标（peer + `STRATA_PF_F16_CUDA=1` + `STRATA_DENSE_F16_ACC=1`）：
+
+| | tg64 | pp512 |
+|---|---:|---:|
+| E1 `--kv f16`（对照）| 59.2 | 1010.1 |
+| E2 `--kv int8` | **61.4**（+3.7%）| 1003.4（不变）|
+
+⇒ 老的 `--kv int8` 结论在新二进制上仍然成立，**tg64 现在是 61.4**（基线 59.1，+3.9%）。
+⇒ dense 的 FP16 累加**没有动解码**（解码的投影是 GEMV，走 `mmq` 不走 `Gemm::f16`），符合预期。
+
+**解码每一层 0.39 ms 的去向**（E3 的 `GPU primary` 时间线，bench 2）：
+
+| 段 | ms/层 | 占比 |
+|---|---:|---:|
+| attn_ssm（mixer 的 dense GEMV）| **0.150** | 38% |
+| cpu_pool（**主卡在等 helper 的行，GPU 空转**）| **0.105** | 27% |
+| helper_dispatch | 0.067 | 17% |
+| local_shared | 0.031 | 8% |
+| router | 0.021 | 5% |
+| helper_merge | 0.015 | 4% |
+| local_grouped | 0.002 | 0% |
+
+三个 helper 的 host 侧：ms_begin 1.65–1.76、ms_wait 1.45–1.65、ms_sync_overhead 0.11 ms/token。
+
 ### 4.2 剩下的候选，和为什么先做不了
 
 | 候选 | 预计 | 在哪个文件 | 能做吗 |
