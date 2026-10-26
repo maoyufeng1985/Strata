@@ -592,6 +592,54 @@ T/64 步）只给 Volta 开，且它改算术、要单独一轮验证。
 三条 helper 全走 host staging（无 P2P），实测 H2D 0.81 / D2H 0.58 GB/s ⇒ 理论 9.79 ms/层，
 实测 4.56 ms/层（传输重叠）⇒ **已在物理上限附近**。
 
+### 3.18 两条剩下的路也量过了（MEASURED，2026-10-26）
+
+**(a) SSM 递推的分块算法：不值得移植。**
+
+`.run/R-acc-stack` 之后在引擎里加了 `STRATA_Q36_GDNPROF=1`（只计一次，默认关），量到
+**递推 + norm = 1.906 ms/层**（mixer 4.81 的 40%，T=512，P100）。
+
+但 barrier 的成本单独量了（`.run/barrier-20261026.cu`，同样的 128 block × 512 线程）：
+**0.26 µs/barrier**，1024 次 = **0.263 ms**。所以 1.906 里只有 0.26 ms 是 barrier，
+剩下 1.64 ms 是算术本身（每 token 每列 16 次 FMA + 1 次 `__expf`）。
+
+chunk 化省的是 barrier（512 次串行降到 8 次），算术还在。**收益上限 ~0.3 ms/层**
+（forward 12.7 的 2%）——不够 3% 的判据。而且现成的 `gdn_chunk.cu` 是给 Flash-Next 的
+（48 V heads、3 个共享 k/q），q36 是 32 V heads、2 个共享，不能直接用。
+
+**(b) helper 的传输格式：已经在上限。**
+
+`PEER_I8` + `PEER_SUM` 已经把下行压到每 token 一行 int8（512 × 2048 × 1 B = 1 MiB/helper）。
+三条 helper 全走 host staging，实测 H2D 0.81 / D2H 0.58 GB/s。
+每层 6.38 MiB 的流量在这个带宽上是 9.79 ms，实测 helper 链 4.56 ms（传输重叠）⇒ **已在物理上限附近**。
+
+helper 的计算也贴着带宽：每 helper 每层 ~1100 entries × 1.87 MB ≈ 2 GB 权重，
+P104 的 ~320 GB/s ⇒ 计算地板 ~6 ms/层，和传输链的 4.56 ms 同量级。
+
+### 3.19 MTP 在编码任务上有收益（MEASURED，2026-10-26）
+
+`--bench-tg` 测不出 MTP：它喂随机 token，草稿几乎不会命中，接受率接近 0。
+换成**引擎自己的 tokenizer**（`tools/strata_tokenizer.py`，从 GGUF 读）tokenize 的编码 prompt，
+生成 256 token，接受率完全不同。
+
+两个 prompt（168 / 172 token），`--mtp 0` 对照，`--mtp 1..5` 加 `STRATA_Q36_MTP_VRAM=1
+STRATA_Q36_MTP_MAPPED=1`（MTP 层全驻留主卡，mapped chain live）：
+
+| --mtp | prompt 0 | prompt 1 | 接受率 | vs 60.5 |
+|---|---:|---:|---|---:|
+| 0 | 60.4 | 60.6 | — | 1.00x |
+| 1 | 80.6 | 82.3 | 90–96% | 1.35x |
+| 2 | 89.5 | 92.6 | 87–92% | 1.51x |
+| **3** | **94.1** | **95.9** | 82–85% | **1.57x** |
+| 4 | 91.5 | 95.0 | 76–81% | 1.54x |
+| 5 | 84.8 | 91.2 | 68–74% | 1.45x |
+
+逐深度接受率（`--mtp 4`，两个 prompt）：d=0 86/95%，d=1 81/88%，d=2 73/75%，d=3 61/66%。
+d=4（`--mtp 5`）降到 47/48%，所以 D=4 开始回落。
+
+**`--mtp 3` 是峰值：94–96 tok/s，比 60.5 快 57%。** 代价是 pp512 掉 4–15%
+（MTP 层占了主卡的专家预算，3.19 之前的表）。
+
 ## 4. 下一步：解码（tg64 58.9）
 
 ### 4.1 量到的（MEASURED，2026-10-26，q8 window 的二进制 `bin/strata-q36.q8fix`）
