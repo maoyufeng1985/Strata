@@ -2584,12 +2584,20 @@ struct Engine {
     static int attn_gqa() {
         static const int n = [] {
             const char* v = std::getenv("STRATA_Q36_ATTN_GQA");
-            if (!v || v[0] == '\0') return 0;
+            if (!v || v[0] == '\0') return 0;    // unset = the old kernel, byte for byte (the shipped default)
+            if (v[0] == 'a' || v[0] == 'A') return -1;   // "auto": decide by the cells the decode will read
             const int x = std::atoi(v);
-            return (x == 2 || x == 4 || x == 8) ? x : 0;
+            if (x < 0) return -1;                // any negative also means the automatic rule
+            return (x == 2 || x == 4 || x == 8) ? x : 0;   // 0 (or anything else) = the old kernel, always
         }();
         return n;
     }
+    /// The context length at which the shared shape starts to win: the decode must read at least this many cells
+    /// before one block per KV head pays for its lower occupancy.  MEASURED 2026-10-26 (192.168.1.98, peer on,
+    /// --bench-pp P --bench-tg 64): at 576 cells the shared shape is 2.6% SLOWER, at ~4160 cells 2.1% FASTER,
+    /// at ~8256 7.6%, at ~32832 50%.  The crossing sits between 576 and 4160; 2048 is the conservative side of it
+    /// (the cost model's fit says 2048 is about break-even, and being wrong there costs ~1% rather than 3%).
+    static constexpr int64_t kAttnGqaMinCells = 2048;
     bool gpu_timing = false;      // helper_timing() and every event exists (see open_engine)
     // STRATA_Q36_MIXER_SPLIT=1: the mixer's two branches timed apart - the attention layers and the GDN layers.
     // The 8-segment decode timeline has one "attn_ssm" segment that covers both (30 GDN layers and 10 attention
@@ -3719,7 +3727,12 @@ struct Engine {
                         // heads share the K / V read).  The old kernel is the default and stays byte for byte.
                         // The shared kernel serves a WHOLE group, so it needs H == N * HKV; anything else falls
                         // back to the old kernel (the group would not divide).
-                        const int gb = attn_gqa();
+                        const int cfg = attn_gqa();
+                        const int gb = cfg == 0 ? 0
+                                      : cfg > 0 ? cfg
+                                                : (H % HKV == 0 && (int64_t) nc * kChunkCells >= kAttnGqaMinCells
+                                                       ? H / HKV
+                                                       : 0);
                         if (gb > 0 && H == gb * HKV) {
                             if (gb == 2) {
                                 k_attn_part_gqa<K8, V8, 2><<<dim3(nc, nt * HKV), kChunkCells, 0, st>>>(
