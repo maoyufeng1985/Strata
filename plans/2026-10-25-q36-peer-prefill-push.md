@@ -622,7 +622,7 @@ P104 的 ~320 GB/s ⇒ 计算地板 ~6 ms/层，和传输链的 4.56 ms 同量�
 换成**引擎自己的 tokenizer**（`tools/strata_tokenizer.py`，从 GGUF 读）tokenize 的编码 prompt，
 生成 256 token，接受率完全不同。
 
-两个 prompt（168 / 172 token），`--mtp 0` 对照，`--mtp 1..5` 加 `STRATA_Q36_MTP_VRAM=1
+两个 prompt（168 / 172 token），`--mtp 0` 对照，`--mtp 1..6` 加 `STRATA_Q36_MTP_VRAM=1
 STRATA_Q36_MTP_MAPPED=1`（MTP 层全驻留主卡，mapped chain live）：
 
 | --mtp | prompt 0 | prompt 1 | 接受率 | vs 60.5 |
@@ -633,9 +633,11 @@ STRATA_Q36_MTP_MAPPED=1`（MTP 层全驻留主卡，mapped chain live）：
 | **3** | **94.1** | **95.9** | 82–85% | **1.57x** |
 | 4 | 91.5 | 95.0 | 76–81% | 1.54x |
 | 5 | 84.8 | 91.2 | 68–74% | 1.45x |
+| 6 | 88.5 | 93.0 | 69–72% | 1.50x |
 
 逐深度接受率（`--mtp 4`，两个 prompt）：d=0 86/95%，d=1 81/88%，d=2 73/75%，d=3 61/66%。
-d=4（`--mtp 5`）降到 47/48%，所以 D=4 开始回落。
+d=4（`--mtp 5`）降到 47/48%。`--mtp 6` 的 d=4 是 56/54%、d=5 是 54/43%——
+D=4 起单步接受率掉到一半，多出来的草稿不再抵得过它的成本，峰值停在 `--mtp 3`。
 
 **`--mtp 3` 是峰值：94–96 tok/s，比 60.5 快 57%。** 代价是 pp512 掉 4–15%
 （MTP 层占了主卡的专家预算，3.19 之前的表）。
