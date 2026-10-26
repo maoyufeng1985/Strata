@@ -557,6 +557,41 @@ rms(diff)/rms(logits) 平均 **0.085**（之前收下的 fused FP16 路径是 0.
 `gen:` 的 8 个 token 逐位相同。
 
 
+### 3.17 到顶了：三条候选都量过、都否掉（MEASURED，2026-10-26）
+
+prompt 从 493.9 推到 **1001.7**（+103%）。再往上要找的地方都量了，全部到顶：
+
+**(a) dense GEMV 已经打满带宽.** `.run/q8gemv-20261026.cu` 在 P100 上比「纯流式读同样字节」和「引擎自己的
+Q8_0 row-dot」：
+
+| 形状 | 纯读 GB/s | row-dot GB/s | 纯读 ms | row-dot ms |
+|---|---:|---:|---:|---:|
+| attn_qkv 8192×2048 | 414.5 | **433.3** | 0.043 | 0.041 |
+| attn_gate 4096×2048 | 387.8 | **402.5** | 0.023 | 0.022 |
+| ssm_out 4096×2048 | 387.7 | **403.2** | 0.023 | 0.022 |
+
+⇒ row-dot **比纯读还快**（它边读边算，读/算重叠），已贴着 HBM 的实际带宽（P100 峰值 732，这个访问模式到 ~410）。
+`STRATA_Q8_SM60=1` 早已开着（所有测量都带它），Pascal 的 packed q8 kernel 已在跑。**没有空间。**
+
+**(b) 解码的 dense 权重地板.** 每 token 的 dense 权重 = 37.9 MB/层 × 40 = **1.51 GB**；在 ~410 GB/s 的实测带宽上
+**地板 3.7 ms/token**。实测 `attn_ssm` 0.150 × 40 = 6.0 ms，其中 3.7 是这四个 GEMV 的地板，剩下 2.3 ms 是
+conv / SSM 递推 / norm。`k_gdn_seq_cols` 对 T 严格串行（每 token 依赖上一 state），分块算法（`gdn_chunk.cu`，
+T/64 步）只给 Volta 开，且它改算术、要单独一轮验证。
+
+**(c) `cpu_pool` 的 0.105 ms/层是自旋，不是工作.** 报告写着
+`61440 of 61440 batch entries on the GPU (100.0%), 0 on the CPU pool`，`route_spin=0.119 ms/tok`（6018 次调用）
+和 `cpu_pool=0.110 ms/层` 是同一个数。
+
+⇒ **试过、量过、否掉**：`moe_helpers()` 无条件 `cudaStreamSynchronize(st)`，而 `ev_route` 记在它**之后**的
+空 stream 上 ⇒ 那次自旋必然立刻返回。加 `stream_synced_this_layer` 跳过它后
+**`route_spin=0.000`**、logits **逐位相同**（0.08483，8/8 argmax），但 **tg64 61.2 vs 61.4，噪声内**：
+时间只是从 `route_spin` 搬到了 `prebegin_sync`（5.34 → 5.42 ms/tok）。host 本来就在等 GPU，少一次自旋不改变
+它等多久。⇒ **已回退**，不留没收益的改动。
+
+**(d) helper 链贴着 PCIe 上限.** 每层 6.38 MiB（3 份 q8_1 窗口上行 + 3 份 int8 行下行），
+三条 helper 全走 host staging（无 P2P），实测 H2D 0.81 / D2H 0.58 GB/s ⇒ 理论 9.79 ms/层，
+实测 4.56 ms/层（传输重叠）⇒ **已在物理上限附近**。
+
 ## 4. 下一步：解码（tg64 58.9）
 
 ### 4.1 量到的（MEASURED，2026-10-26，q8 window 的二进制 `bin/strata-q36.q8fix`）
