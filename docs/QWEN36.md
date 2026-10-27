@@ -497,3 +497,46 @@ which is the number a decision to make this path the default would need.
 The numbers and the history are in [the peer plan](../plans/2026-10-25-q36-peer-prefill-today.md), [the push that
 took the prompt from 493.9 to 1001.7](../plans/2026-10-25-q36-peer-prefill-push.md) and [the defect
 record](../plans/2026-10-25-q36-peer-decode-defect.md).
+
+## Reading the KV once instead of eight times (opt-in, `STRATA_Q36_ATTN_GQA=a`)
+
+The decode's attention has one job per group of query heads: 8 of the 16 query heads share the same keys and values, and
+the old kernel read them 8 times, once per head. `STRATA_Q36_ATTN_GQA=a` (or `=2`, `=4`, `=8`) makes one block serve the
+whole group, so the keys and values are read once. The tokens do not change - the same expressions over the same numbers,
+in the same order - only the traffic changes.
+
+**Measured on:** 192.168.1.98 (Tesla P100-12GB primary, 3x NVIDIA P104-100 helpers), Qwen3.6-35B-A3B-UD-Q4_K_XL, the peer
+path on, `--kv int8`, `--bench-pp 32768 --bench-tg 64`:
+
+| context | the flag | decode |
+|---|---|---:|
+| 40960 | off (the shipped default) | 34.4 tok/s |
+| 40960 | `=a` | **51.8 tok/s** (+50%) |
+| 2048 | off or `=a` | 60.3 tok/s (the context is too short for the shared shape to pay for itself) |
+
+`=a` decides by itself: the shared shape is used when the decode will read at least 2048 cells. Below that the old kernel
+is faster - measured 2.6% slower with the shared shape at 576 cells, 2.1% faster at about 4160 - so 2048 is the
+conservative side of the crossing (being wrong there costs about 1%).
+
+The prompt uses the same shape, and gives the same answer: on an 8192-cell prompt the old kernel and the shared shape
+give the same 96 tokens (measured 2026-10-27). The traffic drops by 8 and the time by 3, because the shared shape also
+runs 8 times fewer blocks and needs 40 registers a thread.
+
+## Reading only the chunks that can matter (opt-in, `STRATA_Q36_QUEST=K`)
+
+`STRATA_Q36_QUEST=K` (K = how many chunks of 256 cells a query row keeps) makes the decode read only the K chunks a cheap
+upper bound says can matter, instead of every chunk before the query's position. It is an approximation: the bound is an
+upper bound, not the truth.
+
+**Measured on:** the same box and model, `--bench-pp 32768 --bench-tg 64`:
+
+| | decode |
+|---|---:|
+| every chunk (the default) | 34.4 tok/s |
+| K = 8 chunks (6% of 128) | 54.0 tok/s |
+
+The kept chunks are not exact, so it needs a quality check of its own: at 32K, K = 8 gave the dense answer token for
+token over 96 tokens (and K = 4 did not), at 16K K = 4 already differs. With `STRATA_Q36_ATTN_GQA=a` on, the dense path is
+already 51.8 tok/s and the K = 8 path adds 2.7% on top. So at 32K the chunk selection alone is the faster of the two
+(54.0 against 51.8), but it is an approximation: the shared shape gives the same answer by construction, the chunk
+selection only did so in that one check.
