@@ -43,7 +43,7 @@
 | 墙钟 @32K（ctx 40960, peer, `--kv int8`）| 28.8 ms/token（GQA 关）/ **19.3 ms/token（GQA 开）** | tok/s 34.4 → 51.8 | MEASURED 盒子日志 `aaoff.out` / `aaauto.out`（12h 报告 §4） |
 | attention 核 @32K decode cell，默认核 | **14.274 ms/token** | `k_attn_part` 的核时间 | MEASURED 探针（`STRATA_Q36_MIXER_SPLIT=1`，ctx 131072，`--bench-pp 32768 --bench-tg 32`）：`plans/2026-10-26-q36-kv-stream.md:213` |
 | attention 核 @32K decode cell，GQA 共享核 | **4.787 ms/token** | `k_attn_part_gqa` 的核时间 | 同上：`:299`（merge 0.549 → 0.548 ms/token） |
-| 流量（读一次）| 470 MB/token | 528 B/head/cell（int8：256 码 + 4 个 fp16 scale）× 2 head × 40960 cell × 11 层 | DERIVED（`q36_engine.cu:423` kKVG=64；12h 报告 :49 的 528） |
+| 流量（读一次）| **381 MB/token** | 528 B/head/cell（**K 和 V 各 264 B** = 256 个 int8 码 + 4 个 fp16 scale）× 2 head × **32768 cell** × 11 层 | DERIVED（`q36_engine.cu:423` kKVG=64；12h 报告 :49 的 528）；**（2026-10-27 修正：这行早先写的是 470 MB / 40960 cell —— 探针那一趟 decode 读的是 32768 cell（ctx 131072、prompt 32768），墙钟那一趟也一样（ctx 40960 但 prompt 32768）⇒ 381 才是这两个数共用的流量）** |
 | 8 倍冗余 | 默认核每份 KV 被读 8 次 | grid `dim3(nc, nt*H)`，16 个 query row 里 8 个映射到同一个 `kvh`，地址只依赖 `kvh` | 代码：`q36_engine.cu:4145` + `:550-551` |
 | 默认核的有效读带宽 | ≈ 211 GB/s | 3.02 GB ÷ 14.274 ms | DERIVED；P100 的本地地板 ≈ 410 GB/s（q8 GEMV 实测，12h 计划 :35）|
 | 共享核 | 流量 /8，时间只 /3.03 | block 数 `nc*16` → `nc*2`，寄存器 40/线程 | MEASURED 探针 + `kv-stream.md:305-307` |
@@ -71,7 +71,7 @@
 | dense 权重 | 1.51 GB/token | 40 层的 attn_qkv 17 MiB + attn_gate 8.5 + ssm_out 8.5 + 共享专家 3×1.06（Q8_0） | DERIVED `plans/2026-10-25-q36-decode-mtp-directions.md:76-78` |
 | 本地地板 | ≈ 410 GB/s | P100 的 q8 GEMV 实测（row-dot 402-433） | MEASURED `plans/2026-10-25-q36-peer-prefill-push.md:584-591` |
 | **3.7 ms/token** | 1.51 GB ÷ 410 GB/s | **dense 块的地板**，墙钟真的付（它在 mixer 的 5.65 ms GPU 段里） | DERIVED |
-| routed 专家的字节 | 580-588 MiB/token | 8 专家 × 40（+MTP）层 × 1.8125 MiB | DERIVED |
+| routed 专家的字节 | **580 MiB/token** | 8 专家 × **40 层** × 1.8125 MiB（每专家 1,900,544 B，`plans/2026-10-24-q36-prefill-primary-fp16-review.md:71-79`）| DERIVED；**（2026-10-27 修正：这一行早先写「580-588 MiB」，那个范围没交代 40 层还是 41 层。路由账是 10240 条 = 40 层 × 256 专家（下面那行 9040/10240 就是它）⇒ MTP 那一层不在这份账里 ⇒ 580 是不用猜的数）** |
 | routed 专家在哪儿 | **88.3% 在 helper 上**（9040/10240），主卡 VRAM 只 3.1%，CPU 池 0 | 当前 peer 配置 | MEASURED 启动行（`hybrid experts: 30 of 256 per layer in VRAM (2.20 GiB)` + 三个 helper 的人数） |
 | ⇒ helper 那部分的地板 | 2.08 MB/层/helper ÷ 0.81 GB/s ≈ **2.6 ms/层** | 走 PCIe，不是 HBM | DERIVED `peer-prefill-push.md:615-617` |
 
