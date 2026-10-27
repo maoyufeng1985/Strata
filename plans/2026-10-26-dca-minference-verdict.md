@@ -75,7 +75,11 @@ Numbers all traceable to `plans/2026-10-26-q36-kv-stream.md` (MEASURED 2026-10-2
 | Cost-model fit (0.6655 + 0.10496·nc, nc=1024) | **108.1 ms/token** (extrapolated, not measured) | plan L273 |
 
 **Decode baseline (MEASURED, this box):** 54.8 tok/s = **18.25 ms/token** at ctx 2048
-(`plans/2026-10-25-q36-decode-mtp-directions.md` L31). The "16 ms/token" figure in
+(`plans/2026-10-25-q36-decode-mtp-directions.md` L31).
+**配置（2026-10-27 补）：二进制 `strata-q36.f16cuda3`、`--kv int8`、ctx 2048、**没有** peer 旗标、
+**没有** marshal、tg128，2026-10-25（`.run/decode-mtp-20261025.log`）。
+⇒ 它和别的文件里的 59.1（peer 开、fp32 KV、tg64）、61.4（peer 开、int8）是**三套不同的配置**，
+引用时必须带配置。** The "16 ms/token" figure in
 `q36_engine.cu:2577` and `plans/2026-10-26` L35/L275 is UNVERIFIED against the measured
 2026-10-25/26 numbers (18.25 ms is the measured value; 16 ms may be a different config).
 
@@ -130,7 +134,12 @@ block. The fix was implemented in `k_attn_part_gqa` (flag `STRATA_Q36_ATTN_GQA=8
 - **+19%** at ctx 32768 (17.7→21.2 tok/s), **+50%** at peer config (34.2→51.3 tok/s),
   **−0.5%** at ctx 2048 (noise) — MEASURED, plan L395-447.
 - The slope of the cost model drops from 0.105 to ~0.013 ms/tok per 256 cells
-  (plan L283). At 262144: 108.1 → ~14 ms/token (extrapolated).
+  (plan L283) — **that 0.013 was a prediction, and the measurement came back higher**:
+  the measured GQA slope is **0.0350 ms/tok per 256 cell** (`STRATA_Q36_MIXER_SPLIT=1`,
+  ctx 131072, decode 读 32768 cell, MEASURED 2026-10-26) ⇒ at 262144:
+  **108.1 → 36.1 ms/token** (still extrapolated, but from the measured slope).
+  **（2026-10-27 修正：这一行早先写的「~14 ms/token」用的是那个 0.013 的预测值，
+  实测斜率只降了 3.03 倍而不是 8 倍 ⇒ 14 不成立。）**
 - **What it took**: ~50 lines in q36's own kernel, no new dependency, no training,
   no P2P, no new GPU. Already in the tree.
 
