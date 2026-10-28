@@ -2734,10 +2734,10 @@ void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long l
 }
 
 // ================================== the read as ONE persistent kernel (opt-in STRATA_HC_PERSIST=1, CUDA + HIP) ==============
-// 80 blocks that must all be resident (a start-up run per T decides; larger T keep the default read) and two grid
-// barriers on an atomic counter.  Block b: (A) stages R' * w_norm for columns [128 b, 128 b + 128) (one stream) and writes
-// that slice's sum of squares and the UNSCALED partial dots of the 320 down + 4 inject rows (the v3 identity
-// w . xn = sum_c rs[c] (w[:, c] . x'[c])); barrier; (B) rs per stream, then rows (k, r) = b + 80 j reduced to lo / inject;
+// NB blocks that must all be resident (a start-up run per T decides; larger T keep the default read) and two grid
+// barriers on an atomic counter.  Block b: (A) stages R' * w_norm for columns [SL b, SL b + SL) (one stream) and writes
+// that slice's sum of squares and the UNSCALED partial dots of the LR down + HC inject rows (the v3 identity
+// w . xn = sum_c rs[c] (w[:, c] . x'[c])); barrier; (B) rs per stream, then rows (k, r) = b + NB j reduced to lo / inject;
 // barrier; (C) the up projection read straight from VRAM, a thread pair per row, the epilogue as gr_up_kernel.
 // ANOTHER SUMMATION ORDER than the default read (not bitwise; the init check bounds the difference).  Only the verifier's hyper-connection reads use it: they run on one stream per card (both pipeline
 // verifiers share it), so two of these kernels never wait on each other; the drafter's reads keep the default kernels.
@@ -2754,11 +2754,13 @@ __device__ __forceinline__ T shfl_xor_persist(T v, int mask) {
 #endif
 }
 // Measured on gfx1030 (bench/results/2026-10-12-hc-persist-gfx1030): the gain over the three-kernel read is (1) the down
-// projection split by column slices over all 80 blocks (the default read runs 41 blocks staging the activations through
+// projection split by column slices over all NB blocks (the default read runs 41 blocks staging the activations through
 // LDS) and (2) one launch with two grid barriers instead of three launches and the gaps between them.  Prefetching the
 // up weights (into registers or by touching them into L2 / Infinity Cache) and the epilogue inputs measured no gain on
 // gfx1030 and is gone: the 13 MB are read once from VRAM whichever way.
-constexpr int NB = 80, SL = D / NB, SPS = N / SL, UPC = N / NB, NR = LR + HC;
+// NB follows N: Flash-Next (N=2560) was 80; Whittle (N=2048) is 64 so UPC*HC*2 == THREADS still holds.
+constexpr int NB = N / 32, SL = D / NB, SPS = N / SL, UPC = N / NB, NR = LR + HC;
+static_assert(N % 32 == 0 && D % NB == 0 && SPS % 4 == 0, "persist grid divides the shape");
 static_assert(UPC * HC * 2 == THREADS, "a thread pair per up row");
 struct PArgs {
     FusedGrArgs a[kFusedGrMaxT];
@@ -2769,7 +2771,7 @@ struct PArgs {
     double* partd;      // STRATA_HC_PERSIST=3 (a reference only): the partial dots and sums of squares in double
     double* sspd;
 };
-// Returns false when the read was aborted: a block waited longer than `ticks` (the 80 blocks were not all resident - the
+// Returns false when the read was aborted: a block waited longer than `ticks` (the NB blocks were not all resident - the
 // start-up check finds that out by running every T with a short timeout) or another block aborted.  Then every block
 // leaves the kernel; the outputs are not written completely and bar[48] stays set until the host clears the words.
 __device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long ticks) {
@@ -2912,7 +2914,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
             }
     }
     if (!grid_sync(f.bar, f.timeout_ticks)) return;
-    // (B) rs per stream (every block), then rows (k, r) = b + 80 j reduced to lo / inject by the blocks in turn
+    // (B) rs per stream (every block), then rows (k, r) = b + NB j reduced to lo / inject by the blocks in turn
     if (tid < T * HC) {
         const int k = tid / HC, c = tid - k * HC;
         float rr;
@@ -3195,14 +3197,14 @@ void fused_gr_persist_init() {
         return;
     }
     if (max_t == 0) {
-        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: 80 blocks are not resident at once on %d "
-                             "multiprocessors (the check timed out)\n", dev, mp);
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: %d blocks are not resident at once on %d "
+                             "multiprocessors (the check timed out)\n", dev, hcp::NB, mp);
         return;
     }
     st.max_t = max_t;
     std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1: the verifier's hyper-connection read runs as one "
-                         "persistent kernel (80 blocks on %d multiprocessors, up to %d tokens; %d token counts timed out in "
-                         "the check; checked against the default read, max relative difference %.2g)\n", dev, mp, max_t,
+                         "persistent kernel (%d blocks on %d multiprocessors, up to %d tokens; %d token counts timed out in "
+                         "the check; checked against the default read, max relative difference %.2g)\n", dev, hcp::NB, mp, max_t,
                  timeouts, worst);
 }
 

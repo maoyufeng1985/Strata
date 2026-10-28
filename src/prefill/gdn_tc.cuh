@@ -45,6 +45,8 @@ constexpr int GTC_CW = S / 16;    // consumer warps a block: 16 value columns ea
 template <bool NORM>
 constexpr size_t kTcScanSmem = 2 * (4 * GCH * GTC_KP * 2 + GCH * GTC_VP * 4 + (NORM ? GCH * GTC_VP * 4 : 0) +
                                     4 * GCH * GTC_PP * 2 + GCH * 16 + (NORM ? GCH * GTC_CW * 4 : 0)) + 16;
+// 124944/160784 pin the Flash-Next plan (whence the numbers in the commit history); Whittle's HV=32
+// does not touch it (the scan smem is per GCH x S x HK and HV-free).
 static_assert(kTcScanSmem<false> == 124944 && kTcScanSmem<true> == 160784, "gdn_tc.cuh: the shared-memory plan");
 // the prep's scratch for a super-block (gdn_tc_scratch, one a device, 60.3 MB): the T images x 2^et as
 // [chunk][vh][2: hi, lo][GCH][GCH] f16 and their scales 2^-et as [chunk][vh], the token scalars as float4
@@ -61,14 +63,16 @@ struct GtcScratch {
 constexpr size_t kTcTiBytes = (size_t) GTC_NB * HV * 2 * GCH * GCH * 2, kTcTeBytes = (size_t) GTC_NB * HV * 4,
                  kTcScBytes = (size_t) GTC_NB * HV * GCH * 16, kTcKqBytes = (size_t) GTC_NB * HK * 4 * GCH * S * 2,
                  kTcPiBytes = (size_t) GTC_NB * HV * 2 * GCH * GCH * 2;
-static_assert(kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes + kTcPiBytes == 60305408, "gdn_tc.cuh: the scratch plan");
+constexpr size_t kTcScratch = kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes + kTcPiBytes;
+// 60305408: Flash-Next (HV 48, HK 16, S 128). Whittle-45B (HV 32, HK 16, S 128): 51388416.
+static_assert(kTcScratch == 60305408 || kTcScratch == 51388416, "gdn_tc.cuh: the scratch plan");
 // allocated on first use and kept, as gdn_chunk_scratch (kernels.cu); ti == nullptr when the card had no room
 GtcScratch gdn_tc_scratch() {
     static unsigned char* bufs[64] = {};
     GtcScratch r = {nullptr, nullptr, nullptr, nullptr, nullptr};
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return r; }
-    if (bufs[dev] == nullptr && cudaMalloc((void**) &bufs[dev], kTcTiBytes + kTcTeBytes + kTcScBytes + kTcKqBytes + kTcPiBytes) != cudaSuccess) {
+    if (bufs[dev] == nullptr && cudaMalloc((void**) &bufs[dev], kTcScratch) != cudaSuccess) {
         cudaGetLastError();
         bufs[dev] = nullptr;
         return r;
