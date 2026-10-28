@@ -29,6 +29,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/kernels.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "../prefill/moe_f16_kq_cuda.hpp"
 
@@ -675,10 +676,17 @@ __global__ void k_attn_part_gqa(const float* q, const void* kc, const void* vc, 
     // blockIdx.y, and k_attn_merge reads the same local index), so the row here must be the local one too:
     // the local token is `blockIdx.y / HKV` and the query head is `g0 + g`.
     const int lt = blockIdx.y / HKV;   // the local token
-    // STRATA_Q36_QUEST: same early return as the one-head kernel above.  The mask is per (query row, chunk) and
-    // k_quest_sel writes one row per query head, so the index is this block's FIRST query head's row - the other
-    // GB-1 heads of the group see the same KV head and so the same mask.
-    if (sel && !sel[(size_t) (lt * H + g0) * n_chunk + c]) return;
+    // STRATA_Q36_QUEST: early return only when NO head in the group wants this chunk.
+    // k_quest_sel writes one mask row per query head; merge reads each head's own mask.
+    // Gating on the group's first head alone would skip a chunk that a sibling kept, leaving that head's
+    // pm/pacc unwritten for merge to read.  Extra heads computed here are fine: merge skips them via their own mask.
+    if (sel) {
+        bool any = false;
+#pragma unroll
+        for (int g = 0; g < GB; ++g)
+            if (sel[(size_t) (lt * H + g0 + g) * n_chunk + c]) { any = true; break; }
+        if (!any) return;
+    }
     const int j = threadIdx.x;
 #pragma unroll
     for (int g = 0; g < GB; ++g) qs[g][j] = q[((size_t) t * H + g0 + g) * HD + j];
@@ -1600,17 +1608,27 @@ struct Layer {
     size_t src_gsz = 0, src_dsz = 0;
     uint8_t* hblobs = nullptr;  // hybrid mode: every expert's blob in host memory, `stride` apart
     int n_slots = 0;            // hybrid mode: the experts resident in VRAM
+    /// True when this layer's weights are FP16 (the MTP sidecar's own file): its products run on cuBLAS's F16
+    /// GEMM at every T and its activations stay FP16 - there is no q8_1 image of them (see prep).
+    bool f16w() const {
+        for (const Mat* w : {&qkv, &zg, &ssm_out, &wq, &wk, &wv, &wo, &sh_gate, &sh_up, &sh_down})
+            if (w->type == 1) return true;
+        return false;
+    }
 };
 
 struct Model {
     strata::core::ModelGeometry g;
     std::shared_ptr<strata::GgufModel> file;   // kept mapped: the experts are placed after the engine's buffers
+    // --mtp-gguf: the MTP block's own file, kept mapped for the same reason (src_g/u/d of the MTP layer point into it)
+    std::shared_ptr<strata::GgufModel> mtp_file;
     bool hybrid = false;                       // not every expert fits in VRAM: slots + the CPU pool
     // the packed Q8_0 decode copies (gguf weights, packed copy, bytes): given back when that lets every expert fit
     std::vector<std::tuple<const uint8_t*, uint8_t*, size_t>> packed;
     // the GGUF-native MTP block (blk.<n_layers>, loaded with --mtp): eh_proj over [enorm(e) | hnorm(h)], then an
     // attention + MoE layer, shared_head_norm, the main head
     bool has_mtp = false;
+    bool mtp_f16 = false;   ///< the MTP block came from an FP16 sidecar (--mtp-gguf)
     Layer mtp;
     Mat eh_proj;
     const float *mtp_enorm = nullptr, *mtp_hnorm = nullptr, *mtp_shnorm = nullptr;
@@ -1701,7 +1719,8 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
-bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
+bool load(const std::string& path, Model& m, std::string& err, bool want_mtp,
+          const std::string& mtp_gguf = std::string()) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
     const strata::GgufModel& gm = *m.file;
@@ -1722,8 +1741,17 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.freq_base")) m.rope_base = (float) v->num();
     if (const strata::MetaValue* v = gm.meta().get(p + "rope.dimension_count")) m.n_rot = (int) v->u;
     uint64_t bytes = 0;
+    // `gm_of(name)`: the file a tensor comes from.  The MTP block may be a sidecar (--mtp-gguf), whose tensors
+    // carry the MTP prefix; everything else is the model's own file.  Declared before find/mat/f32 so all three
+    // resolve the same way.
+    const strata::GgufModel* mtp_side_p = nullptr;   // set just below, before the MTP layer is read
+    std::string mtp_prefix_v;
+    auto gm_of = [&](const std::string& name) -> const strata::GgufModel& {
+        if (mtp_side_p != nullptr && name.rfind(mtp_prefix_v, 0) == 0) return *mtp_side_p;
+        return gm;
+    };
     auto find = [&](const std::string& name, size_t& s) -> const strata::TensorInfo* {
-        const strata::TensorInfo* t = gm.find(name, &s);
+        const strata::TensorInfo* t = gm_of(name).find(name, &s);
         if (!t) {
             std::fprintf(stderr, "strata-q36: missing %s\n", name.c_str());
             std::exit(1);
@@ -1734,30 +1762,35 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         size_t s = 0;
         const strata::TensorInfo* t = find(name, s);
         bytes += t->elements() * 4;
-        return upload_f32(*t, gm.shard(s).tensor_data(*t));
+        return upload_f32(*t, gm_of(name).shard(s).tensor_data(*t));
     };
-    auto mat = [&](const std::string& name) -> Mat {
+    auto mat = [&](const std::string& name, bool allow_f16 = false) -> Mat {
         size_t s = 0;
         const strata::TensorInfo* t = find(name, s);
         Mat w;
         w.type = (int) t->type;
         w.n_in = (int) t->shape[0];
         w.n_out = (int) t->shape[1];
-        if (!K::native_mmvq_supported(w.type)) {
+        // GGML_TYPE_F16 (1): refused by the native MMVQ, but a legitimate weight for the cuBLAS F16 GEMM the
+        // multi-token chunk path uses (Gemm::native's type-1 branch).  `allow_f16` is set by the MTP block's
+        // weights when they come from an FP16 sidecar file.  A one-row decode step on F16 falls back to the same
+        // GEMM (prep/apply treat it as a chunk), which is correct and slower than MMVQ - the draft step is one row.
+        const bool f16_ok = allow_f16 && w.type == 1;
+        if (!K::native_mmvq_supported(w.type) && !f16_ok) {
             std::fprintf(stderr, "strata-q36: %s is %s, which the native MMVQ does not take\n", name.c_str(), t->type_name());
             std::exit(1);
         }
         const uint64_t nb = strata::tensor_payload_bytes(*t);
         uint8_t* d = nullptr;
         CK(cudaMalloc(&d, nb));
-        CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d, gm_of(name).shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
         bytes += nb;
         w.d = d;
         // STRATA_Q8_PACKED (on by default here): the lossless qs / d plane copy the Q8_0 decode kernels read instead,
         // bitwise the same outputs
         if (w.type == 8 && K::native_q8_0_packed_enabled() && K::native_q8_0_packed_eligible(w.n_in, w.n_out)) {
             std::vector<uint8_t> packed(nb);
-            K::native_q8_0_pack_host(gm.shard(s).tensor_data(*t), packed.data(), w.n_in, w.n_out);
+            K::native_q8_0_pack_host(gm_of(name).shard(s).tensor_data(*t), packed.data(), w.n_in, w.n_out);
             uint8_t* pd = nullptr;
             CK(cudaMalloc(&pd, nb));
             CK(cudaMemcpy(pd, packed.data(), nb, cudaMemcpyHostToDevice));
@@ -1773,6 +1806,46 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
     (void) want_mtp;
     m.has_mtp = g.n_mtp_layers > 0;
+    // ---- --mtp-gguf: the MTP block from its own file (tools/q36_mtp_extract.py writes one in FP16).
+    //
+    // The block lives at blk.<n_layers> of the model file and is loaded from there by default.  A sidecar holds the
+    // same tensor names, so `gm_of(name)` resolves any tensor carrying mtp_prefix_v against it and everything else
+    // against the model file.  It is opened after the geometry is known (the prefix is the model's layer count) and
+    // it must carry every MTP tensor the block needs - a missing one is a load error, not a silent fallback.
+    std::shared_ptr<strata::GgufModel> mtp_side;
+    std::string mtp_prefix = "blk." + std::to_string(g.n_layers) + ".";
+    bool mtp_is_f16 = false;
+    if (!mtp_gguf.empty()) {
+        if (!m.has_mtp) {
+            err = "--mtp-gguf was given but the model's metadata declares no MTP layer (nextn_predict_layers = 0)";
+            return false;
+        }
+        try {
+            mtp_side = std::make_shared<strata::GgufModel>(strata::GgufModel::open(mtp_gguf));
+        } catch (const std::exception& e) {
+            err = std::string("--mtp-gguf: ") + e.what();
+            return false;
+        }
+        // the sidecar may spell the block at the model's layer index or at 0 (a file of the block alone)
+        auto has = [&](const std::string& pre) {
+            return mtp_side->find(pre + "nextn.eh_proj.weight") != nullptr;
+        };
+        if (!has(mtp_prefix)) {
+            if (has("blk.0.")) {
+                mtp_prefix = "blk.0.";
+            } else {
+                err = "--mtp-gguf: neither " + mtp_prefix + "nextn.eh_proj.weight nor blk.0.nextn.eh_proj.weight is in "
+                      + mtp_gguf;
+                return false;
+            }
+        }
+        mtp_side_p = mtp_side.get();
+        mtp_prefix_v = mtp_prefix;
+        // an F16 block needs `prep` to leave the activations FP16 at every T (see apply): read it off the FC weight
+        if (const strata::TensorInfo* t = mtp_side->find(mtp_prefix + "nextn.eh_proj.weight")) mtp_is_f16 = t->type == 1;
+        std::fprintf(stderr, "strata-q36: MTP block from %s (%s, %s)\n", mtp_gguf.c_str(), mtp_prefix.c_str(),
+                     mtp_is_f16 ? "FP16 weights, cuBLAS GEMM" : "in-file quantization");
+    }
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
         const bool is_mtp = l == g.n_layers;
         Layer& y = is_mtp ? m.mtp : m.layers[(size_t) l];
@@ -1790,17 +1863,17 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
             y.conv = f32(L(l, "ssm_conv1d.weight"));
             y.ssm_norm = f32(L(l, "ssm_norm.weight"));
         } else {
-            y.wq = mat(L(l, "attn_q.weight"));
-            y.wk = mat(L(l, "attn_k.weight"));
-            y.wv = mat(L(l, "attn_v.weight"));
-            y.wo = mat(L(l, "attn_output.weight"));
+            y.wq = mat(L(l, "attn_q.weight"), is_mtp);
+            y.wk = mat(L(l, "attn_k.weight"), is_mtp);
+            y.wv = mat(L(l, "attn_v.weight"), is_mtp);
+            y.wo = mat(L(l, "attn_output.weight"), is_mtp);
             y.q_norm = f32(L(l, "attn_q_norm.weight"));
             y.k_norm = f32(L(l, "attn_k_norm.weight"));
         }
         y.router = f32(L(l, "ffn_gate_inp.weight"));
-        y.sh_gate = mat(L(l, "ffn_gate_shexp.weight"));
-        y.sh_up = mat(L(l, "ffn_up_shexp.weight"));
-        y.sh_down = mat(L(l, "ffn_down_shexp.weight"));
+        y.sh_gate = mat(L(l, "ffn_gate_shexp.weight"), is_mtp);
+        y.sh_up = mat(L(l, "ffn_up_shexp.weight"), is_mtp);
+        y.sh_down = mat(L(l, "ffn_down_shexp.weight"), is_mtp);
         y.sh_gate_inp = f32(L(l, "ffn_gate_inp_shexp.weight"));
         CK(cudaMalloc(&y.router_ext, (size_t) (g.n_expert + 1) * g.n_embd * 4));
         CK(cudaMemcpy(y.router_ext, y.router, (size_t) g.n_expert * g.n_embd * 4, cudaMemcpyDeviceToDevice));
@@ -1832,20 +1905,25 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         // 256-byte alignment, which would move the step (a Q6_K layer's 2041200 becomes 2041344).
         const size_t al = lcm_sz(lcm_sz(block_bytes(y.L.gu_type), block_bytes(y.L.d_type)), 16);
         y.stride = (y.L.bytes + al - 1) / al * al;
-        y.src_g = gm.shard(sg).tensor_data(*tg);
-        y.src_u = gm.shard(su).tensor_data(*tu);
-        y.src_d = gm.shard(sd).tensor_data(*td);
+        // gm_of: the MTP layer's experts live in the sidecar when --mtp-gguf is set; every other layer's in gm.
+        // Reading them from gm alone would pull the model's Q4_K/Q5_K bytes into an F16 layout and NaN the logits.
+        const std::string gn = L(l, "ffn_gate_exps.weight");
+        y.src_g = gm_of(gn).shard(sg).tensor_data(*tg);
+        y.src_u = gm_of(L(l, "ffn_up_exps.weight")).shard(su).tensor_data(*tu);
+        y.src_d = gm_of(L(l, "ffn_down_exps.weight")).shard(sd).tensor_data(*td);
         y.src_gsz = gsz;
         y.src_dsz = dsz;
     }
     if (m.has_mtp) {
         const int64_t l = g.n_layers;
-        m.eh_proj = mat(L(l, "nextn.eh_proj.weight"));
+        m.eh_proj = mat(L(l, "nextn.eh_proj.weight"), /*allow_f16=*/true);
         m.mtp_enorm = f32(L(l, "nextn.enorm.weight"));
         m.mtp_hnorm = f32(L(l, "nextn.hnorm.weight"));
         m.mtp_shnorm = f32(L(l, "nextn.shared_head_norm.weight"));
     }
     m.out_norm = f32("output_norm.weight");
+    m.mtp_f16 = mtp_is_f16;
+    m.mtp_file = std::move(mtp_side);   // keep the sidecar mapped: the MTP layer's src_* point into it
     m.head = mat("output.weight");
     {
         size_t s = 0;
@@ -2070,6 +2148,14 @@ struct Engine {
     int32_t *rcnt = nullptr, *rcur = nullptr, *rbounds = nullptr, *rmax = nullptr, *ident = nullptr, *rinv = nullptr;
     void *mq_x = nullptr, *mq_hq = nullptr;
     float *mq_gu = nullptr, *mq_h = nullptr;
+    // the F16 routed experts (the MTP sidecar): the activations in the sorted order, the H in FP16, and the
+    // per-expert row ranges on the host (pinned: the F16 block waits for them, so it is never in a CUDA graph)
+    __half *f16_xg = nullptr, *f16_h = nullptr;
+    int32_t* h_f16b = nullptr;
+    // the F16 block's own stream: its route runs there, so the host's wait for the row ranges does not drain the
+    // main stream (the decode's pipeline overlaps the CPU pool's experts with the GPU's attention)
+    cudaStream_t f16_st = nullptr;
+    cudaEvent_t f16_ev_a = nullptr, f16_ev_b = nullptr;
     // the fused FP16 K-quant experts (STRATA_PF_F16_CUDA=1): the activations and the H in the natural int8
     // layout, the tiles of the experts' rows and their per-expert offsets
     void *f16_xa8 = nullptr, *f16_hq8 = nullptr;
@@ -3189,6 +3275,10 @@ struct Engine {
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+        // the F16 experts' route stream (see moe_f16): it waits for the router, not for the whole main stream
+        CK(cudaStreamCreateWithFlags(&f16_st, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&f16_ev_a, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&f16_ev_b, cudaEventDisableTiming));
         x = dalloc(T * N); h = dalloc(T * N); y = dalloc(T * N); hmain = dalloc(T * N);
         qkv = dalloc(T * C); hc = dalloc(T * C); z = dalloc(T * g.ssm_value_dim);
         alpha = dalloc(T * g.ssm_v_heads); beta = dalloc(T * g.ssm_v_heads); gdn_y = dalloc(T * g.ssm_value_dim);
@@ -3258,7 +3348,8 @@ struct Engine {
                    MMQ::fits(L.L.d_type, g.n_embd);
         };
         for (const Layer& L : m->layers) use_mmq = use_mmq && mmq_ok(L);
-        if (m->has_mtp) use_mmq = use_mmq && mmq_ok(m->mtp);
+        // F16 MTP sidecar: no MMQ kernels for type 1. Keep main-layer MMQ; MTP runs cuBLAS MoE.
+        if (m->has_mtp && !m->mtp_f16) use_mmq = use_mmq && mmq_ok(m->mtp);
         if (use_mmq) {
             const int64_t ne = (int64_t) T * Kp;
             mctx = std::make_unique<MMQ::Context>();
@@ -3290,6 +3381,23 @@ struct Engine {
                 f16_off = dalloc_t<int32_t>((size_t) g.n_expert + 1);
             }
 #endif
+        }
+        if (m->mtp_f16) {
+            // the F16 routed experts (the MTP sidecar): the route's buffers (the MMQ path's, when that path is
+            // off), the activations in the sorted order, the H in FP16, and the per-expert row ranges on the host
+            // (pinned: the F16 block waits for them, so it is never in a CUDA graph)
+            if (rcnt == nullptr) {
+                rcnt = dalloc_t<int32_t>((size_t) g.n_expert);
+                rcur = dalloc_t<int32_t>((size_t) g.n_expert);
+                rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
+                rmax = dalloc_t<int32_t>(1);
+                rinv = dalloc_t<int32_t>((size_t) T * Kp);
+                mq_gu = dalloc((size_t) T * Kp * 2 * FF);
+                mq_h = dalloc((size_t) T * Kp * FF);
+            }
+            f16_xg = dalloc_t<__half>((size_t) T * Kp * (size_t) g.n_embd);
+            f16_h = dalloc_t<__half>((size_t) T * Kp * (size_t) g.n_ff);
+            CK(cudaHostAlloc((void**) &h_f16b, ((size_t) g.n_expert + 1) * sizeof(int32_t), cudaHostAllocDefault));
         }
         std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
         {
@@ -3475,7 +3583,7 @@ struct Engine {
 
     /// y [T][n_out] = W x [T][n_in] on the native MMVQ, 8 columns per launch.
     void mm(const Mat& w, const float* xin, float* out, int T) {
-        prep(xin, w.n_in, T, q8);
+        prep(xin, w.n_in, T, q8, w.type == 1);
         apply(w, q8, out, T);
     }
     /// y [T][n_out] = W [n_out][n_in] (f32) x [T][n_in]: a decode batch on the warp-per-row kernel, a prompt chunk on
@@ -3512,13 +3620,27 @@ struct Engine {
     /// A batch above kGemmT tokens (a prompt chunk) runs its projections as GEMMs (prefill::Gemm::native: the GGUF
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
     static constexpr int kGemmT = 8;
-    void prep(const float* xin, int n, int T, void* q) {
-        if (T > kGemmT) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
+    /// The activations in the form the layer's products read: FP16 (a prompt chunk, or a layer whose weights are
+    /// FP16 - the cuBLAS F16 GEMM in apply() reads that, and such a layer has no q8_1 image) or the q8_1 image
+    /// (the MMVQ products).  `f16w` is the LAYER's own flag: a model-wide one would leave the main layers without
+    /// their q8_1 image, and their MMVQ would read a stale one - wrong numbers, not a crash.
+    void prep(const float* xin, int n, int T, void* q, bool f16w) {
+        if (T > kGemmT || f16w) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
         else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
-        if (T > kGemmT) gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
-        else mmq(w, q, out, T);
+        if (T > kGemmT) {
+            gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
+            return;
+        }
+        if (w.type == 1) {
+            // An F16 weight has no q8_1 MMVQ kernel.  Run the cuBLAS F16 GEMM for these rows too, so `prep` has to
+            // leave the activations as FP16 - which is exactly what the T > kGemmT path already does.  The caller
+            // that keeps F16 weights (the MTP block's own file) sets f16_prep, and then every T takes this branch.
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) w.d, out, T, w.n_out, w.n_in, w.n_out, 0.0f);
+            return;
+        }
+        mmq(w, q, out, T);
     }
     /// x [T][n] -> its q8_1 image (T contiguous columns: one vector of T * n), for every matrix that reads x.
     void quant(const float* xin, int n, int T, void* q) { K::native_quantize_q8_1(xin, q, n * T, 1, st); }
@@ -3614,13 +3736,14 @@ struct Engine {
                 }
         }
     }
-    void prep_in(int T) {
-        if (xq_ready && T <= kGemmT) {
+    void prep_in(int T, bool f16w) {
+        // an F16 layer has no q8_1 image to reuse: it needs the FP16 one (prep writes it below)
+        if (!f16w && xq_ready && T <= kGemmT) {
             xq_ready = false;
             return;
         }
         xq_ready = false;
-        prep(h, (int) m->g.n_embd, T, xq);
+        prep(h, (int) m->g.n_embd, T, xq, f16w);
     }
     void add_rms_post(const Layer& L, int T) {
         const int N = (int) m->g.n_embd;
@@ -3805,6 +3928,64 @@ struct Engine {
         }
         group_old(L, slot_of, skip, T, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
     }
+    /// The F16 routed experts (the MTP sidecar, --mtp-gguf): cuBLAS's FP16 GEMM, one call per expert - a GEMM
+    /// carries one weight matrix, and every expert has its own.  The route is the MMQ path's: the entries sorted by
+    /// expert, so each expert's rows are one contiguous run (rbounds[e] .. rbounds[e+1]).
+    ///   the activations: the FP16 image of h, gathered into the sorted order (ent_tok names each row's token),
+    ///   the gate and the up: two products per expert into mq_gu (the gate in the first FF columns, the up in the
+    ///     second), so the SwiGLU finds the pair together,
+    ///   the SwiGLU: mq_gu -> mq_h (FP32) -> f16_h (FP16, the down product's input),
+    ///   the down: one product per expert into eparts, in the sorted rows the combine reads (prow = rinv).
+    /// The row ranges come back to the host (one copy, one wait): this layer is never in a CUDA graph.
+    void moe_f16(const Layer& L, int T, int n_ent, int N, int FF, int Kp) {
+        const int ne = (int) m->g.n_expert;
+        const auto t_f16a = Clock::now();
+        // the route: the same kernels the MMQ path uses (the entries sorted by expert).  It runs on the block's own
+        // stream, which waits for the ROUTER alone: the host's wait for the row ranges must not drain the main
+        // stream, whose earlier work (the decode's attention) overlaps the CPU pool's experts on the host.
+        CK(cudaEventRecord(f16_ev_a, st));
+        CK(cudaStreamWaitEvent(f16_st, f16_ev_a, 0));
+        CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, f16_st));
+        k_route_count<<<grid1(n_ent), kThreads, 0, f16_st>>>(ids, n_ent, rcnt, nullptr);
+        k_route_scan<<<1, 32, 0, f16_st>>>(rcnt, ne, rbounds, rcur, rmax);
+        k_route_scatter<<<grid1(n_ent), kThreads, 0, f16_st>>>(ids, n_ent, Kp, rcur, ent_dst, ent_tok, rinv, nullptr);
+        // the row ranges on the host: one copy and one wait
+        CK(cudaMemcpyAsync(h_f16b, rbounds, (size_t) (ne + 1) * 4, cudaMemcpyDeviceToHost, f16_st));
+        CK(cudaStreamSynchronize(f16_st));
+        // the main stream waits for the route before it reads ent_tok (the gather) or the routed rows
+        CK(cudaEventRecord(f16_ev_b, f16_st));
+        CK(cudaStreamWaitEvent(st, f16_ev_b, 0));
+        const auto t_f16b = Clock::now();
+        // the activations in the sorted order
+        k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+        strata::prefill::gather_rows16((const uint16_t*) x16, ent_tok, (uint16_t*) f16_xg, n_ent, N, st);
+        // the gate and the up, one expert at a time.  The blob holds the gate's FF rows and then the up's FF rows
+        // (up_off = FF * gu_row), so the two are ONE [2*FF, N] matrix and ONE product gives the pair the SwiGLU
+        // wants: the gate in the row's first FF columns, the up in the second.
+        for (int e = 0; e < ne; ++e) {
+            const int r0 = h_f16b[e], r1 = h_f16b[e + 1];
+            if (r1 <= r0) continue;
+            const int64_t rows = r1 - r0;
+            const uint16_t* x = (const uint16_t*) f16_xg + (size_t) r0 * N;
+            const uint8_t* w = L.blobs + (size_t) e * L.stride;
+            gemm.f16(x, (const uint16_t*) w, mq_gu + (size_t) r0 * 2 * FF, rows, 2 * FF, N, 2 * FF, 0.0f);
+        }
+        // the SwiGLU and its FP16 image
+        MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
+        k_to_f16<<<grid1((int64_t) FF * n_ent), kThreads, 0, st>>>(mq_h, f16_h, (int64_t) FF * n_ent);
+        // the down, one expert at a time, into the sorted rows
+        for (int e = 0; e < ne; ++e) {
+            const int r0 = h_f16b[e], r1 = h_f16b[e + 1];
+            if (r1 <= r0) continue;
+            const int64_t rows = r1 - r0;
+            const uint16_t* hr = (const uint16_t*) f16_h + (size_t) r0 * FF;
+            const uint8_t* w = L.blobs + (size_t) e * L.stride + L.L.down_off;
+            gemm.f16(hr, (const uint16_t*) w, eparts + (size_t) r0 * N, rows, N, FF, N, 0.0f);
+        }
+        if (mtp_timing())
+            std::fprintf(stderr, "strata-q36 MTP-F16: the route and the wait %.3f ms, the products %.3f ms (host, T=%d)\n",
+                         ms_since(t_f16a), ms_since(t_f16b), T);
+    }
     void* vgrp = nullptr;
     float *vx_ = nullptr, *vh_ = nullptr;
     /// The MoE block's end (k_moe_out) for T rows.
@@ -3870,6 +4051,18 @@ struct Engine {
     void shared_expert(const Layer& L, int T, bool ext) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, FS = (int) g.n_ff_shexp;
+        if (L.sh_gate.type == 1) {
+            // the F16 shared expert (the MTP sidecar): the cuBLAS F16 GEMM at every T, the SwiGLU in FP32, and the
+            // down product on the H's FP16 image (x16 again: the gate and the up are done with it by then)
+            k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_gate.d, sg, T, FS, N, FS, 0.0f);
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_up.d, su, T, FS, N, FS, 0.0f);
+            k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
+            k_to_f16<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(shh, x16, (int64_t) T * FS);
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_down.d, sy, T, N, FS, N, 0.0f);
+            if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
+            return;
+        }
         if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
         if (T <= kGemmT) {
             if (!shared_gu(L, T)) {
@@ -3922,7 +4115,7 @@ struct Engine {
             float* hc_b = verify ? v_hc[li] : hc;
             float* al_b = verify ? v_alpha[li] : alpha;
             float* be_b = verify ? v_beta[li] : beta;
-            prep_in(T);
+            prep_in(T, L.f16w());
             apply(L.qkv, xq, qkv_b, T);
             apply(L.zg, xq, z, T);
             if (T <= kGemmT) {
@@ -3987,7 +4180,7 @@ struct Engine {
                 ++mx_gdn_n;
             }
         } else {
-            prep_in(T);
+            prep_in(T, L.f16w());
             apply(L.wq, xq, qg, T);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
@@ -4295,7 +4488,12 @@ struct Engine {
         // (or a decode layer) must not read the sums of the layer before it.
         peer_sums_n = 0;
         ev_mark(kSegDisp);      // E2: routing done; the route D2H and moe_helpers' host wait follow
-        if (hy_rows) {
+        // the F16 routed experts (the MTP sidecar): their own path - cuBLAS's FP16 GEMM, one call per expert
+        const bool f16_here = L.L.gu_type == 1 && L.L.d_type == 1;
+        if (f16_here) {
+            moe_f16(L, T, (int) n_ent, N, FF, Kp);
+            prow = rinv;   // the combine reads the sorted rows the down wrote
+        } else if (hy_rows) {
             // ONE copy of `ids` and `h` for this layer, issued ahead of every host block.  moe_helpers' window
             // (h_helper_ids/h_helper_x) and moe_hybrid_cpu's routing (h_ids/h_h) read the same two device buffers
             // and nothing writes `ids` or `h` between them, so the pair moe_hybrid_gpu used to issue after
@@ -6595,10 +6793,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer& L : m.layers) all.push_back(&L);
     if (m.has_mtp) all.push_back(&m.mtp);
     size_t total = 0, per_slot = 0, max_layer = 0;
+    // the F16 MTP block's experts are all in VRAM (the CPU pool has no FP16 format), so that layer never streams:
+    // it must not raise the staging's size, which is the prompt's expert buffer.  MEASURED 2026-10-28 (P100,
+    // 12 GB): with the FP16 block's 6 MiB experts the staging grew from 1.10 to 3.00 GiB and the main layers'
+    // VRAM slots fell from 42 to 0 per layer, and the decode fell to the CPU pool with it.
+    const bool mtp_in_vram = m.has_mtp && (E.mtp_vram_flag() || m.mtp_f16);
     for (Layer* L : all) {
         total += L->stride * (size_t) ne + kMmqTail;
         per_slot += L->stride;
-        max_layer = std::max(max_layer, L->stride * (size_t) ne);
+        if (!mtp_in_vram || L != &m.mtp) max_layer = std::max(max_layer, L->stride * (size_t) ne);
     }
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
@@ -6639,7 +6842,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     size_t total_main = 0;
     for (Layer& L : m.layers) total_main += L.stride * (size_t) ne + kMmqTail;
     bool mtp_only = false;
-    if (slots <= 0 && vram_gib < 0 && m.has_mtp && total > budget2 && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
+    // the F16 MTP block cannot be the hybrid one: the CPU pool has no FP16 format, so its experts are all in VRAM
+    if (slots <= 0 && vram_gib < 0 && m.has_mtp && !m.mtp_f16 && total > budget2 &&
+        std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr) {
         const size_t att_save = (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // att_s (4 B) + att_p16 (2 B)
         const size_t small_reserve = (size_t) 256 << 20;
         const size_t room = fr + att_save > small_reserve ? fr + att_save - small_reserve : 0;
@@ -6656,6 +6861,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
                          "budget instead\n");
         }
     }
+    if (m.mtp_f16)
+        std::fprintf(stderr, "strata-q36: the FP16 MTP block's %lld experts (%.2f GiB) are all in VRAM - the CPU expert "
+                     "pool has no FP16 format - and they do not raise the prompt staging (the block never streams)\n",
+                     (long long) ne, (double) m.mtp.stride * (size_t) ne / (1 << 30));
     if (slots <= 0 && total <= budget2 && total + ((size_t) 256 << 20) <= fr) {
         std::vector<uint8_t> blob;
         for (Layer* L : all) {
@@ -6695,7 +6904,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // get what is left of the same budget.  (The other way to give that layer experts is
     // STRATA_Q36_MTP_HELPER=1, which puts them on the helpers - but the helpers' caches are full, so that
     // trade comes out of the MAIN layers' experts.)
-    const bool mtp_vram = m.has_mtp && !mtp_only && E.mtp_vram_flag();
+    // the F16 MTP block: its experts have no CPU-pool format (the pool has no F16), so they all stay in VRAM
+    const bool mtp_vram = m.has_mtp && !mtp_only && (E.mtp_vram_flag() || m.mtp_f16);
     if (mtp_vram) {
         const size_t mtp_bytes = m.mtp.stride * (size_t) ne;
         const size_t main_per_slot = per_slot > m.mtp.stride ? per_slot - m.mtp.stride : 0;
@@ -6713,7 +6923,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         for (Layer* L : all) {
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
             else {
-                const int ns = (mtp_vram && L == &m.mtp) ? (int) ne : S;
+                const int ns = ((mtp_vram || m.mtp_f16) && L == &m.mtp) ? (int) ne : S;
                 need += (ns > 0 ? (size_t) ns * L->stride + kMmqTail : 0);
             }
         }
@@ -6728,7 +6938,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
     size_t host = 0;
     for (Layer* L : all)
-        if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
+        if ((!mtp_only || L == &m.mtp) && L->L.gu_type != 1 && L->L.d_type != 1)
+            host += L->stride * (size_t) ne + kMmqTail;
     uint8_t* arena = nullptr;
     bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
     if (!pinned) {
@@ -6754,16 +6965,32 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             L.n_slots = (int) ne;
             continue;
         }
-        L.hblobs = arena + off;
-        off += L.stride * (size_t) ne + kMmqTail;
-        std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
-        for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
-        const int ns = (mtp_vram && &L == &m.mtp) ? (int) ne : S;
+        if (L.L.gu_type == 1 || L.L.d_type == 1) {
+            // the F16 MTP block: no CPU pool (it has no F16 format), so no host copy of its experts either
+            L.hblobs = nullptr;
+        } else {
+            L.hblobs = arena + off;
+            off += L.stride * (size_t) ne + kMmqTail;
+            std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
+            for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+        }
+        // the F16 MTP block: every expert in VRAM (the CPU pool cannot take F16), so it is never hybrid
+        const int ns = ((mtp_vram || m.mtp_f16) && &L == &m.mtp) ? (int) ne : S;
         L.n_slots = ns;
         if (ns > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) ns + kMmqTail));
             CK(cudaMemset(L.blobs, 0, L.stride * (size_t) ns + kMmqTail));
-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) ns, cudaMemcpyHostToDevice));
+            if (L.hblobs) {
+                CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) ns, cudaMemcpyHostToDevice));
+            } else {
+                // the F16 MTP block: it has no host copy (the CPU pool cannot take it), so its blobs are built
+                // from the GGUF here, one expert at a time
+                std::vector<uint8_t> blob(L.L.bytes, 0);
+                for (int64_t e = 0; e < ns; ++e) {
+                    expert_blob(L, e, blob.data());
+                    CK(cudaMemcpy(L.blobs + (size_t) e * L.stride, blob.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                }
+            }
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
@@ -6775,10 +7002,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         H.score.assign((size_t) ne, 0.0);
         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
-        if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
-        if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
-            err = "the CPU and GPU expert layouts differ";
-            return false;
+        // the F16 MTP block: the CPU pool has no F16 format, and its experts are all in VRAM anyway
+        if (L.L.gu_type != 1 && L.L.d_type != 1) {
+            if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
+            if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
+                err = "the CPU and GPU expert layouts differ";
+                return false;
+            }
         }
     }
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
@@ -6820,7 +7050,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     {
         const char* qt = std::getenv("STRATA_Q36_QUEST_TIMING");
         if (qt && qt[0] == '1' && qt[1] == '\0' && E.quest_on()) {
-            E.q_ev.resize(4 * E.m->layers.size());
+            // Size includes the MTP block at index n_layers when the file has one: forward_mtp walks that index
+            // through the same quest_on bounds path, and a layers.size()-only vector made --mtp + QUEST_TIMING
+            // record past the end (cudaEventRecord invalid handle).
+            const size_t n = E.m->layers.size() + (E.m->has_mtp ? 1 : 0);
+            E.q_ev.resize(4 * n);
             for (auto& e : E.q_ev) CK(cudaEventCreate(&e));
             E.q_timing = true;
         }
@@ -7728,7 +7962,9 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
     // over the helper way when both are on: it measured faster (the draft step's layer 0.369 ms against the
     // helper's 0.531 ms, MEASURED 2026-10-25 on 192.168.1.98), and with both on the experts would be in two
     // places at once - the primary's copy wasted, the helper's copy the one the run uses.
-    const bool mtp_vram = m.has_mtp && E.mtp_vram_flag();
+    // the F16 MTP block (--mtp-gguf): its experts cannot go to a helper either - the helpers' caches hold the
+    // quantized experts (q8_1), and the F16 bytes would be cached as garbage
+    const bool mtp_vram = m.has_mtp && (E.mtp_vram_flag() || m.mtp_f16);
     const bool mtp_helper = E.mtp_helper_flag() && m.has_mtp && !mtp_vram;
     if (mtp_vram && E.mtp_helper_flag())
         std::fprintf(stderr, "strata-q36: STRATA_Q36_MTP_VRAM=1 wins over STRATA_Q36_MTP_HELPER=1 (the MTP block's layer "
@@ -7973,6 +8209,7 @@ int strata::qwen35::run(int argc, char** argv) {
     int mtp_calib = 0;
     bool mtp_adapt = false;   // --mtp-adaptive: the learned per-round depth (its number is the pool's ceiling)
     int mtp_adapt_base = 4;   // the ceiling the adaptive pool searches (0 = plain rounds too)
+    std::string mtp_gguf;     // --mtp-gguf: the MTP block from its own GGUF instead of the model file
     int suffix_k = 0;         // --suffix-draft N: suffix-lookup drafts, 0 = off
     double expert_vram = -1.0;
     bool warm = true;
@@ -8024,6 +8261,7 @@ int strata::qwen35::run(int argc, char** argv) {
             else std::fprintf(stderr, "strata-q36: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N "
                                       "drafts)\n", v.c_str());
         }
+        else if (a == "--mtp-gguf") mtp_gguf = next();   // the MTP block from its own file (tools/q36_mtp_extract.py)
         else if (a == "--mtp-calibrate") mtp_calib = std::atoi(next().c_str());
         else if (a == "--suffix-draft") suffix_k = std::atoi(next().c_str());
         else if (a == "--mtp-adaptive") {
@@ -8064,7 +8302,9 @@ int strata::qwen35::run(int argc, char** argv) {
                          "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--kv fp32|int8|k8v32|"
                          "k32v8] [--no-graph]\n"
                          "       (--serve | --tokens IDS | --tokens-file F [--n 64] [--force IDS] [--dump-full-logits F] | "
-                         "--bench-pp N --bench-tg N)\n");
+                         "--bench-pp N --bench-tg N)\n"
+                         "       --mtp N (0..7 drafts) [--mtp-gguf FILE: the MTP block from its own GGUF,\n"
+                         "         e.g. the FP16 one tools/q36_mtp_extract.py writes]\n");
             return 2;
         }
     }
@@ -8109,7 +8349,7 @@ int strata::qwen35::run(int argc, char** argv) {
     Model m;
     std::string err;
     try {
-        if (!load(model, m, err, mtp_d > 0)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
+        if (!load(model, m, err, mtp_d > 0, mtp_gguf)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;
@@ -8118,6 +8358,10 @@ int strata::qwen35::run(int argc, char** argv) {
     E.kv_k8 = kv_k8;
     E.kv_v8 = kv_v8;
     E.use_graph = graph;
+    // --mtp-gguf with FP16 weights: every projection of that block goes to the cuBLAS F16 GEMM, at one row too, so
+    // ITS activations must be left in FP16 by prep().  The flag is per layer (Layer::f16w), not per run: a run-wide
+    // one would leave the main layers without their q8_1 image.
+    E.mtp_graph = !m.mtp_f16;   // the F16 block's row ranges come back to the host: a graph cannot wait
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)

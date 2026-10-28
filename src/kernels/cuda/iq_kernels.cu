@@ -6,6 +6,7 @@
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/expert_nibble.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -845,11 +846,13 @@ STRATA_TQP_FMT(149)
 #else
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(147) X(148) X(149)
 #endif
-// Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
+// Q4_K / Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never
+// selects them.  Q4_K: Whittle-Qwen-3.8-45B-A3B (FF 512) ships 20 layers with BOTH projections Q4_K, and its
+// down kernel is the generic Fmt<TY> one, so Q4_K takes it with no new kernel (same dot as its gate/up).
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(12) X(13) X(14) X(40) X(144) X(146) X(147) X(148) X(149)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(12) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
 #endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
@@ -3673,7 +3676,8 @@ struct S26IQ3S {   // Split<21>::load with the grid from `grid` (LT) or iq3s_gri
     }
 };
 
-constexpr int S26_XMAX = 2560 / 32;   // q8_1 blocks of one activation row (n_embd 2560)
+// q8_1 blocks of one activation row (n_embd / 32): the compiled shape, so the shared rows are sized for it.
+constexpr int S26_XMAX = (int) strata::core::kCompiledGeometry.n_embd / 32;
 
 // S26 BAL: step I of a warp's RPW x NI items (item p = 32 I + lane): rows QA / QB (lanes >= THR take QB)
 template<int I, int NI, int RPW> struct S26Bal {
@@ -3775,7 +3779,8 @@ __global__ void __launch_bounds__(256) s26_gu_l_kernel(const unsigned long long*
     }
 }
 
-constexpr int S26_HMAX = 640 / 32;    // q8_1 blocks of one SwiGLU row (n_ff 640)
+// q8_1 blocks of one SwiGLU row (n_ff / 32): the compiled shape, so the shared rows are sized for it.
+constexpr int S26_HMAX = (int) strata::core::kCompiledGeometry.n_ff / 32;
 
 template<bool LX, int RPW, bool SL = false, bool TS = false, int BAL = 0>
 __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long long* __restrict__ grp_ptr,
@@ -5397,6 +5402,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 3: return (size_t) (n / 32) * sizeof(block_q4_1);
         case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 1: return (size_t) n * 2;    // F16: MTP sidecar experts (layout + cuBLAS MoE; no IQ kernels)
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         case 144: return (size_t) (n / 128) * sizeof(block_tq2_t);   // APR trellis types
         case 145: return (size_t) (n / 128) * sizeof(block_tqk6);
@@ -5528,6 +5534,9 @@ const float* hadamard_device_signs(const float* host, int width) {
 }
 
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
+    // F16/F16: MTP sidecar experts. Layout only; the engine runs them through cuBLAS, not the IQ kernels.
+    if (gu_type == 1 && d_type == 1)
+        return n_embd > 0 && n_ff > 0 && iq_row_bytes(1, n_embd) > 0 && iq_row_bytes(1, n_ff) > 0;
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
     // a type without row bytes would make every row (and the up/down offsets) 0: refused, not run wrong
     return qg > 0 && qd > 0 && iq_row_bytes(gu_type, n_embd) > 0 && iq_row_bytes(d_type, n_ff) > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&
