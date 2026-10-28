@@ -2104,6 +2104,14 @@ static bool pcie_auto_split_ok() {
     return on;
 }
 
+// STRATA_PREFILL_REMOTE_PEERS (opt-in): the prompt path's expert share runs on the helper caches
+// (--expert-cache-device1..3) instead of the primary GPU.  Off by default: the prompt path is then exactly as
+// before (no objects, no output).  Read early: it decides the peer-shaped buffers' sizes, like --peer-device does.
+static bool remote_prefill_peers_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_REMOTE_PEERS"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 // 0.1.43: the HIP defaults of the decode speed push (route tail skip, measured PCIe share) were measured on gfx1201 (Radeon AI PRO
 // R9700) and apply on gfx1200 / gfx1201 only; every other AMD part (gfx11, gfx906, ...) keeps its earlier behaviour.  CUDA: always true.
 [[maybe_unused]] static bool decode_defaults_arch_ok() {
@@ -3461,7 +3469,9 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    // multi-GPU: the Portable flag on mapped host buffers only with a peer card (before any allocation) - a helper
+    // cache is a peer card too (the prompt path's expert share runs on it)
+    strata::core::set_peer_portable(o.peer_device >= 1 || remote_prefill_peers_on());
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
         if (mib < 0) {
@@ -3914,6 +3924,30 @@ int main(int argc, char** argv) {
                      !o.layer_split.empty() ? "--layer-split (use one or the other)"
                                             : "--expert-cache-device1..3 (the peer tier already caches experts there)");
         return 2;
+    }
+    // STRATA_PREFILL_REMOTE_PEERS (opt-in): the prompt path's expert share runs on the helper caches
+    // (--expert-cache-device1..3) instead of the primary GPU.  The peer tier owns its own cache, so the two cannot
+    // share a card; a layer split splits the layers, not the experts, so it is refused too (the helpers would have
+    // to hold a layer's experts, which the split already assigns to a stage).
+    {
+        const bool remote_peers = remote_prefill_peers_on();
+        if (remote_peers) {
+            if (o.peer_device >= 1) {
+                std::fprintf(stderr, "strata generate: STRATA_PREFILL_REMOTE_PEERS cannot be combined with "
+                                     "--peer-device (the peer tier owns its own expert cache)\n");
+                return 2;
+            }
+            if (!o.layer_split.empty()) {
+                std::fprintf(stderr, "strata generate: STRATA_PREFILL_REMOTE_PEERS cannot be combined with "
+                                     "--layer-split (a split assigns each layer's experts to one stage)\n");
+                return 2;
+            }
+            if (o.expert_cache_remote[0] <= 0 && o.expert_cache_remote[1] <= 0 && o.expert_cache_remote[2] <= 0) {
+                std::fprintf(stderr, "strata generate: STRATA_PREFILL_REMOTE_PEERS needs a helper cache "
+                                     "(--expert-cache-device1..3)\n");
+                return 2;
+            }
+        }
     }
 
     if (o.native_flash_attn_short && o.max_context > 256) {
@@ -9831,6 +9865,43 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
                 err.clear();
                 (void) cudaGetLastError();   // a failed allocation here must not end the engine at the next kernel's check
+            }
+        }
+        // STRATA_PREFILL_REMOTE_PEERS (opt-in): the prompt path's expert share runs on the helper caches
+        // (--expert-cache-device1..3) instead of the primary GPU.  Each helper computes the experts its own cache
+        // holds, on its own card, and the rows come back on the host route (the helpers have no direct link to the
+        // primary on this box).  Default off: the prompt path is exactly as before (no objects, no output).
+        if (const char* rv = std::getenv("STRATA_PREFILL_REMOTE_PEERS"); rv != nullptr && std::atoi(rv) != 0 &&
+            !prefill_helpers.empty() && !multi_gpu && stages.empty() && o.batch <= 0) {
+            // how many of the helper caches take part (STRATA_PREFILL_REMOTE_PEERS_N, default: all of them)
+            int n_helpers = (int) prefill_helpers.size();
+            if (const char* nv = std::getenv("STRATA_PREFILL_REMOTE_PEERS_N"); nv != nullptr && std::atoi(nv) > 0)
+                n_helpers = std::atoi(nv);
+            n_helpers = std::min<int>(n_helpers, (int) prefill_helpers.size());
+            n_helpers = std::min<int>(n_helpers, 3);
+            std::vector<strata::prefill::PeerSource> peer_srcs;
+            for (int i = 0; i < n_helpers; ++i) {
+                strata::core::RemoteExperts* hr = prefill_helpers[(size_t) i];
+                strata::prefill::PeerSource ps;
+                ps.remote = hr;
+                ps.device = hr->device();
+                ps.p2p = false;   // a helper cache has no probed direct link to the primary
+                peer_srcs.push_back(ps);
+            }
+            const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
+            if (o.peer_prefill_rows > 0)
+                // the compact path (the helper caches always take it) lifts the peer's row cap to the chunk's rows:
+                // the flag cannot bound their share, so say so instead of taking it silently
+                std::fprintf(stderr, "strata serve: --peer-prefill-rows does not apply to the helper caches: the "
+                                     "compact path lifts the peer's row cap to the chunk's rows, and their share is "
+                                     "bounded by what their caches hold\n");
+            if (!sp.set_remote_peers(peer_srcs.data(), (int) peer_srcs.size(), rows, err)) {
+                std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
+                err.clear();
+                (void) cudaGetLastError();
+            } else {
+                std::fprintf(stderr, "strata serve: %d helper cache(s) compute the prompt path's expert rows "
+                                     "(STRATA_PREFILL_REMOTE_PEERS)\n", (int) peer_srcs.size());
             }
         }
         // a layer split: a one-chunk prompt runs the stages one after the other, so each stage's prompt path gets the

@@ -22,10 +22,24 @@
 #include <memory>
 #include <string>
 
-namespace strata::core { class PeerExperts; }
+namespace strata::core { class PeerExperts; class RemoteExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
 
 namespace strata::prefill {
+
+/// The peer card's prompt-path executor (prefill.cpp): its streams, its buffers and its residency adapter.
+struct PeerPrefill;
+
+/// Where a prompt chunk's experts come from on a second card: `--peer-device`'s own tier, or a helper's
+/// `--expert-cache-deviceN` cache (STRATA_PREFILL_REMOTE_PEERS).  Both answer "does this card hold (layer,
+/// expert)" and "where is its blob", which is all the peer executor needs; `p2p` says whether a direct link
+/// between the two cards was probed and trusted (never for a helper cache today).
+struct PeerSource {
+    core::PeerExperts* own = nullptr;
+    core::RemoteExperts* remote = nullptr;
+    int device = -1;
+    bool p2p = false;
+};
 
 struct PrefillStats {
     int64_t tokens = 0;
@@ -185,6 +199,14 @@ public:
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
 
+    /// STRATA_PREFILL_REMOTE_PEERS (opt-in): the same executor, bound to the helper caches of
+    /// `--expert-cache-device1..3` instead of a `--peer-device` tier.  The entries whose expert a helper holds are
+    /// computed on that helper, from its own cache slots, and come back on the host route (a helper cache has no
+    /// probed direct link on this box).  Refused (false + `err`) where the peer path is: no MMQ prompt path,
+    /// NVFP4 experts, a Hadamard-folded pack.  `helper_count` entries are used, in helper order.
+    bool set_remote_peers(const PeerSource* helpers, int helper_count, int64_t cap_rows, std::string& err);
+
+
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
@@ -318,6 +340,12 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
+    /// The one executor body both entry points open: it opens the peer card's executor for `src` (the
+    /// --peer-device tier or one helper cache) and hands it over.  `declined` says the card did not take the
+    /// share (an APR pack), which is not an error; `err` says why it could not be opened.
+    bool set_peer_from(const PeerSource& src, int64_t cap_rows, std::string& err);
+    static std::unique_ptr<PeerPrefill> open_peer_exec(Impl& m, const PeerSource& src, int64_t cap_rows,
+                                                        std::string& err, bool* declined);
 };
 
 }  // namespace strata::prefill

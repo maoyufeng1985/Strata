@@ -25,6 +25,9 @@ __pycache__/
 *.occ1
 td.log
 
+# the local scratch directory: the box bench scripts, the remote build tree, the captures
+/.run/
+
 # created by setup.py on the user's machine
 /.venv/
 /build/

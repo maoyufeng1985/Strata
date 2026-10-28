@@ -100,7 +100,36 @@ graph capture, the profile fill and the PCIe warm-up are fixed costs.
 
 Prefill scales with the prompt (275 tokens 215 tok/s, 699 tokens 340, 1799 tokens 467) and does not
 benefit from the other three cards at all: 340.5 vs 340.1 tok/s on 699 tokens, 470.9 vs 472.3 on 1799.
-The PCIe link is 6.1 GB/s on this box, which is not enough to pay for shipping the prompt's expert rows.
+The PCIe link is 6.1 GB/s on this box, which is not enough to pay for shipping the prompt's expert
+rows. The helper cards can still help the prompt, but only by computing rows instead of receiving
+them: see `STRATA_PREFILL_REMOTE_PEERS` below.
+
+## The prompt can use the helper cards (`STRATA_PREFILL_REMOTE_PEERS=1`)
+
+Off by default. With it on, the three helper cards (`--expert-cache-device1..3`) each compute a
+share of the prompt's expert rows on their own card and send the rows back over the host route,
+instead of the P100 computing every row itself. The decode does not change.
+
+| Arm (276-token prompt, P100 + three P104s, Q4_K_M) | prompt |
+|---|---|
+| the flag off | 242 tok/s |
+| the flag on, one helper | 258 tok/s |
+| the flag on, two helpers | 305 tok/s |
+| the flag on, three helpers | **330 tok/s** (+36 %) |
+
+Measured on the box on 2026-10-28 with the MMQ prompt path (`STRATA_MMQ_KQ=1`). The decode stayed
+at 44 tok/s in every arm.
+
+Two things to know:
+
+- **The flag needs `STRATA_MMQ_KQ=1`** on a K-quant pack. Without it the MMQ plan is empty and the
+  engine answers "needs the MMQ prompt path (set STRATA_MMQ_KQ=1 for a K-quant pack)" and the
+  prompt quietly stays on the P100.
+- **`--peer-prefill-rows` does not apply here.** The helper caches take the rows their own caches
+  hold; the engine says so when the flag is set.
+
+The numbers, the output check and the review are in
+[the plan](../plans/2026-10-28-whittle-remote-prefill-peers.md).
 
 ## Two things about the numbers
 
