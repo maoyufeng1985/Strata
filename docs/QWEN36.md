@@ -8,6 +8,74 @@ Strata runs [Unsloth's GGUFs with the MTP layer](https://huggingface.co/unsloth/
 (UD-Q4_K_XL, UD-Q6_K_XL, Q8_0) on its own engine path (`src/qwen35`; `strata` switches to it from the file's
 architecture). It runs on NVIDIA and AMD cards. The Intel Arc and Mac engines do not run it.
 
+## The MTP block as its own file (`--mtp-gguf`)
+
+The MTP head is a normal part of the model GGUF: `blk.40` plus four `nextn.*` tensors.  `--mtp-gguf FILE` reads
+that block from a separate file instead, which is how a head of different precision can be used without
+repacking the 23 GB model:
+
+```sh
+python tools/q36_mtp_extract.py --from-checkpoint --out q36-mtp-f16.gguf   # from Qwen's BF16 checkpoint
+strata-q36 --model model.gguf --mtp 2 --mtp-gguf q36-mtp-f16.gguf ...
+```
+
+`--from-checkpoint` range-reads only the 19 `mtp.*` tensors out of the official `Qwen/Qwen3.6-35B-A3B`
+safetensors (about 1.6 GB of BF16) and writes them as FP16, so the weights are the original ones and were never
+quantized.  `--from-gguf FILE` instead widens a block that is already in a GGUF; that recovers nothing, because
+the source was already Q4_K / Q5_K / Q8_0.
+
+An FP16 block is 1.57 GiB and is computed by the cuBLAS F16 GEMM, whose accumulation stays in FP32.  `--mtp 0`
+(the default) loads no drafts at all.
+
+The block's routed experts are FP16 as well, and the engine has no grouped FP16 kernel: it runs them on cuBLAS's
+FP16 GEMM, one call per expert, with the row ranges brought back to the host (so this block is never inside a
+CUDA graph).  Its experts stay in the main card's VRAM - the CPU expert pool has no FP16 format - and they are
+built from the GGUF one expert at a time, so no host copy of them is made either.
+
+Two rules make the extracted file read like the model's own block, and both were measured (2026-10-28, the file
+against the model's `blk.40`, element by element):
+
+- the expert tensors keep the checkpoint's axis order (`[E, FF, H]` for the gate and the up, `[E, H, FF]` for the
+  down), because the GGUF writes the dimensions reversed;
+- the seven RMS norm weights are one larger than the checkpoint's, which stores them shifted by -1.
+
+Check a file with the comparison the extract is written for:
+
+```sh
+python tools/q36_mtp_extract.py --verify model.gguf --out q36-mtp-f16.gguf
+```
+
+It reads the sidecar and the model's own block in each file's memory order and compares the values.  The error
+must be the quantization error of the model's copy (about 7% for the Q4_K gate and up, 4% for the Q5_K down, 0.6%
+for the Q8_0 weights, and exactly zero for the F32 and BF16 ones).  A bigger error means the layout is wrong, and
+it shows up as a non-finite logit, not as a load error.
+
+### What the FP16 head costs, and what it buys
+
+The block's routed experts are 1.5 GiB and they stay in the card (the CPU expert pool has no FP16 format), so the
+main layers get fewer of their slots.  MEASURED 2026-10-28 on the P100 12 GB + 3x P104 8 GB box, one prompt of 38
+tokens, 128 tokens generated, greedy, the same prompt in every row:
+
+| the head | drafts accepted | tok/s, the helpers on | tok/s, the helpers off | the main layers' slots |
+| --- | --- | --- | --- | --- |
+| the model's own block (Q4_K / Q5_K) | 59 of 68 (87%) | 24.9 | 25.8 | 42 of 256 per layer |
+| the FP16 sidecar | 59 of 68 (87%) | 24.5 | 20.9 | 21 of 256 per layer |
+
+The acceptance column is the helpers-on run; with the helpers off the two heads accepted 58 of 69 (84%) and 59 of
+67 (88%).
+
+The two heads draft the same tokens: the FP16 weights change the logits, but not the token the head picks, so the
+acceptance is the same.  The same holds deeper - with `--mtp 3` both heads accepted 86 of 121 (71%), and `--mtp 4`
+on the FP16 head accepted 93 of 137 (68%).
+
+Where the FP16 head costs is the card: 1.5 GiB of the primary's VRAM, which is the main layers' slots (42 per layer
+against 21).  With the helpers serving the decode that is worth about 2% (24.5 against 24.9 tok/s); without them
+most of the experts fall to the CPU pool and the decode drops to 20.9 against 25.8 tok/s.
+
+One placement rule follows from it: an FP16 block's experts never stream, so they must not raise the prompt
+staging either.  When they did, the staging grew from 1.10 GiB to 3.00 GiB, the main layers' slots fell from 42 per
+layer to 0, and the decode fell to the CPU pool with them: 14.6 tok/s against the quantized head's 25.7.
+
 ## Quick start
 
 Pick it in the app's model list, in `strata launch` or in setup:
@@ -528,15 +596,91 @@ runs 8 times fewer blocks and needs 40 registers a thread.
 upper bound says can matter, instead of every chunk before the query's position. It is an approximation: the bound is an
 upper bound, not the truth.
 
-**Measured on:** the same box and model, `--bench-pp 32768 --bench-tg 64`:
+**Measured on:** the same box and model, peer path on, `--kv int8`, `--bench-pp 32768 --bench-tg 64`
+(2026-10-27, `.run/R-questgqa-20261027.sh` / `.run/R-questtime-20261027.sh`):
 
-| | decode |
-|---|---:|
-| every chunk (the default) | 34.4 tok/s |
-| K = 8 chunks (6% of 128) | 54.0 tok/s |
+| | decode | attention ms/tok |
+|---|---:|---:|
+| GQA=8, every chunk | 51.6 / 51.3 tok/s | 4.411 |
+| GQA=8, K = 8 (6% of 128) | **53.4 / 53.3** (+3.5%) | **3.803** |
+| GQA=8, K = 16 | 50.6 / 50.7 | — |
+| GQA=8, K = 32 | 46.4 / 46.4 | 6.696 |
+| GQA=0, K = 8 (old kernel) | 53.9 / 54.1 | — |
+
+Only K = 8 is a net win. The select pass costs ~0.4 ms/tok (bounds another ~0.1); at K = 8 the attention
+saving covers it, at K ≥ 16 it does not.
 
 The kept chunks are not exact, so it needs a quality check of its own: at 32K, K = 8 gave the dense answer token for
-token over 96 tokens (and K = 4 did not), at 16K K = 4 already differs. With `STRATA_Q36_ATTN_GQA=a` on, the dense path is
-already 51.8 tok/s and the K = 8 path adds 2.7% on top. So at 32K the chunk selection alone is the faster of the two
-(54.0 against 51.8), but it is an approximation: the shared shape gives the same answer by construction, the chunk
-selection only did so in that one check.
+token over 96 tokens (and K = 4 did not), at 16K K = 4 already differs. At 64K under GQA=8 the same K = 8 already
+forks at token 5 (K = 16 / 32 / 64 also early); at 128K K = 8 forks at token 3 (1227 s), K = 16 at token 2
+(1235 s), and K = 32 at token 2 (1231 s). A GQA=0 control at 64K (`.run/R-quest64ctl-20261027.sh`) pinned the cause:
+g0 dense == gqa8 dense (96 tokens), but g0 k=8 still forks at token 5 — so the early fork is Quest selection itself,
+not only the GQA mask mismatch. The shared shape's Quest path had a real bug (kept or dropped a chunk from the
+group's first query head's mask while merge reads each head's own mask); the any-head gate in `q36_engine.cu` is
+now on the box (`strata-q36.s3` md5 `f05bf102…`). Remeasure (`.run/R-quest-remeas-20261027.sh`): fix dense == OLD
+dense (96), fix k=8 == g0 k=8 (96) — mask fix works — but fix k=8 still forks dense at token 5. Details:
+`plans/2026-10-27-q36-attn-occupancy.md`.
+
+**What this buys you, in one line:** at 32K the shared shape reads the same answer 50% faster, and the chunk
+selection adds 3.5% on top of it — but the chunk selection changes the answer at 64K and above, so it stays off
+unless you want the approximation. No K in the measured range (8 to 64) keeps the answer equal to the dense one
+past 32K.
+
+## At a 150K context (measured 2026-10-27)
+
+The numbers above use a 32K prompt in a 40K context. Here is the same run with the context at 150,000 cells, the
+prompt at 32,768 tokens and 500 decode steps, MTP depth 3, and the fastest flag set measured so far
+(`STRATA_Q36_HELPER_ASYNC` + `STRATA_Q36_HELPER_PARALLEL` + `STRATA_Q8_SM60` + `STRATA_Q36_HELPER_PARALLEL_MARSHAL` +
+`STRATA_Q36_FIXED_SLOTS` + `STRATA_Q36_PREFILL_PEERS` + `STRATA_Q36_PREFILL_PEERS_HOST` + `STRATA_Q36_PEER_SUM` +
+`STRATA_Q36_PEER_I8` + `STRATA_PF_F16_CUDA` + `STRATA_DENSE_F16_ACC`, the three helper caches on, `--kv int8`).
+Box: 192.168.1.98 (Tesla P100-12GB primary, 3x P104-100 helpers), Qwen3.6-35B-A3B-UD-Q4_K_XL.
+
+| | tok/s |
+|---|---:|
+| prompt, 32,768 tokens (random ids, `--bench-pp 32768`) | **483.0 / 481.9 / 482.1** |
+| decode, 500 steps (`--bench-tg 500`), GQA unset | **33.8 / 33.9 / 33.9** |
+| decode, same shape, `STRATA_Q36_ATTN_GQA=auto` | **50.2 / 50.2 / 50.3** |
+
+The context needs `--chunk 512`: at 150,000 cells the default 2048 asks for more VRAM than the card has left. The 34 figure is the shipped default (GQA off); set `STRATA_Q36_ATTN_GQA=auto` for ~50 tok/s — see below.
+
+A real task at the same size: the prompt is 32,768 **real** tokens (the repository's own source plus an
+instruction), and the model writes the code that was asked for.
+
+```
+prompt 32768 tokens in 67750.9 ms (483.9 tok/s), 500 generated in 15100.3 ms (33.1 tok/s),
+MTP 3 drafts: 340 of 452 accepted (75%)
+```
+
+The MTP depth, measured per draft position: d=0 134 of 154 accepted (87.0%), d=1 113 of 152 (74.3%),
+d=2 93 of 146 (63.7%).
+
+The 34 → 51 tok/s gap is **only** `STRATA_Q36_ATTN_GQA`. Unset keeps the old one-head-per-block kernel
+(`attn_gqa()` returns 0 at `q36_engine.cu:2886`); `=auto` picks the shared shape once the decode reads
+≥ 2048 cells. Same binary, peer path on, `--kv int8`:
+
+| GQA | shape | decode |
+|---|---|---:|
+| unset (default) | ctx 40k, chunk 2048, tg 500 | 33.8 / 34.0 / 33.9 tok/s |
+| unset (default) | ctx 150k, chunk 512, tg 500 | 33.8 / 33.9 / 33.9 tok/s |
+| `=auto` | ctx 40k, chunk 2048, tg 64 | 50.9 / 51.8 / 51.6 tok/s |
+| `=auto` | ctx 150k, chunk 512, tg 500 | 50.2 / 50.2 / 50.3 tok/s |
+| unset (`aaoff`, 2026-10-26) | ctx 40k, chunk 2048, tg 64 | 34.0 tok/s |
+| `=auto` (`aaauto`, 2026-10-26) | ctx 40k, chunk 2048, tg 64 | 51.0 tok/s |
+
+With GQA on, the 150K decode matches the 40K one (~50 tok/s). Set `STRATA_Q36_ATTN_GQA=auto` for the
+long-context decode path.
+
+Ruled out (same binary, GQA unset → all ~34 tok/s):
+
+| context | decode steps | MTP | prompt | decode |
+|---|---:|---:|---:|---:|
+| 150000 | 500 | 3 drafts | 483.9 | 33.8 / 33.9 / 33.9 tok/s |
+| 40960 | 500 | 3 drafts | 489.2 | 34.1 / 34.1 / 34.1 tok/s |
+| 150000 | 64 | 3 drafts | 482.6 | 33.6 / 34.1 / 34.1 tok/s |
+| 40960 | 500 | none | 561.3 | 34.0 / 34.1 / 34.1 tok/s |
+| 150000 | 500 | none | 551.7 | 33.8 / 33.8 / 33.8 tok/s |
+| 40960 | 500 | 3 drafts, chunk 2048 | 561 | 33.8 / 34.0 / 33.9 tok/s |
+
+So context, decode-step count, MTP, and prompt chunk do **not** move the decode. MTP and chunk do cost the
+**prompt**: ~489 tok/s with drafts / chunk 512 against ~561 tok/s without drafts / chunk 2048, because the
+prompt path copies draft seeds and the chunk sets the expert batch size.
