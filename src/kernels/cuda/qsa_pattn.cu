@@ -54,7 +54,7 @@ int pattn_mode() {
 namespace {
 
 constexpr int HD = 256;
-constexpr int G = 12;
+constexpr int G = 8;             // query heads per KV head (16 / 2; Flash-Next was 12)
 static_assert(HD == strata::core::kCompiledGeometry.head_dim &&
               G == strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv,
               "qsa_pattn is compiled for core/geometry.hpp");
@@ -251,7 +251,7 @@ __global__ void __launch_bounds__(THREADS, 2) ps_score_x_kernel(const float* __r
 }
 
 // ps_value_d4_kernel: the value kernel with four dims a thread (64 threads, one CTA per (KV head, query)): a cell's four
-// codes are one 32-bit load (a warp reads 128 contiguous bytes), its 12 weights three broadcast float4 reads for 48
+// codes are one 32-bit load (a warp reads 128 contiguous bytes), its G weights (G/4) broadcast float4 reads for 4*G
 // fmaf.  V loads run four cells ahead.  Per (dim, head) the fold and the merge are ps_value_kernel's.
 __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const int32_t* __restrict__ steps,
                                                          const float* __restrict__ blocks, int n_kv_heads, int n_chunks,
@@ -318,8 +318,10 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
             const float v0 = (float) (int8_t) (codes & 0xFF) * sc, v1 = (float) (int8_t) ((codes >> 8) & 0xFF) * sc;
             const float v2 = (float) (int8_t) ((codes >> 16) & 0xFF) * sc, v3 = (float) (int8_t) (codes >> 24) * sc;
             const float4* w4 = reinterpret_cast<const float4*>(spt[cl]);
-            const float4 w0 = w4[0], w1 = w4[1], w2 = w4[2];
-            const float ww[G] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w, w2.x, w2.y, w2.z, w2.w};
+            const float4 w0 = w4[0], w1 = w4[1];
+            // G==8 (Whittle): two float4. Flash-Next was G==12 (three float4).
+            static_assert(G == 8, "ps_value_d4 fold assumes G==8");
+            const float ww[G] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
 #pragma unroll
             for (int h = 0; h < G; ++h) {
                 a[0][h] = fmaf(ww[h], v0, a[0][h]);
