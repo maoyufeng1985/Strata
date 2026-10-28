@@ -1048,9 +1048,9 @@ void usage() {
                  "  --dump-mixed PATH    write the post-attention residual (n_embd, f32)\n"
                  "  --stage-timing       per-stage KERNEL-COUNT shares.  NOT a time profile: an uncaptured\n"
                  "                       event interval includes host gaps, so run with --gpu-only-full first\n"
-                 "  --graph-only         MEASURE: replay the 48 `pre` graphs only.  OMITS the 48 `post` graphs\n"
+                 "  --graph-only         MEASURE: replay the `pre` graphs only.  OMITS the `post` graphs\n"
                  "                       and the LM head, so it is NOT the GPU floor (R0.3, Memory/ERRORS.md A4)\n"
-                 "  --gpu-only-full      MEASURE: replay pre+post for all 48 layers plus the LM head, no pool.\n"
+                 "  --gpu-only-full      MEASURE: replay pre+post for every layer plus the LM head, no pool.\n"
                  "                       THE TRUE PER-TOKEN GPU FLOOR.  Quote this one, not --graph-only.\n"
                  "  --stats              print the per-stage breakdown\n"
                  "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the argmax and\n"
@@ -1223,8 +1223,9 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         // unaffected - it is a per-layer split, and shifting every layer by one preserves both metrics - but
         // anything keyed on the layer index, which is exactly what a cache profile is, would have been wrong.
         const int32_t layer_idx = (int32_t) (t->d.layers - 1);
-        if (layer_idx < 0 || layer_idx >= 48) {
-            std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
+        if (layer_idx < 0 || layer_idx >= (int32_t) strata::core::kCompiledGeometry.n_layers) {
+            std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..%lld\n", layer_idx,
+                         (long long) strata::core::kCompiledGeometry.n_layers - 1);
             return;
         }
         const int32_t rec[2] = {layer_idx, (int32_t) k};
@@ -1247,7 +1248,7 @@ void drive_pool_multi_impl(void* user, const float* x_f, const int32_t* ids, int
     // one record per token.  The multi dispatch fuses the router weights into the kernel and does not surface
     // them, so records carry unit weights: tools/make_profile.py ranks pairs by routed frequency, which is the
     // signal that matters; a one-shot --dump-routing run records true weights if a weighted ranking is wanted.
-    if (t->routing != nullptr && layer >= 0 && layer < 48) {
+    if (t->routing != nullptr && layer >= 0 && layer < (int32_t) strata::core::kCompiledGeometry.n_layers) {
         for (int64_t tok = 0; tok < n_tok; ++tok) {
             const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
             std::fwrite(rec, sizeof rec, 1, t->routing);
@@ -2682,7 +2683,7 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     if (n < 4096) return -1.0;
     constexpr size_t kTok = 4;   // 64 rows a batch
     std::vector<uint32_t> rows(kTok * 16);
-    std::vector<float> out(kTok * 2560);
+    std::vector<float> out(kTok * strata::core::kCompiledGeometry.n_embd);
     uint64_t x = 0x9E3779B97F4A7C15ull ^ n;
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t done = 0;
@@ -4574,6 +4575,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --max-context %lld cannot hold %zu prompt + %lld new tokens\n",
                      (long long) o.max_context, o.tokens.size(), (long long) o.max_new);
         return 2;
+    }
+    // THE INDEXER'S SELECTION MUST FIT THE ONE-BLOCK CAPACITY.  `attention.indexer.top_k` is free
+    // (geometry_unsupported does not pin it) because it is a budget, not a shape: the width every kernel uses is
+    // `min(n_kv, top_k + block - 1)`, read from device memory.  Two budgets behave differently:
+    //   * top_k + block - 1 <= kTopkMaxCells: the width is capped by the budget, so it can never exceed the
+    //     buffer no matter how long the context is - Flash-Next's 2048 at any length.  Always safe.
+    //   * above that: the width grows with the context until it passes the buffer, which is exactly the cells
+    //     the selection can no longer name.  Such a file is only run where the context itself stays within the
+    //     capacity - Whittle-45B's 262144 (= its context_length, i.e. a selection that is the identity
+    //     everywhere) at up to 32768 tokens, where the kernel's first branch takes the identity path unsorted.
+    if (g.has_indexer()) {
+        const int64_t reach = g.idx_top_k + g.idx_block - 1;
+        if (reach > strata::kernels::kTopkMaxCells && o.max_context > strata::kernels::kTopkMaxCells) {
+            std::fprintf(stderr,
+                         "strata generate: --max-context %lld is past what this model's indexer selection can "
+                         "name: attention.indexer.top_k %lld (a selection of %lld cells) and the one-block "
+                         "top-k writes at most %lld\n",
+                         (long long) o.max_context, (long long) g.idx_top_k, (long long) reach,
+                         (long long) strata::kernels::kTopkMaxCells);
+            return 2;
+        }
     }
 
     strata::core::SessionState ss;
@@ -8122,7 +8144,8 @@ int main(int argc, char** argv) {
                     std::printf("  %-24s %10.3f %10.3f %11.1f%%\n", sn2[k], sw, df,
                                 sw != 0.0 ? 100.0 * (df / sw - 1.0) : 0.0);
                 }
-                std::printf("  %-24s %10.3f   (full pre, 48 layers)\n", "prefix 5 total", sweep[5]);
+                std::printf("  %-24s %10.3f   (full pre, %lld layers)\n", "prefix 5 total", sweep[5],
+                            (long long) strata::core::kCompiledGeometry.n_layers);
             }
         }
         std::printf("\n  compare `--gpu-only-full`, which replays the same work as TWO graphs per layer.  The\n");
@@ -8326,7 +8349,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: token graph captured (48 layers, one launch per token)\n");
+        std::fprintf(stderr, "strata generate: token graph captured (%lld layers, one launch per token)\n",
+                     (long long) strata::core::kCompiledGeometry.n_layers);
     }
 
     // ================================ WHERE THE HOST TERM GOES, PER TOKEN ================================
@@ -18204,6 +18228,16 @@ int main(int argc, char** argv) {
         retry_round:
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
             int T = S_mtp;
+            // WITHOUT A DRAFTER THERE IS NOTHING TO VERIFY BUT THE ONE TOKEN: a pack whose file carries no MTP head
+            // (Whittle-45B) and a run with no prompt lookup takes --spec T for the WIDEST window the graph may hold,
+            // and a window of T rows then runs T-1 rows of work whose argmax the round throws away - measured at
+            // 5.2-6.5 ms a row on a P100 (T1 22.58, T2 29.13, T3 34.30, T4 41.67 ms/round).  So the window is one row
+            // and the round is plain decode; --spec still sizes the captured graphs and the buffers.  A benchmark
+            // arm with a continuation supplied (--spec-oracle / --spec-follow) keeps its window: there the rows are
+            // the point.
+            const bool no_drafter = !use_mtp && !use_df2 && o.suffix_draft <= 0 && o.lookup_chain <= 0 &&
+                                    o.spec_oracle.empty() && o.spec_follow.empty();
+            if (no_drafter) T = 1;
             policy.set_context(p);
             bool from_sfx = false;
             int sfx_match = 0;

@@ -12,6 +12,8 @@
 // specification, and fitting formulas to it would hide exactly the errors this is supposed to catch.
 #pragma once
 
+#include "strata/core/geometry.hpp"
+
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -21,8 +23,9 @@ namespace strata::plan {
 
 // ---- model geometry (the real Qwen3.8-Flash-Next artifact) ------------------
 struct Geometry {
-    int n_layers = 48;
-    int n_qsa_layers = 12; // layers 3, 7, ... 47 - the full-attention ones
+    int n_layers = (int) strata::core::kCompiledGeometry.n_layers;
+    int n_qsa_layers = (int) (strata::core::kCompiledGeometry.n_layers / strata::core::kCompiledGeometry.qsa_interval);
+    // the full-attention ones: every qsa_interval'th layer
     int n_kv_heads = 2;
     int head_dim = 256;
     int kv_group = 64; // INT8 KV is grouped-64: one fp16 scale per 64 elements
@@ -49,9 +52,9 @@ struct Geometry {
     /// GDN geometry.  `docs/semantics.md`: `ssm.state_size = 128`, `ssm.time_step_rank = 48` (the v heads),
     /// `ssm.conv_kernel = 4`, and `n_embd_r() = (d_conv-1) * (ssm_d_inner + 2*n_group*d_state) = 3 * 10240`.
     int ssm_state_size = 128;
-    int ssm_v_heads = 48;
+    int ssm_v_heads = (int) strata::core::kCompiledGeometry.ssm_v_heads;
     int ssm_d_conv = 4;
-    int ssm_conv_channels = 10240;
+    int ssm_conv_channels = (int) strata::core::kCompiledGeometry.ssm_conv_channels;
 
     /// 36 of the 48 layers are GDN; the rest are QSA.  Declared as a derivation rather than a third constant,
     /// because a `n_gdn_layers = 36` alongside `n_layers` and `n_qsa_layers` is a third thing to keep in step.

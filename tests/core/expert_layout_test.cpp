@@ -7,7 +7,7 @@
 //      field, and the totals with the header's.
 //   2. The v4 shard column `gate,up,down` (an empty field = the --native shard); v5, four names, two names and a
 //      trailing column are refused.
-//   3. check_experts_gguf + load_experts_gguf on a synthetic arena at the real dimensions 2560/640 with Unsloth's
+//   3. check_experts_gguf + load_experts_gguf on a synthetic arena at the compiled dimensions with Unsloth's
 //      format pairs (Q4_K/Q5_1, Q5_K/Q8_0): layer 1's gate/up in another file than its down.  Every byte of the
 //      arena is compared with the source tensors.  Then the refusals: an offset that is not the tensor's, a
 //      truncated file, a role named in the wrong file, a type or a shape the pack does not say, a missing file.
@@ -120,7 +120,7 @@ std::string manifest(int version, const std::string& col1, int64_t blob, int n_e
 void columns() {
     strata::kernels::cpu::NativeFmt f;
     std::string err;
-    if (!strata::kernels::cpu::native_fmt(12, 7, 2560, 640, f, err)) {
+    if (!strata::kernels::cpu::native_fmt(12, 7, strata::kernels::cpu::H, strata::kernels::cpu::FF, f, err)) {
         check(false, "Q4_K/Q5_1 native format: " + err);
         return;
     }
@@ -151,7 +151,7 @@ void columns() {
 // ---- 3. the arena from synthetic shards
 void arena() {
     using fixture::Tensor;
-    constexpr int64_t H = 2560, FF = 640, NE = 2;
+    constexpr int64_t H = strata::kernels::cpu::H, FF = strata::kernels::cpu::FF, NE = 2;
     const uint32_t Q4_K = 12, Q5_1 = 7, Q5_K = 13, Q8_0 = 8, Q3_K = 11, IQ3_S = 21;
     strata::kernels::cpu::NativeFmt f0, f1;
     std::string err;
@@ -333,7 +333,8 @@ void arena() {
                            {"blk.0.ffn_down_exps.weight", {FF, H, NE + 1}, Q5_1, 33}});
     ok = load(d2.path / "pack", 1, 512, err) && !strata::core::check_experts_gguf(C.string(),
                                                                                   strata::kernels::cpu::expert_layout(), err);
-    check(ok && err.find("is not [640, 2560, 2]") != std::string::npos, "a down tensor of another shape is refused");
+    check(ok && err.find("is not [" + std::to_string(FF) + ", " + std::to_string(H) + ", 2]") != std::string::npos,
+          "a down tensor of another shape is refused");
 }
 }  // namespace
 

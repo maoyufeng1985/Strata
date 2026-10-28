@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/prefill/gdn_chunk.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -20,8 +21,14 @@
 namespace strata::prefill {
 namespace {
 
-constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
-constexpr int S = 128, HK = 16, HV = 48, C = 10240;
+constexpr int N = strata::core::kCompiledGeometry.n_embd, HC = strata::core::kCompiledGeometry.hc,
+              D = N * HC, LR = strata::core::kCompiledGeometry.hc_lr;
+constexpr int S = strata::core::kCompiledGeometry.ssm_state_size, HK = strata::core::kCompiledGeometry.ssm_k_heads,
+              HV = strata::core::kCompiledGeometry.ssm_v_heads,
+              C = strata::core::kCompiledGeometry.ssm_conv_channels,
+              FF = strata::core::kCompiledGeometry.n_ff;   // the expert width (Whittle 512, Flash-Next 640)
+// the experts a token takes: the combine's unrolled k, and the strides of the routing and slot rows
+constexpr int K = strata::core::kCompiledGeometry.n_expert_used;
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -2013,7 +2020,9 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
 }
 
 // ---------------------------------------------------------------- MoE
-template <int REG>
+// REG experts per lane (n_expert / 32), KP the experts a token takes (the compiled n_expert_used: 8 on Whittle,
+// 10 on Flash-Next).  The rows of `ids` and `wout` are KP wide.
+template <int REG, int KP>
 __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
                              int64_t T) {
     const int64_t t = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -2034,7 +2043,7 @@ __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restri
 #pragma unroll
     for (int i = 0; i < REG; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
     float selected = 0.0f, selected_sum = 0.0f;
-    for (int rank = 0; rank < 10; ++rank) {
+    for (int rank = 0; rank < KP; ++rank) {
         float best = v[0];
         int ex = lane;
 #pragma unroll
@@ -2046,11 +2055,11 @@ __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restri
             if (ob > best || (ob == best && oi < ex)) { best = ob; ex = oi; }
         }
         if ((ex & 31) == lane) { v[ex / 32] = -INFINITY; selected_sum += best; }
-        if (lane == 0) ids[t * 10 + rank] = ex;
+        if (lane == 0) ids[t * KP + rank] = ex;
         if (rank == lane) selected = best;
     }
     selected_sum = fmaxf(warp_sum(selected_sum), 6.103515625e-5f);
-    if (lane < 10) wout[t * 10 + lane] = selected / selected_sum;
+    if (lane < KP) wout[t * KP + lane] = selected / selected_sum;
 }
 // Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales [2560][10] f16
 template <bool HALF>
@@ -2080,9 +2089,9 @@ __global__ void blob_dequant_kernel(const uint8_t* __restrict__ blob, uint16_t* 
 }
 __global__ void swiglu_il_kernel(const float* __restrict__ gu, uint16_t* __restrict__ h16, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n * 640) return;
-    const int64_t r = i / 640, k = i % 640;
-    const float g = gu[r * 1280 + 2 * k], u = gu[r * 1280 + 2 * k + 1];
+    if (i >= n * FF) return;
+    const int64_t r = i / FF, k = i % FF;
+    const float g = gu[r * (2 * FF) + 2 * k], u = gu[r * (2 * FF) + 2 * k + 1];
     h16[i] = hf_sat(g / (1.0f + __expf(-g)) * u);
 }
 // The Volta prompt experts (gemm_iq_f16_grouped): SwiGLU of the gate/up product's rows (gate 0..n_ff, up n_ff..2 n_ff,
@@ -2099,7 +2108,7 @@ __global__ void swiglu_split_f16_kernel(const float* __restrict__ gu, uint16_t* 
 __global__ void swiglu_pair_kernel(const float* __restrict__ g, const float* __restrict__ u, uint16_t* __restrict__ h16,
                                    int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n * 640) return;
+    if (i >= n * FF) return;
     const float a = g[i];
     h16[i] = hf_sat(a / (1.0f + __expf(-a)) * u[i]);
 }
@@ -2120,10 +2129,10 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k) {
-        const int64_t r = slot[t * 10 + k];
+    for (int k = 0; k < K; ++k) {
+        const int64_t r = slot[t * K + k];
         const float v = row_sd ? Dm[r * N + d] * row_sd[r] : Dm[r * N + d];   // the product scale_down_rows stored
-        s = fmaf(w[t * 10 + k], v, s);
+        s = fmaf(w[t * K + k], v, s);
     }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
@@ -2138,12 +2147,12 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     if (i >= T * (N / 4)) return;
     const int64_t t = i / (N / 4), d = (i % (N / 4)) * 4;
     float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 v[10];
-    float ww[10];
+    float4 v[K];
+    float ww[K];
 #pragma unroll
-    for (int k = 0; k < 10; ++k) {
-        ww[k] = w[t * 10 + k];
-        const int64_t r = slot[t * 10 + k];
+    for (int k = 0; k < K; ++k) {
+        ww[k] = w[t * K + k];
+        const int64_t r = slot[t * K + k];
         v[k] = *reinterpret_cast<const float4*>(Dm + r * N + d);
         if (row_sd) {   // NVFP4 in MMQ: the row's s_down, as moe_combine_kernel applies it
             const float sd = row_sd[r];
@@ -2151,7 +2160,7 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
         }
     }
 #pragma unroll
-    for (int k = 0; k < 10; ++k) {
+    for (int k = 0; k < K; ++k) {
         s.x = fmaf(ww[k], v[k].x, s.x); s.y = fmaf(ww[k], v[k].y, s.y);
         s.z = fmaf(ww[k], v[k].z, s.z); s.w = fmaf(ww[k], v[k].w, s.w);
     }
@@ -2212,18 +2221,23 @@ __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, i
     p[pair] = a * c - b * s;
     p[pair + 32] = a * s + b * c;
 }
+// THE Q ROWS ARE NH HEADS OF 2*QHD: the projection writes the query and the gate side by side (the gated
+// attention), and this kernel takes the query half.  The compiled shape gives both.
+constexpr int64_t QHD = strata::core::kCompiledGeometry.head_dim;
+constexpr int64_t NH = strata::core::kCompiledGeometry.n_head;
+constexpr int64_t QW = NH * 2 * QHD;      // the Q row width per token (q and gate)
 __global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T * 24 * 256) return;
-    const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-    q[i] = qf[t * 24 * 512 + h * 512 + d];
+    if (i >= T * NH * QHD) return;
+    const int64_t t = i / (NH * QHD), h = (i / QHD) % NH, d = i % QHD;
+    q[i] = qf[t * QW + h * 2 * QHD + d];
 }
 __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
                                  int64_t T, int64_t ld16) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= T * 24 * 256) return;
-    const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-    o16[t * ld16 + h * 256 + d] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
+    if (i >= T * NH * QHD) return;
+    const int64_t t = i / (NH * QHD), h = (i / QHD) % NH, d = i % QHD;
+    o16[t * ld16 + h * QHD + d] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * QW + h * 2 * QHD + QHD + d]))));
 }
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
@@ -2817,12 +2831,13 @@ void gdn_recurrence_state_only(float* state, const float* h, const float* gate, 
                         stream, 0, /*with_out=*/false);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
-    if (n_expert == 512)
-        route_kernel<16><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
-    else if (n_expert == 256)
-        route_kernel<8><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    // the compiled KP is the row width of `ids` / `weights` (NativeGeom / the prompt buffers are sized with it)
+    if (n_expert == 512 && K == 10)
+        route_kernel<16, 10><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    else if (n_expert == 256 && K == 8)
+        route_kernel<8, 8><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
     else
-        strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
+        strata::kernels::router_top10(logits, (int) T, (int) n_expert, (int) K, ids, weights, stream);
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
@@ -2835,7 +2850,7 @@ void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, voi
 }
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
-    swiglu_il_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(gu, h16, n);
+    swiglu_il_kernel<<<blocks_for(n * FF), 256, 0, (cudaStream_t) stream>>>(gu, h16, n);
     check("swiglu_interleaved");
 }
 void swiglu_split_f16(const float* gu, uint16_t* h16, int64_t rows, int n_ff, bool interleaved, void* stream) {
@@ -2844,7 +2859,7 @@ void swiglu_split_f16(const float* gu, uint16_t* h16, int64_t rows, int n_ff, bo
     check("swiglu_split_f16");
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
-    swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
+    swiglu_pair_kernel<<<blocks_for(n * FF), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
     check("swiglu_pair");
 }
 namespace {
@@ -2887,9 +2902,9 @@ __global__ void moe_combine_peer_kernel(const float* __restrict__ Dm, const int3
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k) {
-        const int32_t r = slot[t * 10 + k];
-        if (r < rows_local) s = fmaf(w[t * 10 + k], Dm[(int64_t) r * N + d], s);
+    for (int k = 0; k < K; ++k) {
+        const int32_t r = slot[t * K + k];
+        if (r < rows_local) s = fmaf(w[t * K + k], Dm[(int64_t) r * N + d], s);
     }
     bo[i] = (s + peer[i]) + shared[i] * sigm(sg[t]);
 }
@@ -2899,7 +2914,7 @@ __global__ void peer_scatter_add_kernel(float* __restrict__ sum, const float* __
     if (i >= n * N) return;
     const int64_t r = i / N, d = i % N;
     const int32_t p = pair[r];
-    float* o = sum + (int64_t) (p / 10) * N + d;
+    float* o = sum + (int64_t) (p / K) * N + d;
     *o = fmaf(wk[p], rows[i], *o);
 }
 __global__ void moe_combine_peer16_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
@@ -2911,9 +2926,9 @@ __global__ void moe_combine_peer16_kernel(const float* __restrict__ Dm, const in
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k) {
-        const int32_t r = slot[t * 10 + k];
-        if (r < rows_local) s = fmaf(w[t * 10 + k], Dm[(int64_t) r * N + d], s);
+    for (int k = 0; k < K; ++k) {
+        const int32_t r = slot[t * K + k];
+        if (r < rows_local) s = fmaf(w[t * K + k], Dm[(int64_t) r * N + d], s);
     }
     bo[i] = (s + __half2float(__ushort_as_half(peer16[i]))) + shared[i] * sigm(sg[t]);
 }
@@ -3033,12 +3048,12 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
     check("rope");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
-    split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
+    split_q_kernel<<<blocks_for(T * NH * QHD), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
     check("split_q");
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16) {
-    gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T,
-                                                                                ld16 > 0 ? ld16 : 24 * 256);
+    gate_attn_kernel<<<blocks_for(T * NH * QHD), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T,
+                                                                                ld16 > 0 ? ld16 : NH * QHD);
     check("gate_attn");
 }
 

@@ -236,7 +236,10 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         throw std::invalid_argument("ple_block: native key requires Q2_0, IQ3_XXS, IQ4_XS or Q8_0 weights, input/output, private scratch and explicit stream");
     if (emb == nullptr || hidden == nullptr || hist_rows == nullptr || out.result == nullptr) return;
     const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
-    static_assert(NG_N_EMBD == 2560 && NG_HC_DIM == 10240, "native PLE key geometry changed");
+    // The key geometry is PLE_N_HEADS rows of PLE_HEAD_DIM values = n_embd, and the HC width is
+    // NG_HC * n_embd.  Whittle-45B: 8 x 256 = 2048 and 4 x 2048 = 8192 (the same invariant at a new width).
+    static_assert(PLE_N_HEADS * PLE_HEAD_DIM == NG_N_EMBD && NG_HC_DIM == NG_HC * NG_N_EMBD,
+                  "native PLE key geometry changed");
     const size_t float_bytes = (size_t) (5 * hc_dim + n_embd + hc) * sizeof(float);
     cudaStream_t st = (cudaStream_t) stream;
 

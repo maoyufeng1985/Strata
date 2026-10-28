@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/core/geometry.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_expert_opt.hpp"   // RemoteExpertOpt's definition: remote_opt_active() reads its active()
@@ -37,7 +38,9 @@ public:
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
               std::vector<uint8_t>& claimed, std::string& err, bool auto_size = false,
-              int64_t n_embd = 2560, int64_t n_ff = 640, int64_t k = 10,
+              int64_t n_embd = strata::core::kCompiledGeometry.n_embd,
+              int64_t n_ff = strata::core::kCompiledGeometry.n_ff,
+              int64_t k = strata::core::kCompiledGeometry.n_expert_used,
               const std::vector<strata::kernels::NativeExpertLayout>* layer_layouts = nullptr);
     void close();
 
@@ -160,8 +163,8 @@ private:
     int rings_ = 1;            ///< 1 = legacy (RING unset/0); >=2 = HELPER_RING depth
     int rr_ = 0;               ///< ping-pong index for begin_win
     int64_t n_expert_ = 0;
-    int64_t n_embd_ = 2560;   ///< the model's row width, set by open(); Flash-Next's default
-    int64_t n_ff_ = 640;      ///< the model's expert intermediate width, for the scratch sizing
+    int64_t n_embd_ = strata::core::kCompiledGeometry.n_embd;   ///< the model's row width, set by open()
+    int64_t n_ff_ = strata::core::kCompiledGeometry.n_ff;      ///< the model's expert intermediate width, for the scratch sizing
     int64_t k_ = 10;          ///< the experts routed per token; begin() checks a window against it
     int64_t cap_ = 80;        ///< the window's entry count, MAXT * k_ (Flash-Next: 8 * 10)
     std::vector<strata::kernels::NativeExpertLayout> layer_layouts_;   ///< per-layer native layout override; empty = use the global expert_layout() table

@@ -32,6 +32,7 @@ not additional top-level families.
 | DeepSeekV4.1-Flash-1017 | `deepseek41` in `MULTI_FILE_FAMILIES` in [setup.py](../setup.py); Terminal since 0.2.4, desktop app since 0.2.5 | [MODELS.md](MODELS.md#deepseek-v41-flash): IST-DAS 1.75 bpw (239 GB), 2.00 bpw (257 GB) and 2.25 bpw (274 GB), 8K context, a Speed choice (Faster or Full quality). NVIDIA RTX 30, 40 and 50 (Windows, Linux), AMD Radeon AI PRO R9700 (Linux) and Ryzen AI Max / Strix Halo (Windows, gfx1151). Not on Mac, Intel Arc or Strix Halo on Linux yet. |
 | Qwen3.8-Flash-Next | Catalog entries in [setup.py](../setup.py), model guides and backend documentation | [MODELS.md](MODELS.md), [QUANTS.md](QUANTS.md), [GYRO.md](GYRO.md), [NVFP4.md](NVFP4.md), [ORCA.md](ORCA.md) |
 | Qwen3.6-35B-A3B | `qwen36` in `OWN_PATH_FAMILIES` in [setup.py](../setup.py) | [QWEN36.md](QWEN36.md): NVIDIA and AMD; not the Intel or Mac engine |
+| Whittle-Qwen-3.8-45B-A3B | **not an officially supported model**: a working-tree port of the `qwen4exp` engine path to its shape (40 layers, 2048 wide, 16 heads, 256 experts top-8), no catalog entry | [WHITTLE45B.md](WHITTLE45B.md): NVIDIA; measured on a Tesla P100, 43.9 tok/s decode and 215 tok/s prefill with a native pack and three helper cards |
 
 Do not reuse Qwen quant names, model sizes or performance figures for DeepSeek. A field this page does not state is
 **unknown**, not zero and not unsupported. DeepSeek Harness is a coding tool; its presence does not establish support

@@ -21,7 +21,7 @@ namespace strata::kernels {
 namespace {
 
 constexpr int HD = 256;          // head_dim
-constexpr int G = 12;            // query heads per KV head (24 / 2)
+constexpr int G = 8;            // query heads per KV head (16 / 2)
 static_assert(HD == strata::core::kCompiledGeometry.head_dim && G == strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv, "qsa_decode_attn is compiled for core/geometry.hpp");
 constexpr int CHUNK = 64;        // cells per block
 constexpr int THREADS = 256;
@@ -135,7 +135,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
     part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
     part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
     part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
-    __shared__ __align__(16) float sq[G][HD];     // 12 KB: this KV head's query heads
+    __shared__ __align__(16) float sq[G][HD];     // G*HD*4 B: this KV head's query heads
     __shared__ float sp[G][CHUNK];                // scores, then probabilities
     __shared__ long long srow[CHUNK];             // pool row of each cell (page, kv head, slot)
     const int n_ids = __ldg(step + kStepWidth);
@@ -149,7 +149,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
         return;
     }
     // Opt-in gfx906 batched attention: a bijective XOR of query dimensions in LDS only. It swaps the two
-    // float4 halves of lanes whose bit 2 is set, retaining 16-byte alignment and the 12 KB tile.
+    // float4 halves of lanes whose bit 2 is set, retaining 16-byte alignment and the query tile.
     // The scoring reads undo this permutation; FP operands and operation order are unchanged.
     static_assert(!QUERY_SWIZZLE || !LANE_CELL, "query swizzle is for warp scoring only");
     for (int i = t; i < G * HD; i += THREADS) {
@@ -172,7 +172,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
     if constexpr (LANE_CELL) {
         // S25 (STRATA_ATTN_LANECELL=1): thread t scores cell t % 64 for heads 3 (t / 64) .. +2 by itself - the same
         // 8-dimension partial per former lane (the identical expression), then the former warp_sum's butterfly as
-        // lane 0 ran it (a[l] += a[l + o] for o = 16 .. 1), so every score is bit-identical without 12 shuffle
+        // lane 0 ran it (a[l] += a[l + o] for o = 16 .. 1), so every score is bit-identical without G shuffle
         // reductions per cell
         constexpr int HPT = G * CHUNK / THREADS;   // heads per thread (3)
         const int c = t % CHUNK, h0 = (t / CHUNK) * HPT;
@@ -256,7 +256,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
         if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
     }
     __syncthreads();
-    // values: thread t owns dimension t for all 12 heads.
+    // values: thread t owns dimension t for all G heads.
     float acc[G];
 #pragma unroll
     for (int h = 0; h < G; ++h) acc[h] = 0.0f;
@@ -331,11 +331,11 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* _
 // Turing (INT8 pools): attn_chunk_kernel<1> bit for bit, rearranged for the SM's shared-memory pipe, which the
 // default kernel saturates (its time grew with the queries even with the SMs half empty).  Three changes, none to an
 // operand or the order of an operation:
-//   - the lane's slice of the 12 query heads (8 dimensions each) is read from shared memory once, into registers,
+//   - the lane's slice of the G query heads (8 dimensions each) is read from shared memory once, into registers,
 //     instead of two 16-byte reads per head per cell (with a two-way bank conflict at lane * 8);
 //   - the 12 heads' lane sums are reduced with reduce12_gfx906 (16 shuffles, each sum warp_sum's pairs) instead of
 //     12 warp_sums (60 shuffles);
-//   - the probabilities are stored cell-major, so the value loop reads a cell's 12 as three 16-byte broadcasts.
+//   - the probabilities are stored cell-major, so the value loop reads a cell's G as 16-byte broadcasts.
 // RTX 2080 Ti, 2051 selected cells: 1 / 2 / 3 / 4 queries 51.6 / 78.5 / 110 / 146 -> 34.5 / 41.0 / 73.0 / 84.9 us
 // (with the merge); 600 cells 45.9 / 74.6 / 105 / 137 -> 28.6 / 32.8 / 33.5 / 33.3 us.  STRATA_ATTN_V3=0 keeps the
 // default kernel; =1 takes this one on any CUDA card.
@@ -352,7 +352,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_v3_kernel(const float* 
     part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
     part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
     __shared__ __align__(16) float sq[G][HD];
-    __shared__ __align__(16) float spt[CHUNK][G];   // cell-major: one cell's 12 heads are 3 float4
+    __shared__ __align__(16) float spt[CHUNK][G];   // cell-major: one cell's G heads, 16-byte each
     __shared__ long long srow[CHUNK];
     const int n_ids = __ldg(step + kStepWidth);
     const int chunk = blockIdx.x, kvh = blockIdx.y;
@@ -427,8 +427,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_v3_kernel(const float* 
         const float v = (float) p.v_q[srow[c] * HD + t] * sc;
         const float4 p0 = *reinterpret_cast<const float4*>(&spt[c][0]);
         const float4 p1 = *reinterpret_cast<const float4*>(&spt[c][4]);
-        const float4 p2 = *reinterpret_cast<const float4*>(&spt[c][8]);
-        const float pr[G] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w, p2.x, p2.y, p2.z, p2.w};
+        const float pr[G] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
 #pragma unroll
         for (int h = 0; h < G; ++h) acc[h] = fmaf(pr[h], v, acc[h]);
     }
@@ -490,9 +489,9 @@ template <bool DPP> __device__ __forceinline__ float warp_max_x(float v) {
     v = fmaxf(v, shfl_x<DPP, 2>(v)); v = fmaxf(v, shfl_x<DPP, 1>(v));
     return v;
 }
-// The 12 heads' lane sums (`part[12..15]` zero), reduce-scattered with warp_sum's pairing order (xor 16, 8, 4, 2, 1):
+// The G heads' lane sums (`part[G..15]` zero), reduce-scattered with warp_sum's pairing order (xor 16, 8, 4, 2, 1):
 // every output adds the same two operands at every level, so each sum is bit for bit warp_sum's (float add commutes),
-// for 16 shuffles instead of 12 x 5.  Lane l ends holding head head_of_lane(l); lanes l and l^1 agree.
+// for 16 shuffles instead of G x 5.  Lane l ends holding head head_of_lane(l); lanes l and l^1 agree.
 template <bool DPP> __device__ __forceinline__ float reduce12(const float (&part)[16], int lane) {
     float r8[8];
 #pragma unroll

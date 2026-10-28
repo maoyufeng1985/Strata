@@ -28,10 +28,10 @@
 namespace strata::kernels {
 
 // ---- geometry, every value confirmed against the artifact (docs/gguf-metadata.txt) ----
-inline constexpr int NG_N_EMBD = 2560;          // n_embd
-inline constexpr int PLE_HEAD_DIM = 160;        // qwen4exp.embedding_length_per_layer_input
+inline constexpr int NG_N_EMBD = 2048;          // n_embd
+inline constexpr int PLE_HEAD_DIM = 256;        // qwen4exp.embedding_length_per_layer_input
 inline constexpr int NGRAM_SIZE = 3;            // qwen4exp.ple.ngram_size
-inline constexpr int HEADS_PER_NGRAM = 8;       // qwen4exp.ple.heads_per_ngram
+inline constexpr int HEADS_PER_NGRAM = 4;       // qwen4exp.ple.heads_per_ngram
 inline constexpr int PLE_N_HEADS = (NGRAM_SIZE - 1) * HEADS_PER_NGRAM;   // 16
 inline constexpr int PLE_CONV_KERNEL = 4;       // qwen4exp.ple.conv_kernel
 inline constexpr int32_t PLE_EOS_TOKEN_ID = 248044;
@@ -43,20 +43,21 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 
 // The table: [160, 320001536] IQ4_NL.  ne0 = 160 is the FAST axis, so one row is 160 contiguous elements =
 // 5 blocks of 32 at 18 bytes = 90 bytes.  The head-slowest flatten then makes 16 rows exactly n_embd = 2560.
-inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
+inline constexpr uint64_t PLE_TABLE_ROWS = 39040000ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90: an IQ4_NL row
 inline constexpr int PLE_ROW_BYTES_FP8 = PLE_HEAD_DIM;                   // 160: an F8_E4M3 row, one byte a value
 inline constexpr int PLE_ROW_BYTES_Q5_1 = (PLE_HEAD_DIM / 32) * 24;     // 120: a Q5_1 row (a Q5_K_M finetune)
 inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;     // 170: a Q8_0 row (UD-Q6_K_XL, Swift-1.5 Q4_K_L)
 inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;             // 320: a BF16 row, two bytes a value
 inline constexpr int PLE_ROW_BYTES_NVFP4 = PLE_HEAD_DIM / 2 + PLE_HEAD_DIM / 16;   // 90: 80 B of E2M1 codes + 10 E4M3 block scales
+inline constexpr int PLE_ROW_BYTES_Q4_K = 144;              // 144: one Q4_K block (256 values)
 inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;             // the widest row any format in `ple_formats()` has
 
 /// THE FORMATS OF THE TABLE, ONE ROW EACH. A table type is one entry here (its GGUF type name, the bytes of one
 /// 160-value row, how to turn a row into floats) and nothing else: `PleTable::open`, `format()`, the reader's row size,
 /// the error string and the buffers' size all read this list, so a new format cannot be in one switch and missing from
 /// another. A row is always `PLE_HEAD_DIM` = 160 values = 5 blocks of 32 for the block formats.
-enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16, NVFP4 };
+enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16, NVFP4, Q4_K };
 
 struct PleFormatInfo {
     PleFormat id;

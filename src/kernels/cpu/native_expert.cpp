@@ -2,6 +2,7 @@
 // Default keeps the existing dispatch. WindowInvariant preserves that dispatch's single-token arithmetic
 // while retaining shared weight decoding where the grouped kernel gives the same result.
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
@@ -124,7 +125,7 @@ bool x512_one_ok(int type) {
     const ggml_type_traits_cpu* tr = traits(type);
     const ggml_type_traits_cpu* t8 = traits(GGML_TYPE_Q8_K);
     if (tr != nullptr && tr->vec_dot != nullptr && t8 != nullptr && t8->from_float != nullptr && iq512x_supported(type)) {
-        constexpr int n = 2560, rows = 24;
+        constexpr int n = strata::core::kCompiledGeometry.n_embd, rows = 24;
         const size_t rb = ggml_row_size((ggml_type) type, n), nb = (size_t) n / 256, bb = rb / nb;
         std::vector<uint8_t> w((size_t) rows * rb), act(ggml_row_size(GGML_TYPE_Q8_K, n));
         uint32_t seed = 12345u;

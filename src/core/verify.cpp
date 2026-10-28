@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -840,7 +841,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: " + why + " (the verify window reproduces the default native decode path)";
         return false;
     }
-    if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
+    if (!strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) ||
+        ss.k != (int) strata::core::kCompiledGeometry.n_expert_used || g.ssm_state_size != 128 ||
         g.ssm_d_conv != 4) {
         err = "verify: geometry differs from the artifact's";
         return false;
@@ -2080,7 +2082,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() &&
+            native_router_topk_supported((int) NE, (int) K)) {
             try {
                 if (w_sgi != nullptr)
                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
@@ -2089,7 +2092,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
-                native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+                native_router_topk(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, (int) NE, (int) K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {
@@ -2106,13 +2109,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
+        // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-k picked again with a logit bonus for the resident
         // experts; the weights stay the router's (route_prior.cu).  The default is g_route_prior() above: 1.5 on a
         // discrete CUDA card of 13 GiB or less, off elsewhere (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%;
         // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
+        // The expert count and top-k are the artifact's, not a constant: this used to read NE == 512 && K == 10, so
+        // Whittle (256 / 8) never took it.
         const float route_prior = g_route_prior();
-        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
-            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
+        if (route_prior > 0.0f && hits_.d_res != nullptr)
+            route_prior_topk(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K,
+                             n, (int) NE, (int) K, cs);
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {

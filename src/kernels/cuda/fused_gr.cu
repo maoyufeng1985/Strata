@@ -28,7 +28,7 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int N = 2560;         // n_embd
+constexpr int N = 2048;         // n_embd
 constexpr int HC = 4;           // streams
 constexpr int D = N * HC;       // 10240
 constexpr int LR = 320;         // hc_lr
@@ -896,7 +896,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 //    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Before sm_80
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
 constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;
-constexpr int H_TILE = 1280;                          // staged tile: half a stream = 160 chunks of 8, 5 per lane
+constexpr int H_TILE = 1024;                          // staged tile: 2048/1024 = 2 per stream, 128 chunks of 8
 constexpr int HQ = H_TILE / 8 / 32;
 constexpr int N_HTILES = D / H_TILE;                  // 8
 static_assert(N % H_TILE == 0, "a staged tile never straddles two streams");
@@ -1151,11 +1151,11 @@ int down_chunk(bool staged, int* tile_out) {
     static bool attr[64] = {};
     static int chunk[64] = {};   // tokens the plain down kernel may carry in one launch on this card
     static int chunk_staged[64] = {};  // the same for staged
-    static int tile[64] = {};    // the plain down kernel's TILEV on this card (1280 on sm_75, 2560 elsewhere)
+    static int tile[64] = {};    // the plain down kernel's TILEV on this card (N/2 on sm_75, N elsewhere)
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) {
-        *tile_out = 2560;
+        *tile_out = N;
         return kFusedGrMaxT;
     }
     if (!attr[dev]) {
@@ -1180,18 +1180,18 @@ int down_chunk(bool staged, int* tile_out) {
         cudaDeviceGetAttribute(&cc_min, cudaDevAttrComputeCapabilityMinor, dev);
         const bool small_tile = strata::cc_major_of(cc_maj) * 10 + strata::cc_minor_of(cc_min) == 75;
 #endif
-        const int tv = small_tile ? 1280 : 2560;
+        const int tv = small_tile ? N / 2 : N;      // the down projection's output row width
         tile[dev] = tv;
         int want = (int) (kFusedGrMaxT * tv * sizeof(float));
         if (optin > 0 && want > optin) want = optin;
         if (small_tile) {
-            cudaFuncSetAttribute(gr_down_multi_kernel<1280>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            cudaFuncSetAttribute(gr_down_multi_kernel<1280, kFusedGrMaxT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            cudaFuncSetAttribute(gr_down_multi_kernel<1280, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+            cudaFuncSetAttribute(gr_down_multi_kernel<N / 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+            cudaFuncSetAttribute(gr_down_multi_kernel<N / 2, kFusedGrMaxT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+            cudaFuncSetAttribute(gr_down_multi_kernel<N / 2, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
         } else {
-            cudaFuncSetAttribute(gr_down_multi_kernel<2560>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            cudaFuncSetAttribute(gr_down_multi_kernel<2560, kFusedGrMaxT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
-            cudaFuncSetAttribute(gr_down_multi_kernel<2560, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+            cudaFuncSetAttribute(gr_down_multi_kernel<N>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+            cudaFuncSetAttribute(gr_down_multi_kernel<N, kFusedGrMaxT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
+            cudaFuncSetAttribute(gr_down_multi_kernel<N, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, want);
         }
         auto set_staged_attr = [&](auto kernel, int max_t) {
             int ws = (int) (2 * max_t * H_TILE * sizeof(float));
@@ -1228,7 +1228,7 @@ int down_chunk(bool staged, int* tile_out) {
         chunk_staged[dev] = capacity_staged < 1 ? 1 : (capacity_staged > kFusedGrMaxT ? kFusedGrMaxT : capacity_staged);
         attr[dev] = true;
     }
-    *tile_out = tile[dev] ? tile[dev] : 2560;
+    *tile_out = tile[dev] ? tile[dev] : N;
     return staged ? chunk_staged[dev] : chunk[dev];
 }
 
@@ -1352,7 +1352,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     // STRATA_HC_Q8: the staged down kernel reads bf16 only, so Q8 weights take split's down kernel (the plain one)
     const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;
-    int tv = 2560;
+    int tv = N;
     const int chunk_tok = down_chunk(staged, &tv);
     const size_t per_tok = (staged ? (size_t) 2 * H_TILE : (size_t) tv) * sizeof(float);
     static const bool no_multi_gr = [] {
@@ -1394,18 +1394,18 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
             else if (exact_t && ct == 6) gr_down_staged_kernel<6, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
             else if (max4) gr_down_staged_kernel<4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
             else gr_down_staged_kernel<><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-        } else if (tv == 1280) {
+        } else if (tv == N / 2) {
             if (q8w) {   // STRATA_HC_REQ8
-                if (max4) gr_down_multi_kernel<1280, 4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-                else gr_down_multi_kernel<1280, kFusedGrMaxT, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            } else if (max4) gr_down_multi_kernel<1280, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else gr_down_multi_kernel<1280><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                if (max4) gr_down_multi_kernel<N / 2, 4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                else gr_down_multi_kernel<N / 2, kFusedGrMaxT, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            } else if (max4) gr_down_multi_kernel<N / 2, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            else gr_down_multi_kernel<N / 2><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
         } else {
             if (q8w) {   // STRATA_HC_REQ8
-                if (max4) gr_down_multi_kernel<2560, 4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-                else gr_down_multi_kernel<2560, kFusedGrMaxT, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            } else if (max4) gr_down_multi_kernel<2560, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
-            else gr_down_multi_kernel<2560><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                if (max4) gr_down_multi_kernel<N, 4, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                else gr_down_multi_kernel<N, kFusedGrMaxT, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            } else if (max4) gr_down_multi_kernel<N, 4><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+            else gr_down_multi_kernel<N><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
@@ -1711,7 +1711,9 @@ __global__ void gr_down_finish_kernel(GrMulti m) {
 constexpr int Q8B = 34;                             // Q8_0 block: fp16 d + 32 int8
 constexpr int Q8_RPW = 4;                           // down rows per warp
 constexpr int Q8_RG = LR / (WARPS * Q8_RPW);        // 10 row groups (+1: the inject rows)
-constexpr int Q8_KC = 640, Q8_NKC = D / Q8_KC;      // 16 chunks, 4 per stream
+// The down projection's columns are the HC width D; the read takes them in 16 chunks of D/16, so the
+// chunk width follows the compiled shape (Flash-Next 640, Whittle 512) and N/Q8_KC stays 4 per stream.
+constexpr int Q8_KC = D / 16, Q8_NKC = D / Q8_KC;  // 16 chunks, 4 per stream
 constexpr int Q8_CPS = N / Q8_KC;                   // chunks per stream
 constexpr int Q8_SPB = Q8_KC / 128;                 // 5 steps of 4 Q8_0 blocks (8 lanes x 4 values each)
 __device__ __forceinline__ uint32_t q8_ld16(const uint8_t* p) { return *(const uint16_t*) p; }

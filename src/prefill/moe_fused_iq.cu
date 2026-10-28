@@ -20,6 +20,7 @@
 // ldmatrix.  The products are mma.sync m16n8k32 (m16n8k16 for the formats with a scale per 16 values); the epilogues
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
 #include "strata/prefill/moe_fused_iq.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -28,6 +29,10 @@
 #if defined(__HIPCC__)
 #include "moe_f16_common.cuh"
 #include "moe_f16_kq.hpp"
+#else
+// CUDA: the same interface, the CUDA kernels (moe_f16_kq_cuda.cu).  The K-quants have no int8 fused
+// kernel here, so this is the only CUDA path that covers a Q4_K / Q5_K expert.
+#include "moe_f16_kq_cuda.hpp"
 #endif
 
 #include <cuda_fp16.h>
@@ -75,7 +80,16 @@ constexpr bool T75_DEV = true;    // the Q2_0 stage epilogue in native_kernel: f
 constexpr int ASTAGES_DEV = ASTAGES;
 constexpr bool T75_DEV = false;
 #endif
-constexpr int GU_ROWS_K = 2560, D_ROWS_K = 640;   // K of gate/up (n_embd) and of down (n_ff)
+// K of gate/up (n_embd) and of down (n_ff): the compiled shape, so the stage counts along K are the
+// model's widths (Whittle-45B: 2048 / 512).
+constexpr int GU_ROWS_K = (int) strata::core::kCompiledGeometry.n_embd;
+constexpr int D_ROWS_K = (int) strata::core::kCompiledGeometry.n_ff;
+// the OUTPUT widths: the gate/up writes 2 * n_ff rows (gate and up), the down n_embd.  The compiled shape
+// (Whittle-45B: 1024 / 2048); the Flash-Next build had 1280 / 2560.
+constexpr int GU_ROWS_TOTAL = 2 * (int) strata::core::kCompiledGeometry.n_ff;
+constexpr int N_EMBD = (int) strata::core::kCompiledGeometry.n_embd;
+// one routed row of H (the int8 activation layout): n_ff / 64 blocks of AB bytes
+constexpr int H_ROW_BYTES = (D_ROWS_K / 64) * AB;
 
 // the formats (ggml type ids)
 constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_S = GGML_TYPE_IQ2_S,
@@ -571,7 +585,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
     constexpr int WT_BYTES = WR * WLDX, WS_FLOATS = F16 ? 0 : WR * 4, ACT_STAGE = TR * AB;
     constexpr bool TWO_PASS = NT != THREADS;   // the two-pass loads (load_unit_l) only in the opt-in NT = 256 kernels
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;   // 64-value stages along K
-    constexpr int NFB = (GU ? 1280 : 2560) / WR;          // weight-row blocks per tile
+    constexpr int NFB = (GU ? GU_ROWS_TOTAL : N_EMBD) / WR;   // weight-row blocks per tile
     constexpr int ACT_LD = NS * AB;                       // bytes per activation row: 3200 (a token), 800 (a row's H)
     constexpr int BS = block_bytes(WT);
     constexpr bool K16 = per16(WT);
@@ -833,7 +847,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                     const float inv = am > 0.0f ? 127.0f / am : 0.0f;
                     const int r = nb0 + 8 * n + 2 * tig + c;
                     if (r < nrows) {
-                        uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (blk >> 1) * AB;
+                        uint8_t* o = out + (size_t) (row0 + r) * H_ROW_BYTES + (blk >> 1) * AB;
                         const int hh = blk & 1;
 #pragma unroll
                         for (int i = 0; i < 4; ++i) o[32 * hh + 8 * i + g] = (uint8_t) (int8_t) __float2int_rn(h[i] * inv);
@@ -850,7 +864,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
 #pragma unroll
                     for (int q = 0; q < 4; ++q) {
                         const int r = nb0 + 8 * n + 2 * tig + (q & 1);
-                        if (r < nrows) dm[(size_t) (row0 + r) * 2560 + rbase + 64 * wf + 16 * i + 8 * (q >> 1) + g] = acc[i][n][q];
+                        if (r < nrows) dm[(size_t) (row0 + r) * N_EMBD + rbase + 64 * wf + 16 * i + 8 * (q >> 1) + g] = acc[i][n][q];
                     }
                 }
         }
@@ -1284,7 +1298,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                   const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm) {
 #if STRATA_NAT_WMMA
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;  // 64-value stages along K
-    constexpr int NFB = (GU ? 1280 : 2560) / NW_ROWS;     // work items per tile
+    constexpr int NFB = (GU ? GU_ROWS_TOTAL : N_EMBD) / NW_ROWS;   // work items per tile
     constexpr int ACT_LD = NS * AB;
     constexpr int BS = block_bytes(WT);
     constexpr bool K16 = per16(WT);
@@ -1474,7 +1488,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 #pragma unroll 8
                     for (int j = 0; j < 32; ++j) am = fmaxf(am, fabsf(hs[r][32 * hh + j]));
                     const float inv = am > 0.0f ? 127.0f / am : 0.0f;
-                    uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (size_t) fb * AB;
+                    uint8_t* o = out + (size_t) (row0 + r) * H_ROW_BYTES + (size_t) fb * AB;
                     uint32_t wd[8] = {};
                     int csum = 0;
 #pragma unroll
@@ -1500,11 +1514,11 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                         if (r < nrows) {
 #if STRATA_NAT_W12
                             // columns rbase + 32 wm + 16 mt + 8 hi .. + 7: contiguous, 32-byte aligned (dm: 16, checked in experts_native)
-                            float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + 8 * hi);
+                            float4* d = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * N_EMBD + rbase + 32 * wm + 16 * mt + 8 * hi);
                             d[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
                             d[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
 #else
-                            float* d = dm + (size_t) (row0 + r) * 2560 + rbase + 32 * wm + 16 * mt + hi;
+                            float* d = dm + (size_t) (row0 + r) * N_EMBD + rbase + 32 * wm + 16 * mt + hi;
 #pragma unroll
                             for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
 #endif
@@ -1848,6 +1862,7 @@ bool gu_covered(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS
 #if !defined(__HIPCC__)
            || (t == T_Q2_0 && (dev_info().t75 || dev_info().q2n))   // Q2_0 gate/up: the Turing opt-in, or STRATA_PF_FUSED_Q2N=1 on sm_80+
+           || ((t == T_Q4_K || t == T_Q5_K) && f16kqc::requested())   // the CUDA fused FP16 K-quant path (opt-in)
 #endif
 #if defined(__HIPCC__)
            || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
@@ -1859,6 +1874,9 @@ bool d_covered(int t) {
     return t == T_Q2_0 || t == T_IQ4_NL
 #if defined(__HIPCC__)
            || ((t == T_Q5_1 || t == T_Q8_0) && kq_on())
+#endif
+#if !defined(__HIPCC__)
+           || ((t == T_Q4_K || t == T_Q5_K) && f16kqc::requested())   // the CUDA fused FP16 K-quant down (opt-in)
 #endif
         ;
 }
@@ -1959,6 +1977,12 @@ bool native_supported(int gu_type, int d_type) {
     if (env < 0) {
         // the native Q2_0 pack's Q2_0 / Q2_0 layers: only with STRATA_PF_FUSED_Q2N=1 (d.q2n), on any sm_80+ card
         if (gu_type == T_Q2_0) { const DevInfo& d = dev_info(); return d.ok && d.q2n && d_type == T_Q2_0 && d_covered_on(d_type, d); }
+        // STRATA_PF_F16_CUDA=1 takes a K-quant pack's experts here (moe_f16_kq_cuda.cu): the only CUDA kernel
+        // that covers Q4_K / Q5_K, so its own switch is the opt-in for it.
+        if (f16kqc::requested() && (gu_type == T_Q4_K || gu_type == T_Q5_K)) {
+            const DevInfo& d = dev_info();
+            return d.ok && d_covered_on(d_type, d);
+        }
         if (gu_type != T_IQ2_S && gu_type != T_IQ3_XXS && gu_type != T_IQ3_S && gu_type != T_IQ4_XS) return false;
         const DevInfo& d = dev_info();
         // 12.0 cards with 80+ SMs only (RTX PRO 5000 / 6000, RTX 5080 / 5090): on an RTX 5070 (48 SMs, IQ2_XS pack, experts
@@ -2012,9 +2036,9 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             std::fprintf(stderr, "prefill fused experts (native): the down rows (%p) must be 16-byte aligned\n", (void*) dm);
             std::exit(1);
         }
-        const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (1280 / NW_ROWS),
+        const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_TOTAL / NW_ROWS),
                                                            (int64_t) d.sms * (occ_gu ? occ_blocks(d.w12, g.gu_type, true) : wgp_blocks(d.occ)));
-        const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (2560 / NW_ROWS),
+        const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (N_EMBD / NW_ROWS),
                                                           (int64_t) d.sms * (occ_d ? occ_blocks(d.w12, g.d_type, false) : wgp_blocks(d.occ)));
         const uint8_t* xa8 = (const uint8_t*) xa;
         uint8_t* ha8 = (uint8_t*) ha;
@@ -2082,8 +2106,14 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     // the most 64-row tiles the batch can have (every row in it, plus a partial tile per expert) - the items of the
     // ones inside a larger item end at once
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
-    const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (1280 / weight_rows(ww)), (int64_t) d.sms * d.occ);
-    const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (2560 / weight_rows(ww)), (int64_t) d.sms * d.occ);
+    const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_TOTAL / weight_rows(ww)), (int64_t) d.sms * d.occ);
+    const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (N_EMBD / weight_rows(ww)), (int64_t) d.sms * d.occ);
+    // The fused FP16 K-quant path (CUDA, opt-in STRATA_PF_F16_CUDA=1): the K-quants' gate/up and down, the codes
+    // dequantized into registers.  It is the ONLY CUDA path that covers a Q4_K / Q5_K expert (the int8 fused
+    // kernels have no K-quant instance), so it is what a K-quant pack takes when the switch is on.
+    if (f16kqc::requested() && f16kq::covers(g.gu_type)) {
+        f16kq::gate_up(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, (const uint8_t*) xa, src, (uint8_t*) ha, s);
+    } else
     switch (g.gu_type) {
         case T_IQ2_XXS: launch<T_IQ2_XXS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
         case T_IQ2_XS: launch<T_IQ2_XS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
@@ -2093,7 +2123,9 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         case T_Q2_0: launch<T_Q2_0, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
         default: launch<T_IQ4_XS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
     }
-    if (g.d_type == T_Q2_0) launch<T_Q2_0, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
+    if (f16kqc::requested() && f16kq::covers_down(g.d_type))
+        f16kq::down(b, g, tb.ts, tb.tiles, tb.off, n, n_expert, tiles, (const uint8_t*) ha, dm, s);
+    else if (g.d_type == T_Q2_0) launch<T_Q2_0, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
     else launch<T_IQ4_NL, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
     ck(cudaGetLastError(), "experts_native");
 }

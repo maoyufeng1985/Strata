@@ -6,10 +6,14 @@
 
 namespace strata::kernels {
 
-/// Top-10 per token over `logits` (n_tok x 512) where a resident expert (`res_layer[e] >= 0`, the layer's residency
+/// Top-k per token over `logits` (n_tok x n_expert) where a resident expert (`res_layer[e] >= 0`, the layer's residency
 /// table) gets `lambda` added to its logit for the SELECTION; the weights are the router's own probabilities
-/// (softmax over the 512 unbiased logits) renormalised over the 10 picked, as the native router does.
-void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
-                       int n_tok, void* stream);
+/// (softmax over the unbiased logits) renormalised over the k picked, as the native router does.
+///
+/// `n_expert` is the model's expert count and `k` its top-k, so one engine serves every geometry (Flash-Next's
+/// 512 / 10 and Whittle's 256 / 8 both do).  `n_expert` must be 512 or less: the kernel keeps the logits in one warp's
+/// registers, 16 a lane.
+void route_prior_topk(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
+                      int n_tok, int n_expert, int k, void* stream);
 
 }  // namespace strata::kernels

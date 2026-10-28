@@ -11,6 +11,7 @@
 #include "gguf_fixture.hpp"
 
 #include "strata/core/native_dense.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/core/weights.hpp"
 
 #include <cuda_runtime.h>
@@ -52,9 +53,13 @@ const char* QKV = "blk.0.attn_qkv.weight";
 constexpr uint64_t NE0 = 256, NE1 = 4;
 
 std::vector<fixture::Kv> arch_keys() {
-    return {fixture::str("general.architecture", "qwen4exp"), fixture::u32("qwen4exp.block_count", 48),
-            fixture::u32("qwen4exp.embedding_length", 2560), fixture::u32("qwen4exp.expert_count", 512),
-            fixture::u32("qwen4exp.expert_used_count", 10), fixture::u32("qwen4exp.attention.head_count", 24),
+    const auto& c = strata::core::kCompiledGeometry;
+    return {fixture::str("general.architecture", "qwen4exp"),
+            fixture::u32("qwen4exp.block_count", (uint32_t) c.n_layers),
+            fixture::u32("qwen4exp.embedding_length", (uint32_t) c.n_embd),
+            fixture::u32("qwen4exp.expert_count", (uint32_t) c.n_expert),
+            fixture::u32("qwen4exp.expert_used_count", (uint32_t) c.n_expert_used),
+            fixture::u32("qwen4exp.attention.head_count", (uint32_t) c.n_head),
             fixture::u32("qwen4exp.attention.head_count_kv", 2)};
 }
 

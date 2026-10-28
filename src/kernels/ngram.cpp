@@ -47,15 +47,13 @@ PleConsts ple_artifact_consts() {
     // ALSO in the metadata as its own array - and deriving one from the other would hide a mismatch between
     // them instead of surfacing it.  The parity test checks the two agree.
     PleConsts c{};
-    c.mult[0] = 23703573157769ull;
-    c.mult[1] = 20109073645365ull;
-    c.mult[2] = 8052911324071ull;
+    c.mult[0] = 32473892291597ull;
+    c.mult[1] = 22010589867355ull;
+    c.mult[2] = 6403636407469ull;
     const uint64_t vocab[PLE_N_HEADS] = {
-        20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077,
-        20000081, 20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171};
+        4880000, 4880000, 4880000, 4880000, 4880000, 4880000, 4880000, 4880000};
     const uint64_t offset[PLE_N_HEADS] = {
-        0,        20000003, 40000026, 60000059, 80000106, 100000165, 120000228, 140000297,
-        160000374, 180000455, 200000548, 220000655, 240000802, 260000955, 280001114, 300001275};
+        0, 4880000, 9760000, 14640000, 19520000, 24400000, 29280000, 34160000};
     for (int i = 0; i < PLE_N_HEADS; ++i) {
         c.vocab[i] = vocab[i];
         c.offset[i] = offset[i];
@@ -181,6 +179,11 @@ void dequant_fp8(const uint8_t* row, float scale, float* out160) { fp8_e4m3_dequ
 void dequant_bf16(const uint8_t* row, float, float* out160) { bf16_dequant_row(row, out160); }
 void dequant_nvfp4(const uint8_t* row, float scale, float* out160) { nvfp4_row_dequant(row, scale, out160); }
 
+// Q4_K: ONE row is 256 values = one Q4_K block, so the row is the block (144 B) and the dequantizer is
+// ggml's own (d, dmin and the 6-bit scale/min pairs).  Whittle-45B ships the table this way: 39,040,000
+// rows x 144 B = 5.62 GB, which is the 5.6 GiB the model card names.
+void dequant_q4_k(const uint8_t* row, float scale, float* out) { (void) scale; strata::dequantize_q4_K(row, out); }
+
 const PleFormatInfo kPleFormats[] = {
     {PleFormat::IQ4_NL, "IQ4_NL", "IQ4_NL", PLE_ROW_BYTES, false, dequant_iq4_nl},
     {PleFormat::Q5_0, "Q5_0", "Q5_0", (PLE_HEAD_DIM / 32) * 22, false, dequant_blocks<strata::dequantize_q5_0, 22>},
@@ -196,6 +199,8 @@ const PleFormatInfo kPleFormats[] = {
     // NVFP4 x16 (NVIDIA's Qwen3.8-Flash-Next-FP4-Local, tools/nvfp4_local_pack.py ple): 90-byte rows, I8 bytes marked
     // strata.ple.format = nvfp4x16 with strata.ple.scale. The tensor is [90, rows]: ne0 is the row's byte count.
     {PleFormat::NVFP4, "NVFP4", "I8", PLE_ROW_BYTES_NVFP4, true, dequant_nvfp4},
+    // Q4_K (Whittle-45B): one 256-value row is one Q4_K block, so ne0 is the element count and the row is 144 B
+    {PleFormat::Q4_K, "Q4_K", "Q4_K", PLE_ROW_BYTES_Q4_K, false, dequant_q4_k},
 };
 constexpr int kPleFormatCount = (int) (sizeof kPleFormats / sizeof kPleFormats[0]);
 }  // namespace

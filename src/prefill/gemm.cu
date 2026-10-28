@@ -1184,10 +1184,18 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
             x_rows = std::max<int64_t>(std::min<int64_t>(x_rows, 64), x_rows / 2);
         }
         if (!fit && path == 2) {   // Pascal has no BF16 cuBLAS call to fall back to; Volta keeps its raw one below
+            size_t fb = 0, tb = 0;
+            const cudaError_t mi = cudaMemGetInfo(&fb, &tb);
+            cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+            (void) cudaStreamIsCapturing((cudaStream_t) stream_, &cs);
             std::fprintf(stderr, "prefill gemm: no GPU memory left for the %s conversion buffers of a %lld x %lld BF16 weight "
-                                 "(Pascal cards run the BF16 products through them); free VRAM on this card: raise "
+                                 "(Pascal cards run the BF16 products through them; the smallest tile it tried was %lld x %lld"
+                                 " = %.1f MiB; cudaMemGetInfo -> %s, this card has %.1f MiB free of %.1f MiB; capturing: %d);"
+                                 " free VRAM on this card: raise "
                                  "--vram-reserve-mib, lower --max-context or --kv-resident, or give it fewer layers\n",
-                         "FP32", (long long) N, (long long) K);
+                         "FP32", (long long) N, (long long) K, (long long) w_rows, (long long) x_rows,
+                         (double) (w_rows * K * 4) / 1048576.0, cudaGetErrorString(mi), (double) fb / 1048576.0,
+                         (double) tb / 1048576.0, (int) cs);
             std::exit(1);
         }
         if (fit) {
@@ -1466,6 +1474,16 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
+    // GGML_TYPE_F16 (type 1): the weight is ALREADY the FP16 operand cuBLAS wants, so there is nothing to
+    // dequantize - read it in place.  Without this the only route into this function is `dequant_f16`, whose type
+    // switch has no F16 case, so a caller holding F16 weights (the Q36 MTP head's own file) could not run a
+    // multi-token chunk at all.  CUBLAS_COMPUTE_32F keeps the accumulation in FP32; the 0.36% figure in the
+    // STRATA_DENSE_F16_ACC note is the FP16-ACCUMULATE variant, which this branch does not ask for.
+    // Pascal included: sm_60 has FP16 units and cuBLAS runs this GEMM on them.
+    if (ggml_type == 1 && (ldx == 0 || ldx == K)) {
+        f16(X, reinterpret_cast<const uint16_t*>(W_blocks), Y, T, N, K, ldy, beta);
+        return;
+    }
 #ifdef STRATA_USE_HIP
     // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
     // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory
