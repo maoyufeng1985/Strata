@@ -173,6 +173,14 @@ this setup's own float-order sensitivity, not a peer bug: the flag-off arm diffe
 token 24 with the same 90 % rate.  A token difference between two arms is therefore no evidence of
 a bug either way — the first token's logprob is the number that is.
 
+### The three steps that are not worth it here (measured, not estimated)
+
+| step | what it would buy | the number that decides it |
+|---|---|---|
+| the N-helper SUM merge (one weighted sum per token from each helper) | less return traffic | **negative here**: the SUM mode returns T×N floats per helper per layer, the rows mode returns rows×N, and the helpers hold 250 rows a layer for T = 275 tokens — the SUM mode would return 10 % *more*. The SUM mode's win is the K-fold compression of rows/T (8× for a peer that holds every token of its experts); a helper cache holds ~0.9 rows per token, so there is nothing to compress. |
+| the I8 down-leg (the returned rows quantized to int8) | 4× less return traffic | the return is ~245 MB over the 6.1 GB/s link (~40-64 ms of the 875 ms prompt); int8 would make it ~61 MB and save ~30 ms, **3.4 %** of the prompt, for a new kernel and a dequant on the primary. |
+| the helpers' peer-streamed share (`ps_frac` for the helpers) | the helpers take a share of the primary's streamed experts | **≈0 here**: moving 17 % more of the expert rows to the helpers (a 3000-slot primary cache) bought **+1.2 %** (329.6 → 333.6 tok/s). The expert share is no longer the critical path, and the mechanism copies the weights to the helper over the same link, the wrong way. |
+
 ### Gates
 
 - **A0 ✓** — the flag off: 0 `PREFILL_REMOTE_PEERS` lines, the default path untouched.
@@ -234,6 +242,23 @@ does it break something). What it changed:
   the flag silently. Making it bite is not free: an expert over the cap falls back to the
   primary, but the stager has already skipped staging its blob, so the request would die.
 - `has_peer()` was dead code; `set_peer_from` is now private.
+
+The follow-up questions the review left open, answered:
+
+- **`STRATA_PREFILL_HELPER_SOURCE` together with this flag**: refuted. The helper cache's slots are
+  written in one place only (`RemoteExperts::open()`, `remote_experts.cpp:321`, blocking, before the
+  engine starts) and `copy_cached_blobs` only reads them (`:673`). Measured: four runs with both
+  flags give the first token's logprob bit for bit (−0.042972) and the same token stream, at
+  327-331 tok/s.
+- **The `--peer-device` tier's P2P route**: not run (no P2P on this box), but the refactor did not
+  touch it - the 23 P2P-related lines of `prefill.cpp` are identical in order and content before
+  and after.
+- **The backends**: HIP compiles the same CUDA sources (not built here: no hipcc, no AMD card).
+  Metal is in CI and the change adds **no new `cuda*` symbol**, so its `cuda_runtime.h` shim's
+  coverage is unchanged (not built here: no macOS). SYCL was **already broken** by the geometry
+  port (30dbf508): the tree is Flash-Next-shaped (`fused_gr.dp.cpp:27` pins `N = 2560`, three
+  `qsa_*_attn.dp.cpp` files pin `G = 12`) while asserting against the shared `geometry.hpp`, which
+  now says Whittle. Porting SYCL is its own task and no CI workflow builds it.
 
 The output correctness check above is the plan's own: the token gate cannot work on this box, and
 the first token's logprob can.

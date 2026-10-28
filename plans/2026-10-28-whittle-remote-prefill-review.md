@@ -153,12 +153,31 @@ same throughput, same token stream as the plain 3-helper arm.
 ## Not covered
 
 - The SUM merge for N helpers, the I8 down-leg and the helpers' peer-streamed share: not
-  implemented, so there is nothing to review.
-- `STRATA_PREFILL_HELPER_SOURCE` together with `STRATA_PREFILL_REMOTE_PEERS`: the helper's
-  `copy_blob` writes into its cache slot while the peer reads that slot in place (`gather_native`),
-  and the two are on different streams. The mechanism is real; whether a torn read can mix two
-  experts was not proved, and no bench arm sets both. Not in the measured setup.
-- The `--peer-device` tier's P2P route: the refactor touches it, and the automated review did not
-  re-run it on a P2P box.
-- The HIP, SYCL and Metal backends: the three geometry files were only built for CUDA (the box has
-  no AMD or Intel card).
+  implemented, and the measurements say they are not worth it on this box (the plan has the
+  numbers: the SUM mode would return *more* bytes here, the I8 down-leg is worth 3.4 % of the
+  prompt, and moving 17 % more of the expert rows to the helpers is worth +1.2 %).
+- `STRATA_PREFILL_HELPER_SOURCE` together with `STRATA_PREFILL_REMOTE_PEERS`: **refuted**. The
+  helper cache's slots are written in exactly one place, `RemoteExperts::open()`
+  (`src/core/remote_experts.cpp:321`, `fill_slot_blocking`, before the engine starts), and
+  `copy_cached_blobs` only reads them (`src/core/remote_experts.cpp:673`, a D2H copy into a host
+  buffer). The peer reads a slot in place, so the two are a read and a read — no torn bytes are
+  possible. Measured too (`.run/R-helper-source-twice.sh`): four runs with both flags give the
+  first token's logprob **bit for bit** (−0.042972, the same value as the flag-only runs) and the
+  same token stream (md5 `a393d8b767e5`), with the prompt at 327-331 tok/s. The flag-on path's
+  bit-for-bit reproducibility is what makes this a test: any corruption would show up as a
+  difference.
+- The `--peer-device` tier's P2P route: not run (no P2P on this box), but the refactor did not
+  touch it: the 23 P2P-related lines of `prefill.cpp` are identical in order and content before
+  and after.
+- The HIP backend: hipcc compiles the same CUDA sources, so the `fused_gr.cu` fix covers it, but
+  it was not built (no hipcc on this machine, no AMD card on the box).
+- The SYCL backend: **broken before this change**, by the geometry port (30dbf508), not by it. The
+  SYCL tree is Flash-Next-shaped — `sycl/src/kernels/cuda/fused_gr.dp.cpp:27` pins `N = 2560`,
+  three `qsa_*_attn.dp.cpp` files pin `G = 12`, and `sycl/src/core/remote_experts.cpp` documents
+  the 2560/640/10 widths — while they all assert against the shared
+  `include/strata/core/geometry.hpp`, which now says Whittle. Porting SYCL to Whittle is its own
+  task; no CI workflow builds SYCL, so nothing would notice.
+- The Metal backend: it is in CI (`.github/workflows/metal-build.yml`) and it compiles the shared
+  `src/prefill/prefill.cpp` against `metal/include/metal_compat/cuda_runtime.h`. The peer change
+  introduces **no new `cuda*` symbol** (the diff only reorders existing calls), so the shim's
+  coverage is unchanged; it was not built here (no macOS, no metal-cpp).
