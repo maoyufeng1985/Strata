@@ -417,8 +417,8 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 // the native fused router is canonical-512x10 only; anything else takes the generic top-k kernel
-if (native_router_enabled() && g.n_expert == 512 && k == 10) {
-    try { native_router_top10(b.logits, b.ids, b.weights, stream); }
+if (native_router_enabled() && native_router_topk_supported((int) g.n_expert, (int) k)) {
+    try { native_router_topk(b.logits, b.ids, b.weights, (int) g.n_expert, (int) k, 1, stream); }
     catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
 } else router_top10(b.logits, 1, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
 // ---- THE DOORBELL, AND IT IS THE WHOLE POINT OF THE PROTOCOL.  The routed experts' INPUT (`x`) and the
@@ -443,7 +443,8 @@ strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
 bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                       const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err) {
     using namespace strata::kernels;
-    const bool batched = native_bf16_projections && !(native_router_enabled() && g.n_expert == 512 && k == 10) &&
+    const bool batched = native_bf16_projections &&
+                         !(native_router_enabled() && native_router_topk_supported((int) g.n_expert, (int) k)) &&
                          !std::getenv("STRATA_ROUTE_PER_TOKEN");
     if (!batched || n == 1) {
         for (int t = 0; t < n; ++t) {

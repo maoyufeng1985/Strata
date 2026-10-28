@@ -800,8 +800,15 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
 }
 
 /// Returns "" when the compiled kernels can run `g`, else the first metadata key whose value they are not
-/// compiled for.  Only the expert count and the experts per token are free (the router and the expert paths
-/// take them at run time); the vocabulary is free because the head and the embedding take their tensors' shapes.
+/// compiled for.  Only the expert count, the experts per token and the indexer's selection budget are free (the
+/// router, the expert paths and the selection width take them at run time); the vocabulary is free because the
+/// head and the embedding take their tensors' shapes.
+///
+/// `attention.indexer.top_k` is FREE because it is a budget, not a shape.  `qsa_selection_width` is
+/// `min(n_kv, top_k + block - 1)`, and every selection kernel reads that width from device memory and treats
+/// `n_kv <= width` as the identity (block_topk_kernel's first branch), so a file whose budget is at or above its
+/// own context selects everything - dense attention - on the same code (Whittle-45B ships 262144 = its
+/// context_length).  The only bound is the kernels' single-block capacity, checked next.
 inline std::string geometry_unsupported(const core::ModelGeometry& g) {
     const core::ModelGeometry& c = core::kCompiledGeometry;
     struct Pin {
@@ -824,7 +831,6 @@ inline std::string geometry_unsupported(const core::ModelGeometry& g) {
         {"attention.indexer.head_count", &core::ModelGeometry::idx_q_heads},
         {"attention.indexer.key_length", &core::ModelGeometry::idx_key_dim},
         {"attention.compress_ratios", &core::ModelGeometry::idx_block},
-        {"attention.indexer.top_k", &core::ModelGeometry::idx_top_k},
         {"hyper_connection.count", &core::ModelGeometry::hc},
         {"hyper_connection.low_rank", &core::ModelGeometry::hc_lr},
         {"expert_feed_forward_length", &core::ModelGeometry::n_ff},

@@ -9,6 +9,8 @@
 // `gguf_geometry_test --real SHARD1`: the geometry a real model's metadata shard declares, and the verdict.
 #include "gguf_fixture.hpp"
 
+#include "strata/core/geometry.hpp"
+
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -46,40 +48,41 @@ std::vector<uint64_t> ratios(int64_t layers, int64_t interval, uint64_t block) {
     return r;
 }
 
-/// Qwen3.8-Flash-Next's metadata as its GGUF carries it (the PLE and rope-section keys the reader does not use
-/// are left out), with a vocabulary of `vocab` tokens.
+/// The qwen4exp family's metadata as its GGUF carries it: the COMPILED shape (the PLE and rope-section keys the
+/// reader does not use are left out), with a vocabulary of `vocab` tokens.
 std::vector<fixture::Kv> full_keys(size_t vocab = 1000) {
     using namespace fixture;
     const std::string p = "qwen4exp.";
+    const auto& c = strata::core::kCompiledGeometry;
     std::vector<std::string> tokens(vocab);
     for (size_t i = 0; i < vocab; ++i) tokens[i] = "t" + std::to_string(i);
     return {str("general.architecture", "qwen4exp"),
-            u32(p + "block_count", 48),
+            u32(p + "block_count", (uint32_t) c.n_layers),
             u32(p + "context_length", 262144),
-            u32(p + "embedding_length", 2560),
-            u32(p + "attention.head_count", 24),
+            u32(p + "embedding_length", (uint32_t) c.n_embd),
+            u32(p + "attention.head_count", (uint32_t) c.n_head),
             u32(p + "attention.head_count_kv", 2),
             f32(p + "rope.freq_base", 1e7f),
             f32(p + "attention.layer_norm_rms_epsilon", 1e-6f),
-            u32(p + "expert_count", 512),
-            u32(p + "expert_used_count", 10),
+            u32(p + "expert_count", (uint32_t) c.n_expert),
+            u32(p + "expert_used_count", (uint32_t) c.n_expert_used),
             u32(p + "attention.key_length", 256),
             u32(p + "attention.value_length", 256),
-            u32(p + "expert_feed_forward_length", 640),
-            u32(p + "expert_shared_feed_forward_length", 640),
+            u32(p + "expert_feed_forward_length", (uint32_t) c.n_ff),
+            u32(p + "expert_shared_feed_forward_length", (uint32_t) c.n_ff_shexp),
             u32(p + "ssm.conv_kernel", 4),
             u32(p + "ssm.state_size", 128),
             u32(p + "ssm.group_count", 16),
-            u32(p + "ssm.time_step_rank", 48),
-            u32(p + "ssm.inner_size", 6144),
+            u32(p + "ssm.time_step_rank", (uint32_t) c.ssm_v_heads),
+            u32(p + "ssm.inner_size", (uint32_t) c.ssm_value_dim),
             u32(p + "full_attention_interval", 4),
             u32(p + "rope.dimension_count", 64),
             u32(p + "hyper_connection.count", 4),
             u32(p + "hyper_connection.low_rank", 320),
             u32(p + "attention.indexer.head_count", 4),
             u32(p + "attention.indexer.key_length", 128),
-            u32(p + "attention.indexer.top_k", 2048),
-            u32s(p + "attention.compress_ratios", ratios(48, 4, 4)),
+            u32(p + "attention.indexer.top_k", (uint32_t) c.idx_top_k),
+            u32s(p + "attention.compress_ratios", ratios((int64_t) c.n_layers, (int64_t) c.qsa_interval, (uint64_t) c.idx_block)),
             str("tokenizer.ggml.model", "gpt2"),
             strs("tokenizer.ggml.tokens", tokens)};
 }
@@ -165,15 +168,19 @@ int main(int argc, char** argv) {
         want.n_vocab = 1000;
         check(r.read_err.empty(), "the full key set reads" + (r.read_err.empty() ? "" : ": " + r.read_err));
         check(same_shape(r.g, want), "  and gives the compiled shape (vocabulary from tokenizer.ggml.tokens)");
-        check(r.g.ssm_conv_channels == 10240, "  conv channels derived: 2 x 128 x 16 + 6144 = 10240");
+        check(r.g.ssm_conv_channels == strata::core::kCompiledGeometry.ssm_conv_channels,
+              "  conv channels derived: 2 x state x groups + inner");
         check(r.unsupported.empty() && r.guard.empty(), "  which the kernels run, and the guard passes");
     }
     {
         // the six keys tests/core/native_dense_ple_key_test.cpp writes: everything else is the compiled value
         const std::vector<fixture::Kv> six = {
-            fixture::str("general.architecture", "qwen4exp"), fixture::u32(p + "block_count", 48),
-            fixture::u32(p + "embedding_length", 2560),       fixture::u32(p + "expert_count", 512),
-            fixture::u32(p + "expert_used_count", 10),        fixture::u32(p + "attention.head_count", 24),
+            fixture::str("general.architecture", "qwen4exp"),
+            fixture::u32(p + "block_count", (uint32_t) strata::core::kCompiledGeometry.n_layers),
+            fixture::u32(p + "embedding_length", (uint32_t) strata::core::kCompiledGeometry.n_embd),
+            fixture::u32(p + "expert_count", (uint32_t) strata::core::kCompiledGeometry.n_expert),
+            fixture::u32(p + "expert_used_count", (uint32_t) strata::core::kCompiledGeometry.n_expert_used),
+            fixture::u32(p + "attention.head_count", (uint32_t) strata::core::kCompiledGeometry.n_head),
             fixture::u32(p + "attention.head_count_kv", 2)};
         const Result r = run(d.path, six);
         check(r.read_err.empty() && same_shape(r.g, strata::core::kCompiledGeometry) && r.guard.empty(),
@@ -251,13 +258,15 @@ int main(int argc, char** argv) {
         const Result h = run(d.path, with(with(full_keys(), hd.key, &hd), vd.key, &vd));
         check(h.read_err.empty() && h.g.head_dim == 128 && has(h.guard, "attention.key_length = 128"),
               "head width 128 reads and is refused: " + h.guard);
+        // THE INDEXER'S BUDGET IS FREE: it is a budget, not a shape (the width is min(n_kv, top_k + block - 1)),
+        // so a different budget is NOT refused.
         const fixture::Kv tk = fixture::u32(p + "attention.indexer.top_k", 1024);
-        check(has(run(d.path, with(full_keys(), tk.key, &tk)).guard, "attention.indexer.top_k = 1024"),
-              "an indexer budget of 1024 is refused");
+        check(run(d.path, with(full_keys(), tk.key, &tk)).guard.empty(),
+              "an indexer budget of 1024 is accepted (a budget, not a shape)");
         const fixture::Kv eps = fixture::f32(p + "attention.layer_norm_rms_epsilon", 1e-5f);
         check(has(run(d.path, with(full_keys(), eps.key, &eps)).guard, "layer_norm_rms_epsilon = 1e-05"),
               "an rms epsilon of 1e-5 is refused");
-        const fixture::Kv vocab = fixture::u32(p + "embedding_length", 2560);
+        const fixture::Kv vocab = fixture::u32(p + "embedding_length", (uint32_t) strata::core::kCompiledGeometry.n_embd);
         check(run(d.path, with(full_keys(151936), vocab.key, &vocab)).guard.empty(),
               "another vocabulary size is accepted (the head and embedding take their tensors' shapes)");
         const fixture::Kv arch = fixture::str("general.architecture", "glm5next");

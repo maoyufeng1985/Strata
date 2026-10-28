@@ -91,13 +91,213 @@ float* const sc  = smem;             // scores 住在 queries 的字节里
 ⇒ **所以这个对照没有把「算术 vs 带宽」分开**（两条路径差的不只是字节数）
 ⇒ 但它钉住了一件事：**int8 路径的 4.412 ms 里没有 DRAM 的账**（86.4 GB/s，离 410 GB/s 很远）。
 
-### 下一个实验（零改码，已排上）：**Quest + GQA 的速度**
+### Quest + GQA 的速度（MEASURED 2026-10-27）
 
-Quest 的旧账「~13 ms/token 的 attention 侧开销」是在**旧的 8 倍冗余读**的核上量的。
-现在 GQA 共享形状下，稠密读只要 4.412 ms/token；而 Quest 在 k=8 时只留 8/128 个 chunk（6.25% 的 cell）
-⇒ 如果 Quest 的开销主要在旧核的掩码上，**Quest + GQA 会是净赢**，
-而 32K 上 k=8 的输出**逐字节等于稠密**（96 token 实测）⇒ 又快又准。
-脚本 `.run/R-questgqa-20261027.sh`（GQA=8 × QUEST=0/8/16/32，加 GQA=0 × QUEST=8）。
+同配置（ctx 40960、`--bench-pp 32768 --bench-tg 64`、peer 全开、`--kv int8`）。
+脚本 `.run/R-questgqa-20261027.sh` / `.run/R-questtime-20261027.sh`。
+
+**墙钟（`.run/R-questgqa-20261027.sh`）：**
+
+| | tg64 | vs dense |
+|---|---:|---:|
+| GQA=8 QUEST=0 | **51.6 / 51.3** | — |
+| GQA=8 QUEST=8 | **53.4 / 53.3** | **+3.5%** |
+| GQA=8 QUEST=16 | 50.6 / 50.7 | −2% |
+| GQA=8 QUEST=32 | 46.4 / 46.4 | −10% |
+| GQA=0 QUEST=8 | **53.9 / 54.1** | ≈ QUEST=8 旧核 |
+
+⇒ **只有 k=8 是净赢**。k 再大，读回来的 chunk 多过省下的钱。
+
+**核时间（`STRATA_Q36_MIXER_SPLIT=1` + `STRATA_Q36_QUEST_TIMING=1`，GQA=8）：**
+
+| | attn ms/tok | merge | bounds | select† | tg64 |
+|---|---:|---:|---:|---:|---:|
+| QUEST=0 | **4.411** | 0.421 | — | — | 49.7 / 49.8 |
+| QUEST=8 | **3.803** | 0.270 | 0.105 | 0.408 | 51.0 / 51.3 |
+| QUEST=32 | **6.696** | 0.356 | 0.094 | 0.408 | 44.3 / 44.4 |
+
+† `QUEST:` 行的「select+pick」是 event 1→2，止于 `k_quest_sel`；`k_quest_pick` 是 event 2→3，**不在这个数里**（`q36_engine.cu:4024-4099` / `:8756-8768`）。
+
+⇒ k=8：attn −0.608、merge −0.151，另加 select 0.408 + bounds 0.105 ⇒ **净约 −0.25 ms/tok**，和墙钟 +3.5% 对得上。
+k=32：attn 反而涨到 6.696（读 32/128 chunk + 掩码开销）⇒ 墙钟输。
+
+### 质量：64K 上的 k 曲线（MEASURED，GQA=8）
+
+`.run/R-kcurve-fast-20261027.sh`，`--tokens-file /tmp/ctx64k.ids`，96 token：
+
+| k | vs dense |
+|---|---|
+| 8 | 第 **5** token 分叉 |
+| 16 | 第 **5** token 分叉 |
+| 32 | 第 **7** token 分叉 |
+| 64 | 第 **5** token 分叉 |
+
+32K 上 k=8 曾逐字节等于稠密；**64K / 128K 上同一个 k 已经早分叉**。
+
+| ctx | k | fork |
+|---|---:|---:|
+| 32K | 8 | 无（96 token 逐字节同） |
+| 64K | 8/16/32/64 | 第 5/5/7/5 token |
+| 128K | 8 | 第 **3** token（1227 s） |
+| 128K | 16 | 第 **2** token（1235 s） |
+| 128K | 32 | 第 **2** token（1231 s） |
+
+**代码嫌疑（仍成立，但不是唯一病因）：** GQA 共享核用**组内第一个 query head** 的掩码决定整组是否读这个 chunk（旧 `k_attn_part_gqa`），而 `k_attn_merge` 按**每个 head 自己的掩码**合并（`:928-934`）。
+若头 0 丢、头 1 留 ⇒ merge 读到从未写过的 `pm`/`pacc`。
+`k_quest_sel` 是**每 query head 一行**，旧注释「同组共用同一掩码」错了。
+
+**对照结论（MEASURED 2026-10-27，`.run/R-quest64ctl-20261027.sh`，旧二进制）：**
+
+| 对比 | 结果 |
+|---|---|
+| g0 dense vs gqa8 dense | **IDENTICAL 96** |
+| g0 dense vs g0 k8 | **第 5 token 分叉** |
+| g0 k8 vs gqa8 dense | 第 5 token 分叉 |
+| g0 k8 vs gqa8 k8 | 第 11 token 分叉（两边都早分叉，但路径不同） |
+
+⇒ **GQA=0 路径本身没错**（dense 对齐）。
+⇒ **GQA=0 × k=8 仍第 5 token 分叉** ⇒ 64K 早分叉**主要是 Quest 选块本身不够**，不是单靠 GQA 掩码错位能解释的。
+⇒ any-head 修仍是**必要**（代码 bug），但是**非充分**。
+
+**最小修（已推盒编装）：** `q36_engine.cu:677-688` early-return 改成「组内**任一** head 要留才算留」。
+`bin/strata-q36.s3` md5=`f05bf102909f1ac955ee4667309fa56b`；短门 parity `gen: 220`。
+
+### 修后重测（MEASURED 2026-10-27，`.run/R-quest-remeas-20261027.sh`）
+
+| 对比 | 结果 |
+|---|---|
+| fix dense vs OLD dense | **IDENTICAL 96** |
+| fix k8 vs g0 k8 | **IDENTICAL 96** |
+| fix k8 vs fix dense | 第 **5** token 分叉 |
+| fix k8 vs OLD dense | 第 5 token 分叉 |
+| fix k8 vs OLD k8 | 第 11 token 分叉 |
+
+臃时：k=0 313 s，k=8 317 s。
+
+⇒ **掩码修生效**（fix k8 == g0 k8）；dense 路径位不变。
+⇒ **长 ctx 质量仍限于 Quest 选块**（仍第 5 token 分叉）。
+
+### 验证清单
+
+1. ~~等 k 曲线~~ ✓
+2. ~~读对照~~ ✓（走「Quest 本身」支）
+3. ~~推盒编译 any-head~~ ✓
+4. ~~重跑 remeas~~ ✓（掩码修生效；Quest 本身仍早分叉）
+5. ~~SparseEngine 的默认预算映射到 q36~~ ✓（**负面**，见下）
+6. **下一步**：变体 F/E/C（Quest 这条线已关，见下）。
+
+### SparseEngine 的默认预算映射（MEASURED 2026-10-27，**负面**）
+
+SparseEngine（`D:\work\src\SparseEngine`）的默认：`sink_keep_tokens=64`、`decode_keep_tokens=4096`、
+`recent_keep_tokens=512` ⇒ 共 4672 token；`quest_skip_layers=2`；`quest_chunk_size=16`。
+
+映射到 q36 的 **256-cell chunk** 单位（`kChunkCells = 256`，`q36_engine.cu:256`）：
+
+| SE | SE 原值 | q36 的 chunk 数 |
+|---|---:|---:|
+| sink | 64 token | 1 chunk |
+| recent | 512 token | 2 chunk |
+| 合计 keep | 4672 token | 19 chunk（4864 token）|
+| skip layers | 2 | 2 |
+
+**注意：SE 的原生页是 16 token，不是 256。** q36 的 256 是 attention 的 split-K chunk；
+把 q36 改成 16 的页要重写 `k_attn_part` / `k_attn_part_gqa` 和全部共享内存尺寸，不是改一个常数。
+
+实测（`.run/R-quest-se-20261027.sh`，`bin/strata-q36.mtpse` md5 `2cf4d14d…`，64K/128K，96 token）：
+
+| 臂 | 墙钟 | vs dense |
+|---|---:|---|
+| SE 默认（19/1/2/2）ctx 65536 | 314 s | **第 7 token 分叉** |
+| SE 默认（19/1/2/2）ctx 131072 | 1228 s | **第 5 token 分叉** |
+| 显式 19/1/2/2（不设 SE_DEFAULTS）ctx 65536 | 314 s | 与 SE_DEFAULTS **逐字节相同 96** |
+
+⇒ 显式臂与 SE_DEFAULTS 臂**逐字节相同**，说明**映射和接线是对的**；
+⇒ 但 SE 的默认预算**依然不等于 dense**（64K 第 7 token、128K 第 5 token 分叉）。
+⇒ MTP 深度在这个预算下**没有收益**（mtp=1 与 mtp=3 的 tg64 都在 ~51 tok/s，噪声内）。
+
+**结论：Quest 这条线关闭。** 在实测过的 k 范围里**没有不 fork 的 k**（64K：k=8/16/64 第 5 token、
+k=32 第 7 token；128K：k=8 第 3 token、k=16 第 2 token、k=32 第 1 token），
+加 k 或加 sink/recent 都不对齐 dense，128K 比 64K 更早分叉。
+`src/qwen35/q36_engine.cu` 里这轮的研究脚手架（SE 默认值、`STRATA_Q36_QUEST_SINK`/`_RECENT`/`_SKIP_LAYERS`）
+**已全部撤掉**（回到 HEAD），只留下两个**真 bug 修复**：
+① `k_attn_part_gqa` 的 any-head 掩码（组内任一 head 要留才算留；旧码用组内第一个 head 的掩码，
+   而 `k_attn_merge` 按每个 head 自己的掩码合并 ⇒ 读到未写过的 `pm`/`pacc`），
+② `q_ev` 的 `has_mtp` 尺寸（`--mtp` + QUEST_TIMING 会越过 event 向量末尾）。
+两处都只在 **Quest 开启**路径上生效，默认路径逐字节不变。
+
+## 同族的另一个实现：kvmem-qw3（2026-10-27 读到）
+
+`https://github.com/kvmem/kvmem-qw3`（Apache-2.0，C++，27★，最近 push 2026-10-13）。
+**架构同族**：它的 QW3 跑 `qwen35` 混合模型；Strata 的 q36 模型元数据也是
+`general.architecture = qwen35moe`、`full_attention_interval = 4`（40 层里只有 **10 层**
+是标准 attention，其余是 DeltaNet 递归层，KV 不随上下文增长）。
+论文：`https://arxiv.org/abs/2609.04852`。
+
+**规模不同，结论不能直接搬**：它的效率实验跑在 **RTX PRO 6000 Blackwell 96 GB + 125 GiB RAM**
+（`docs/kvmem_performance_evaluation_20260726.md`），`--ctx 655360`、KVMem budget 200K、
+CPU tier 64 GiB、block 32 token —— 它把**冷的 KV 块摊到主机内存和 NVMe**，
+所以它的问题是「怎么把历史从 GPU 搬出去又搬回来」。
+q36 的测试机是 **P100-12 GB + 31 GiB RAM**，没有 NVMe tier 也没有 paged KV，
+q36 要解决的是「12 GB 卡上 150K 的上下文怎么读得快」。
+**两者只共享「查询条件化的块选择」这一层想法，不共享工程前提。**
+
+它做的正是 Quest 这一族的事：**查询条件化的 KV 块检索**（按当前 query 选历史 KV 块），
+但**机制和 Quest 完全不同**，有两点值得记下来：
+
+| | q36 的 Quest | kvmem-qw3 的 KVMem |
+|---|---|---|
+| 选什么 | decode 时**原地跳块**（被丢的 chunk 不读，位置不动） | 选中的块**重映射**成一个连续窗口，**重烘 RoPE**（de-rotate 再 re-rotate），位置变成「窗口内的位置」 |
+| 打分 | 每维 int8 min/max 的**上界**（Quest bound），在 RoPE 后的空间比 | **Mean-K** 索引：每块一个平均 K 向量，在**内容帧**（de-RoPE 到位置 0）比 `q_raw · k̄_raw`（位置不变） |
+| 保留 | top-k chunk（+ sink/recent） | top-k 块（+ sink/recent），块大小 32–512 token |
+| 结果 | 64K/128K **早分叉** | AgentLongBench 52 条诊断样本：**40/52**，比最好的 RAG（29/52）多 11 条 |
+
+**为什么这个差别重要：** Quest 在**位置不动**的前提下丢块，剩下的块之间隔着一段
+「空洞」——被丢掉的位置在相对距离上仍然存在，query 与保留 key 的相对位置对不上模型
+见过的分布。KVMem 的做法是把选中的块**压紧**并重烘位置，让模型看到的相对位置仍在
+训练分布内（它自己文档里写：*"the active window length stays within the trained regime,
+and RoPE is re-baked so relative positions remain in-distribution"*）。
+**这可能就是 Quest 在 64K/128K 早分叉的真正原因**：不是「选的块不够多」，
+而是「跳块不压紧 ⇒ 位置分布跑偏」。q36 实测「加 k 或加 sink/recent 都不对齐 dense」
+与这个解释一致——加 k 只是多读几个块，位置空洞还在。
+
+**但 KVMem 自己也撞在同一堵墙上**（它的 `docs/kvmem_known_issues.md`）：
+- **KVMI-007（P2, RESEARCH）**：*"mean-k 会稀释和碎片化长 session 中的相关证据"*；
+- **KVMI-012（P0, RESEARCH）**：normal-attention 块重选后，**DeltaNet 的递归状态仍来自原时间线 checkpoint**，
+  两者不同步；
+- **KVMI-011（P0）**：fp16/fp8 的 K 反复**原地 re-RoPE 会累积漂移**（它用 immutable raw-K 做有界重置）；
+- 它自己把 Quest/InfLLM 归为 *retrieval* 一路，把自己的 cumulative-attention 归为 *retention*（H2O 式），
+  并承认 retention 掉的历史块**再也回不来**，只有 query-conditioned retrieval 能把它**复活**。
+
+⇒ **结论一致**：块级 KV 检索在长上下文上换速度必然换质量，q36 的 Quest 和 kvmem 的 KVMem
+是同一族的两个实现，都还没解决「选得准 + 位置不跑偏」这两件事同时成立。
+q36 侧**如果**要再走这条路，值得抄的是 **RoPE 重烘 + 位置压紧**，不是它已经有的上界打分。
+但这条线需要一个 **paged KV**（KVMem 的窗口装配靠「页表重排 + 指针别名」，零拷贝），
+而 q36 现在是 **dense cell 布局**，没有 page table——**这不是一个局部改动**。
+
+### q36 侧要接 KVMem 式做法的三个硬约束（读代码确认，2026-10-27）
+
+1. **没有 paged KV**：q36 的 KV 是 `int8_t* kc` + `__half* ks` 的 **dense cell 布局**
+   （`q36_engine.cu:500-509`：`kp = ((int8_t*) kc) + (kh * ctx + pos) * HD`），
+   位置就是数组下标。KVMem 的窗口装配靠「页表重排 + 指针别名」零拷贝搬块，
+   q36 要做同样的事，得先把 KV 改成 page table —— **大改**。
+2. **K 是 RoPE 烘焙后量化的，没有 raw-K**：`k_attn_prep` 里 RoPE 先作用在 `v` 上，
+   然后 `v` 直接量化成 int8 + per-group scale（`:499-509`）。
+   KVMem 的内容帧打分（de-RoPE 到位置 0 再比 `q_raw · k̄_raw`）和重烘都要求**未烘焙的 K**。
+   q36 要走这条路得**额外存一份 raw-K**（显存代价：150000 cell × 10 层 × 2 KV head × 256 dim）。
+   KVMem 自己也被这件事咬过：**KVMI-011（P0）**——fp16/fp8 的 K 反复原地 re-RoPE 会累积漂移，
+   它靠 immutable raw-K 做有界重置。
+3. **GDN 没有块级状态快照**：q36 的 30 层 GDN 是 fused 递归层
+   （`k_gdn_seq` / `k_gdn_seq_cols`，`:1420` / `:1497`），只带一个整体状态，
+   没有「块边界状态」的概念。KVMem 的 DeltaNet 召回打分器
+   （`E_j = S_j − a_j·S_{j-1}`，每块存净编辑和累计 log-decay）
+   在 q36 上需要**在 GDN 核里加块边界快照**（它自己说这条要新加 kernel 侧通道：
+   *"forces the qw3 delta kernel when capturing (the ported warp kernel has no snapshot side-channel)"*）。
+   而且 q36 的 `k_gdn_seq` 是**一个 launch 跑整个 prompt chunk**，块边界要在 chunk 内再切。
+
+⇒ **q36 侧接 KVMem 式做法 = 三个大改（paged KV / raw-K / GDN 快照），不是一个局部补丁。**
+这与「Quest 这条线关闭」的判断一致：**q36 现在不做块级 KV 检索**。
+KVMem 的价值在于它证明了这条路的**上限**（AgentLongBench 40/52，比最好 RAG 多 11 条）
+和它的**代价**（mean-k 稀释证据 KVMI-007、re-RoPE 漂移 KVMI-011、DeltaNet 状态不同步 KVMI-012）。
 
 ## 还没做的变体（按新证据重排）
 
@@ -105,9 +305,9 @@ Quest 的旧账「~13 ms/token 的 attention 侧开销」是在**旧的 8 倍冗
 |---|---|---|---|---|
 | ~~D~~ | queries 与 scores 共用共享内存 | 保持 | 占用率 37.5% → 50% | **实测无收益（−2%），不采纳** |
 | ~~B~~ | 把 `m[8]`/`l[8]` 挪进 shared、降寄存器 | 保持 | 占用率再上一档 | **连带作废**：占用率不是杠杆 |
-| E | K 的 int8 读改成 `uint4`（16 B 一次而不是 8 B）⇒ 装载指令少一半 | 保持 | 若卡在装载 ⇒ 有收益 | 待测 |
-| F | 把 scale 挪到 FMA 的另一边（乘法 2048 → 256 次）| **破** | 若卡在算术 ⇒ 大收益 | 破位精确，要单独标成不精确路径 |
-| C | 两棵 8 级树改成 warp 内 shfl + 跨 warp 树 ⇒ 少约 10 道屏障 | **破** | 约 2-4% | 门值要重发 |
+| E | K 的 int8 读改成 `uint4`（16 B 一次而不是 8 B）⇒ 装载指令少一半 | 保持 | 若卡在装载 ⇒ 有收益 | **位点已钉，未改码**：`k_attn_part` `:582-587`、`k_attn_part_gqa` `:705-712` 现用 `uint2`/`i0+=8`。改 `uint4`/`i0+=16`/`x<16`；`kKVG=64` 内 scale 同、FMA 序同 ⇒ 位精确。但计划正文钉住 **V 段占 8/9**，K 装载本就小 — 杠杆弱，等盒空再测 |
+| F | 把 scale 挪到 FMA 的另一边（乘法 2048 → 256 次）| **破** | 若卡在算术 ⇒ 大收益 | **位点已钉，未改码**：K `fmaf(q*sg, c8, a)` → `fmaf(q, c8*sg, a)`（`:587` / `:712`）；V `fmaf(sc*wr, vk, acc)` → `fmaf(sc, wr*vk, acc)`（`:767`）。破舍入，须单独标不精确路径；V 段是大头，杠杆比 E 大。等盒空再测 |
+| C | 两棵 8 级树改成 warp 内 shfl + 跨 warp 树 ⇒ 少约 10 道屏障 | **破** | 约 2-4% | **位点已钉，未改码**：`block_max`/`block_sum` `:264-284`（one-head 走这里 `:595/:598`）；GQA 就地树 max `:737-742` + sum `:779-783`（每级一道 `__syncthreads`，两棵共 ~16 道）。同文件已有 shfl 样板（`:375/:505/:822/:886`）。改 warp shfl + 8-slot 跨 warp 树可砍大半屏障，但 sum 树换序破位精确，门值要重发。杠杆次于 F；等盒空 |
 | — | 把一个 chunk 的 256 个 cell 拆到多个 block | 要重写 merge | 尾波（4.57 block/SM）| 大 |
 
 ## 另一条路：helper 路径（复核过，结论是**先别做**）
@@ -127,6 +327,7 @@ helper 减半不改变墙钟。ctx 40960：helper 的 4.24 **完全被盖住** �
 
 ## 不知道的
 
-- **这个核到底卡在哪**：上面那个 int8-vs-fp32 的对照是第一个直接证据（已排上）。
-- **PTXAS 的两个数**（58 寄存器 / 20480 B）现在是实测的（ptxas 自己的报告），不再是推的。
-- **GQA 共享形状在 ctx 40960（而不是探针那一趟的 131072）的核时间**没量过。
+- **这个核到底卡在哪**：int8-vs-fp32 钉住「不是 DRAM」；变体 E/F 位点已钉，未改码未测。
+- ~~**64K/128K 早分叉是不是 GQA 掩码错位**~~：对照钉主因 Quest；any-head 已推盒，remeas：`fix k8 == g0 k8`，仍第 5 token ≠ dense。
+- ~~**128K 上 k 曲线**~~：齐。k=0/8/16/32 fork 无/3/2/2（1227/1235/1231 s）。
+- ~~**GQA 共享形状在 ctx 40960 的核时间**~~：已量（QUEST=0 → attn 4.411 ms/tok）。

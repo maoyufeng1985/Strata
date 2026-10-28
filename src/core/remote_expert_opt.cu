@@ -13,8 +13,8 @@ namespace {
 // The reduce metadata follows the window: row[cap] int32s then weight[cap] floats, one entry per
 // window row (cap = MAXT * k).  The kernels get the geometry as launch arguments because a
 // __global__ cannot read instance members.
-static_assert(strata::kernels::cpu::MAXT == 8 && strata::kernels::cpu::H == 2560,
-              "the defaults below are Flash-Next's geometry (8 token window, 2560-wide rows)");
+static_assert(strata::kernels::cpu::MAXT == 8 && strata::kernels::cpu::H == 2048,
+              "the defaults below are the compiled geometry (8 token window, n_embd-wide rows)");
 // Flash-Next's arithmetic, so a helper opened with the defaults changes no number: cap = 8 * 10 = 80,
 // metadata = 80 * 4 + 80 * 4 = 640 B (the old sizeof(ReduceMeta)), the pinned buffer =
 // (2560 * 8 + 80) * 4 = 82240 B (the old MAXT * (H + K) * 4), one peer's sum = 2560 * 8 * 4 = 81920 B,

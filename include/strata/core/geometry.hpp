@@ -18,11 +18,13 @@
 namespace strata::core {
 
 /// Every field is a number a kernel depends on, so a change to the compiled values is a change to a kernel
-/// contract and not a tuning knob.  The defaults are Qwen3.8-Flash-Next's (qwen4exp), the shape the kernels
-/// are compiled for; the GGUF key each field is read from is named beside it.
+/// contract and not a tuning knob.  The defaults are the shape the kernels are compiled for - Whittle-Qwen-3.8-45B-A3B
+/// (qwen4exp) since the port; the GGUF key each field is read from is named beside it, and the values that a model
+/// file may vary (the expert count, the experts used, the indexer's budget) are read at RUN time and only their
+/// compiled defaults are here.
 struct ModelGeometry {
-    int64_t n_embd = 2560;          ///< embedding_length
-    int64_t n_layers = 48;          ///< block_count (the trunk; an in-file MTP block is counted in n_mtp_layers)
+    int64_t n_embd = 2048;          ///< embedding_length
+    int64_t n_layers = 40;          ///< block_count (the trunk; an in-file MTP block is counted in n_mtp_layers)
     int64_t qsa_interval = 4;       ///< full_attention_interval: every 4th layer is full attention, 3, 7, ... 47
     int64_t n_vocab = 248320;       ///< the length of tokenizer.ggml.tokens
     double rms_eps = 1e-6;          ///< attention.layer_norm_rms_epsilon
@@ -30,32 +32,36 @@ struct ModelGeometry {
     // GDN (36 layers)
     int64_t ssm_state_size = 128;        ///< ssm.state_size: the key head width, and the value head width
     int64_t ssm_k_heads = 16;            ///< ssm.group_count
-    int64_t ssm_v_heads = 48;            ///< ssm.time_step_rank
+    int64_t ssm_v_heads = 32;            ///< ssm.time_step_rank
     int64_t ssm_d_conv = 4;              ///< ssm.conv_kernel
-    int64_t ssm_conv_channels = 10240;   ///< 2*128*16 + 128*48, derived
-    int64_t ssm_value_dim = 6144;        ///< ssm.inner_size, 128 * 48
+    int64_t ssm_conv_channels = 8192;   ///< 2*128*16 + 128*48, derived
+    int64_t ssm_value_dim = 4096;        ///< ssm.inner_size, 128 * 48
 
     // QSA (12 layers)
-    int64_t n_head = 24;            ///< attention.head_count
+    int64_t n_head = 16;            ///< attention.head_count
     int64_t n_head_kv = 2;          ///< attention.head_count_kv
     int64_t head_dim = 256;         ///< attention.key_length (= attention.value_length)
     int64_t n_rot = 64;             ///< rope.dimension_count: the rotated slice of head_dim and of idx_key_dim
     int64_t idx_q_heads = 4;        ///< attention.indexer.head_count
     int64_t idx_key_dim = 128;      ///< attention.indexer.key_length
     int64_t idx_block = 4;          ///< the non-zero attention.compress_ratios entry: one pooled key per 4 cells
-    int64_t idx_top_k = 2048;       ///< attention.indexer.top_k: cells of selection budget
+    int64_t idx_top_k = 2048;       ///< attention.indexer.top_k: cells of selection budget.  A RUN-TIME value, not a
+                                    ///< shape (as n_expert is): it sizes the selection buffers, and a budget at or
+                                    ///< above the context means NO selection at all (dense attention).  Whittle-45B
+                                    ///< ships 262144 = its own context_length.  The kernels' single-block selection
+                                    ///< caps the width at kTopkMaxCells (qsa.hpp), which the engine checks at load.
 
     // gated residual, on every layer
     int64_t hc = 4;                 ///< hyper_connection.count
     int64_t hc_lr = 320;            ///< hyper_connection.low_rank
 
     // MoE, on every layer
-    int64_t n_expert = 512;         ///< expert_count; pruned variants (GSQ-RCO Coder) ship fewer
-    int64_t n_expert_used = 10;     ///< expert_used_count
-    int64_t n_ff = 640;             ///< expert_feed_forward_length (= expert_shared_feed_forward_length)
+    int64_t n_expert = 256;         ///< expert_count; pruned variants (GSQ-RCO Coder) ship fewer
+    int64_t n_expert_used = 8;      ///< expert_used_count
+    int64_t n_ff = 512;             ///< expert_feed_forward_length (= expert_shared_feed_forward_length)
 
     // appended for the model families (Qwen3.6 = qwen35moe); the defaults keep Flash-Next's values
-    int64_t n_ff_shexp = 640;       ///< the shared expert's FFN width (qwen4exp: equal to n_ff, read_geometry checks)
+    int64_t n_ff_shexp = 512;       ///< the shared expert's FFN width (qwen4exp: equal to n_ff, read_geometry checks)
     ModelFamily family = ModelFamily::Qwen4Exp;
     int64_t n_mtp_layers = 0;       ///< MTP blocks inside the model file, after the trunk (qwen35moe: blk.40)
 

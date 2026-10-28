@@ -85,7 +85,11 @@ cached). \*\* not measured again since 0.1.14.
 More VRAM matters more than a faster GPU. Every extra GB holds about 700 more experts, and every expert on the GPU is one
 the CPU does not have to compute. `tools/make_profile.py` builds an expert profile from your own prompts: run the engine
 once with `--dump-routing trace.bin`, then see the tool's help. The shipped profile ranks every expert pair, so a trace
-changes the order only with `--reorder` (your trace's pairs first, then the base's, then the rest).
+changes the order only with `--reorder` (your trace's pairs first, then the base's, then the rest). A model with another
+depth or expert count than the shipped profile needs `--n-layer` and `--n-expert` to match, or the tool refuses the file.
+How much the profile matters is not small: on a 45B model with 20 of 40 layers off the main card, a profile filled in
+order left 1.4 experts a layer for the CPU, a trace-built one 1.1, and the same prompt went from 18.4 to 29.8 tok/s
+(see [WHITTLE45B.md](WHITTLE45B.md)).
 
 ## Which model?
 

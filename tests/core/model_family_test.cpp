@@ -49,9 +49,21 @@ struct Dims {
     uint64_t block_count, embd, heads, heads_kv, key_len, experts, used, ff, ff_sh, conv, state, groups, v_heads,
         inner, interval, nextn, hc, hc_lr, idx_heads, idx_key;
 };
-// Qwen3.6-35B-A3B (unsloth/Qwen3.6-35B-A3B-MTP-GGUF, every quant) and Qwen3.8-Flash-Next, as their files say
+// Qwen3.6-35B-A3B (unsloth/Qwen3.6-35B-A3B-MTP-GGUF, every quant), as its file says, and the qwen4exp family
+// (the compiled shape).
 const Dims kQwen36 = {41, 2048, 16, 2, 256, 256, 8, 512, 512, 4, 128, 16, 32, 4096, 4, 1, 0, 0, 0, 0};
-const Dims kFlashNext = {48, 2560, 24, 2, 256, 512, 10, 640, 640, 4, 128, 16, 48, 6144, 4, 0, 4, 320, 4, 128};
+const Dims kFlashNext = {
+    (uint64_t) strata::core::kCompiledGeometry.n_layers,      (uint64_t) strata::core::kCompiledGeometry.n_embd,
+    (uint64_t) strata::core::kCompiledGeometry.n_head,        (uint64_t) strata::core::kCompiledGeometry.n_head_kv,
+    (uint64_t) strata::core::kCompiledGeometry.head_dim,      (uint64_t) strata::core::kCompiledGeometry.n_expert,
+    (uint64_t) strata::core::kCompiledGeometry.n_expert_used, (uint64_t) strata::core::kCompiledGeometry.n_ff,
+    (uint64_t) strata::core::kCompiledGeometry.n_ff_shexp,    (uint64_t) strata::core::kCompiledGeometry.ssm_d_conv,
+    (uint64_t) strata::core::kCompiledGeometry.ssm_state_size,
+    (uint64_t) strata::core::kCompiledGeometry.ssm_k_heads,   (uint64_t) strata::core::kCompiledGeometry.ssm_v_heads,
+    (uint64_t) strata::core::kCompiledGeometry.ssm_value_dim, (uint64_t) strata::core::kCompiledGeometry.qsa_interval,
+    (uint64_t) strata::core::kCompiledGeometry.n_mtp_layers,  (uint64_t) strata::core::kCompiledGeometry.hc,
+    (uint64_t) strata::core::kCompiledGeometry.hc_lr,         (uint64_t) strata::core::kCompiledGeometry.idx_q_heads,
+    (uint64_t) strata::core::kCompiledGeometry.idx_key_dim};
 // tiny models of each family for the layout checks (every tensor F32, a few KB)
 const Dims kTiny36 = {5, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 1, 0, 0, 0, 0};
 const Dims kTinyFlash = {8, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 0, 2, 8, 2, 8};

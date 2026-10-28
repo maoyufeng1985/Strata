@@ -194,8 +194,8 @@ void test_native_variable_layout() {
     using namespace strata::kernels::cpu;
     constexpr int64_t layers = 2;
     constexpr int64_t experts = 3;
-    constexpr int64_t embedding = 2560;
-    constexpr int64_t feed_forward = 640;
+    constexpr int64_t embedding = strata::kernels::cpu::H;
+    constexpr int64_t feed_forward = strata::kernels::cpu::FF;
     TempDirectory dir;
 
     NativeFmt first_fmt, second_fmt;
