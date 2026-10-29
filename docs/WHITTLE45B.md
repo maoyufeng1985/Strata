@@ -65,6 +65,62 @@ printf 'GEN 256 %s\n' "$IDS" | strata --pack "$PACK" --native "$M" \
     --remote-expert-opt --serve
 ```
 
+## The two configurations this box settled
+
+A 12-hour sweep on the same box (the log is in
+[the plan](../plans/2026-10-28-whittle-12h-unattended.md)) ended with one command for the prompt and
+one for the decode. Both are opt-in switches; the default path is unchanged.
+
+**The prompt: three helper cards, the rows back in FP16, the chunk at 16384.**
+
+```sh
+printf 'GEN 1 %s\n' "$LONG_IDS" | \
+env STRATA_ROUTE_PRIOR=0 STRATA_MMQ_KQ=1 STRATA_PREFILL_REMOTE_PEERS=1 \
+    STRATA_PREFILL_REMOTE_PEERS_N=3 STRATA_DENSE_F16_ACC=1 STRATA_PF_PEER_COMPRESS=1 \
+  strata --pack "$PACK" --native "$M" \
+    --ple-gguf "$M" --ple-io ram \
+    --max-context 32768 --spec 2 --suffix-draft 0 --expert-profile "$PROF" \
+    --gpu 2,1,0,3 --kv int8 --expert-cache auto \
+    --expert-cache-device1 auto --expert-cache-device2 auto --expert-cache-device3 auto \
+    --remote-expert-opt --conversation-cache-mib 0 \
+    --prefill 16384 --serve
+```
+
+A 30,000-token prompt, cold, on the P100 with the three P104s: **median 633.4 tok/s** (three runs:
+633.4 / 631.5 / 634.3; the best run used `--prefill 32768`, the other two 16384). What each switch
+is worth, measured on this box:
+
+| Switch | Effect |
+|---|---|
+| `STRATA_PF_PEER_COMPRESS=1` | the helper's rows come back in FP16, so the PCIe return route carries half the bytes: 483.9 → 585.5 tok/s (**−17.3 %** of the prefill's time) |
+| `STRATA_DENSE_F16_ACC=1` | FP16-accumulate GEMM on Pascal: **−5.0 %** of the prompt's time |
+| `STRATA_PREFILL_REMOTE_PEERS=1` + `_N=3` | the helper cards compute their share of the prompt's expert rows instead of the P100 computing all of them |
+| `--prefill 16384` (over 512) | **−16.2 %** of the prompt's time (the chunk is the biggest single lever) |
+
+**The decode: two helper cards, and three switches on top.**
+
+```sh
+printf 'GEN 256 %s\n' "$IDS" | \
+env STRATA_ROUTE_PRIOR=0 STRATA_MMQ_KQ=1 \
+    STRATA_QFUSE=1 STRATA_NV_DEFAULTS_PRIMARY=1 STRATA_ADAPT_LAG=2 STRATA_ADAPT_NOWAIT=1 \
+  strata --pack "$PACK" --native "$M" \
+    --ple-gguf "$M" --ple-io ram \
+    --max-context 4096 --spec 2 --suffix-draft 0 --expert-profile "$PROF" \
+    --gpu 2,1,0,3 --kv int8 --prefill 512 --expert-cache auto \
+    --expert-cache-device1 auto --expert-cache-device2 auto \
+    --remote-expert-opt --conversation-cache-mib 0 --serve
+```
+
+**49.1 tok/s** for 256 tokens, against 47.7 tok/s for the plain two-helper configuration (**−3.10 %**).
+The three switches are `STRATA_QFUSE=1` (the fused int8 tails), `STRATA_NV_DEFAULTS_PRIMARY=1` (the
+sm_60 per-arch table; the bigger contributor, −1.22 % on its own, against `QFUSE`'s −0.60 %) and
+`STRATA_ADAPT_LAG=2 STRATA_ADAPT_NOWAIT=1`. `--remote-expert-opt` is worth +1.45 % by itself, and
+**two** helper cards beat three by 0.16 % on the decode.
+
+Both numbers were measured in one session with one binary, against one base arm, and they are the
+hot-batch numbers (the expert arena and the graphs are already warm) — they are the numbers to
+compare a configuration with, not to compare with the cold single-batch numbers above.
+
 ## The PLE table belongs in RAM
 
 `--ple-io ram` maps the table and locks it in RAM at start (`PLE table locked in RAM (--ple-io ram)
@@ -120,6 +176,10 @@ instead of the P100 computing every row itself. The decode does not change.
 Measured on the box on 2026-10-28 with the MMQ prompt path (`STRATA_MMQ_KQ=1`). The decode stayed
 at 44 tok/s in every arm.
 
+The same flag on a 30,000-token prompt, with the settled switches (the FP16 rows back, the
+FP16-accumulate GEMM, the chunk at 16384), gives **median 633.4 tok/s** — see
+[the two configurations](#the-two-configurations-this-box-settled).
+
 Two things to know:
 
 - **The flag needs `STRATA_MMQ_KQ=1`** on a K-quant pack. Without it the MMQ plan is empty and the
@@ -159,7 +219,8 @@ only sizes the captured graphs and the buffers. `--suffix-draft 0` is the fastes
 | `--expert-cache 512` (too few slots) | 10.2 tok/s |
 | `--peer-device 1` | 33.8 tok/s; it also cannot be combined with `--expert-cache-device1..3` |
 | `STRATA_PF_F16_CUDA=1` (fused FP16 K-quant experts) | Reaches the kernels, no measurable change |
-| `STRATA_DENSE_F16_ACC=1` (FP16-accumulate GEMM on Pascal) | No measurable change |
+| `STRATA_PF_F16_PEER=1` (the fused FP16 K-quant prompt path) | **2.9× slower** on the prompt path (613.8 → 208.2 tok/s on a 30k prompt): the helper cards' MoE GEMM is 11× slower with it. Off by default. |
+| `STRATA_DENSE_F16_ACC=1` (FP16-accumulate GEMM on Pascal) | No measurable change on the decode; on the prompt path it is **−5.0 %** (see above) |
 | `STRATA_HC_PERSIST=1` | A HIP kernel; the CUDA build has an empty stub, so it does nothing |
 | `STRATA_HC_UPMIX=1`, `STRATA_HCD_EXACT=1` | Prompt path only |
 | `STRATA_GDN_CHUNKED=1` / `2` | Within noise (+1.3% / +1.0%) |
