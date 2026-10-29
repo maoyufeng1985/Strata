@@ -1062,3 +1062,34 @@ per-card streams already overlap; `FINISH_PAR` +0.17 %), **`--mtp-hnorm stream`*
 **`HELPER_PARALLEL`** (implemented, −3.8 % after the pool rewrite, off). What did transfer, and pays,
 is the **sm_60 default table** — which is not a Q36 port at all, it was already in the tree.
 
+### 2026-10-29 — `STRATA_PF_PEER_COMPRESS=1`: the peer rows come back in FP16, and the prefill is 17 % faster
+
+The helper cards have no P2P to the primary on this box, so their expert rows travel over the PCIe host
+route: the helper writes them into mapped host memory and the primary reads them back in the `combine`. The
+rows are FP32 today (`rows × n_embd × 4` bytes per layer per helper), and the combine phase is 28-36 % of the
+prefill's wall-clock and is mostly a wait for that transfer.
+
+`STRATA_PF_PEER_COMPRESS=1` rounds the helper's rows to FP16 **on the helper's card** (`sums_to_f16`), so the
+link carries half the bytes, and the primary widens them back to FP32 as it combines (`f16_to_f32_wide`). The
+default path is untouched: with the switch off the rows keep their FP32 route, and the FP16 work buffers are
+not allocated for it.
+
+Measured (`R-pfcmp30k.sh`, binary `9893029d1157`, 30k prompt, **2** helper caches (`--gpu 2,1,0,3`),
+`--prefill 16384`, `STRATA_DENSE_F16_ACC=1`, `STRATA_PREFILL_REMOTE_PEERS=1`, one cold prompt per arm):
+
+| arm | prefill ms | tok/s |
+|---|---:|---:|
+| `cmp_off` (FP32 rows) | 61,990 | 483.9 |
+| **`cmp_on` (FP16 rows)** | **51,240** | **585.5** |
+
+**−17.3 % of the prefill time** (61,990 → 51,240 ms; +21.0 % tok/s). Both arms `rc=0` with no illegal
+memory access, and the helper's start-up line is what proves the switch was seen: "no P2P: through mapped host
+memory in FP16 rows" in `cmp_on` against "no P2P: through mapped host memory" in `cmp_off`.
+
+This is the largest single switch win in this run; the chunk-size change (−16.2 %, ch512 → ch16384) is a
+configuration change rather than a code change, and the two compose (the final 30k runs carry both).
+
+Caveat on the number: one cold prompt per arm, not interleaved rounds, so it carries the run-to-run spread
+this box showed elsewhere (the 30k prefill moved ~2 % between identical runs). The direction is not in doubt
+— it is the PCIe traffic halving — but the last digit of "17.3 %" is worth ±2 points.
+
