@@ -13,7 +13,14 @@
 //                        prompt round differently from the paths they replace (24 of 24 greedy answers identical; no KL run yet).
 //
 // A switch the user set (to anything, including 0) is never overridden.  Applied once at start, before any engine code reads its
-// switches; the table is used only when every visible CUDA device has the same compute capability.
+// switches; the table is used only when every visible CUDA device has the same compute capability - the case it was measured in.
+//
+// A mixed fleet (a P100 at sm_60 with P104/P40 helpers at sm_61, the normal shape on the 1+3 boxes) has no per-card switch
+// mechanism: the variables live in the process environment, so a table applied for the primary also drives the helpers (every
+// reader, from g_side_mixer to b6_rows_mode, returns the env var without asking its card).  There `STRATA_NV_DEFAULTS_PRIMARY=1`
+// applies the PRIMARY card's (CUDA ordinal 0) table to the whole process and says so on stderr; without it a mixed fleet keeps
+// the byte-identical default.  Measured on 192.168.1.98: the table never fired (0 firings in every log) and is worth +17.8 % on
+// the P100 alone (148-nv, 8/8 pairs, identity gate identical).
 #pragma once
 
 #include <string>
