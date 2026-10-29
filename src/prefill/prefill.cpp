@@ -861,9 +861,11 @@ struct PeerPrefill {
     // pageable), and a copy from them on the peer's stream would hold up the host until that stream is idle.
     float* host_x = nullptr;              // T x N activations (mapped, portable)
     float* host_rows = nullptr;           // the peer's result rows (mapped, portable)
+    uint16_t *host_rows16 = nullptr;      // the same rows in FP16 (STRATA_PF_PEER_COMPRESS: half the PCIe read)
     int32_t* host_src = nullptr;          // the peer's rows' tokens (mapped, portable)
     int32_t* host_bounds = nullptr;       // its group bounds (mapped, portable)
-    size_t host_x_cap = 0, host_rows_cap = 0, host_src_cap = 0;   // elements
+    size_t host_x_cap = 0, host_rows_cap = 0, host_rows16_cap = 0, host_src_cap = 0;   // elements
+    bool compress = [] { const char* v = std::getenv("STRATA_PF_PEER_COMPRESS"); return v != nullptr && std::atoi(v) != 0; }();
     static constexpr size_t kHostBounds = 2 * (NE + NE / 16 + 2) + 64;
     int64_t back_at = 0, back_rows = 0;
     // SUMS (the host route's default, STRATA_PF_PEER_SUMS=0: rows): the peer adds its rows into one weighted sum per
@@ -921,6 +923,7 @@ struct PeerPrefill {
         if (ev_x) cudaEventDestroy(ev_x);
         if (host_x) cudaFreeHost(host_x);
         if (host_rows) cudaFreeHost(host_rows);
+        if (host_rows16) cudaFreeHost(host_rows16);
         if (host_src) cudaFreeHost(host_src);
         if (host_bounds) cudaFreeHost(host_bounds);
         if (host_w) cudaFreeHost(host_w);
@@ -2271,6 +2274,7 @@ bool Prefill::bind_stage_helper(int64_t T) {
         };
         size_t bounds_cap = P.host_bounds ? PeerPrefill::kHostBounds : 0;
         if (!grow(P.host_x, P.host_x_cap, (size_t) T * N) || !grow(P.host_rows, P.host_rows_cap, (size_t) T * K * N) ||
+            !(P.compress && P.host_rows16 != nullptr ? grow(P.host_rows16, P.host_rows16_cap, (size_t) T * K * N) : true) ||
             !grow(P.host_src, P.host_src_cap, (size_t) T * K) || !grow(P.host_bounds, bounds_cap, PeerPrefill::kHostBounds))
             return false;
     }
@@ -2451,6 +2455,7 @@ std::unique_ptr<PeerPrefill> Prefill::open_peer_exec(Impl& m, const PeerSource& 
             if (ok && pp->gather) host(pp->host_adds, adds_cap, pp->adds_cap);
         } else if (ok) {
             host(pp->host_rows, pp->host_rows_cap, (size_t) pp->cap_rows * N);
+            if (pp->compress) host(pp->host_rows16, pp->host_rows16_cap, (size_t) pp->cap_rows * N);
         }
         if (ok) host(pp->host_src, pp->host_src_cap, (size_t) pp->cap_rows);
         if (ok) host(pp->host_bounds, bounds_cap, PeerPrefill::kHostBounds);
@@ -2470,7 +2475,8 @@ std::unique_ptr<PeerPrefill> Prefill::open_peer_exec(Impl& m, const PeerSource& 
                  pp->dev, (long long) pp->cap_rows,
                  pp->p2p ? "" : (pp->sums ? (pp->f16 ? ", no P2P: through mapped host memory in FP16, one weighted sum per token back"
                                                      : ", no P2P: through mapped host memory, one weighted sum per token back")
-                                          : ", no P2P: through mapped host memory"),
+                                          : (pp->compress ? ", no P2P: through mapped host memory in FP16 rows"
+                                                         : ", no P2P: through mapped host memory")),
                  pp->compact ? (pp->ps_frac > 0.0 ? (", compact group buffers, streams " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
                                                     "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
                                                  : ", compact group buffers") : "", fb >> 20);
@@ -5142,6 +5148,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (P.p2p)
                                         cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm_b[b], P.dev,
                                                             (size_t) nr * N * 4, P.s_out);
+                                    else if (P.compress && P.host_rows16 != nullptr) {
+                                        // STRATA_PF_PEER_COMPRESS: quantize the rows to FP16 on this card, then the host
+                                        // route carries half the bytes; the primary's combine reads FP16 mapped memory
+                                        sums_to_f16(P.Dm_b[b], P.host_rows16 + (size_t) r0 * N, nr * N, P.s_out);
+                                    }
                                     else   // the primary reads them when it combines (below)
                                         cudaMemcpyAsync(P.host_rows + (size_t) r0 * N, P.Dm_b[b], (size_t) nr * N * 4,
                                                         cudaMemcpyDeviceToHost, P.s_out);
@@ -5680,7 +5691,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         for (PeerPrefill* P : peers) {
                             if (P->back_rows <= 0) continue;
                             cudaStreamWaitEvent(m.cs, P->ev_done, 0);
-                            if (!P->p2p && !P->sums)
+                            if (!P->p2p && !P->sums && P->compress && P->host_rows16 != nullptr)
+                                f16_to_f32_wide(m.Dm + (size_t) P->back_at * N, P->host_rows16, P->back_rows * N, m.cs);
+                            else if (!P->p2p && !P->sums)
                                 copy_f32_wide(m.Dm + (size_t) P->back_at * N, P->host_rows, P->back_rows * N, m.cs);
                         }
                     }
