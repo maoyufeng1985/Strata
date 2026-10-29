@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Pack the incoai DFlash2 drafter for Qwen3.8-Flash-Next (safetensors) into the engine's runtime file.
+"""Pack an incoai DFlash2 drafter (safetensors) into the engine's runtime file.
 
     python tools/dflash2_pack.py model.safetensors config.json out.pack [--bf16]
+
+Any DFlash2 drafter packs: the shape comes from the repo's own config.json, not from a list of targets.  Packs measured to load are
+incoai/Qwen3.8-Flash-Next-DFlash2 (hidden 2560, 5 layers, 5 taps) and incoai/Qwen3.6-35B-A3B-DFlash2 (hidden 2048, 6 layers, 8 taps) -
+the second drafts for the Qwen3.6-35B-A3B family, which is what Whittle-Qwen-3.8-45B-A3B is merged from.
 
 Format (little endian): "DF2P", u32 version (1), u32 index_len, a text index (padded with spaces so the data starts on a 4096 multiple), then
 the tensors, each 256-byte aligned at its offset (from the end of the index).  Index lines: "cfg <key> <value>", "t <name> <dtype> <rows>
@@ -80,6 +84,12 @@ def quant_q8_0(w):
     return out.tobytes()
 
 
+def _source(st_path):
+    """A short provenance tag for the pack's index: the drafter's name from the path, else the file's own directory."""
+    p = st_path.replace("\\", "/")
+    parts = [x for x in p.split("/") if x]
+    return parts[-2] if len(parts) >= 2 else parts[-1] if parts else "?"
+
 def pack(st_path, cfg_path, out_path, say=print):
     """Write the engine's runtime file for the drafter in `st_path` (+ its config.json). Returns the number of bytes written."""
     with open(cfg_path, encoding="utf-8") as fh:
@@ -125,7 +135,7 @@ def pack(st_path, cfg_path, out_path, say=print):
         "head_dim": cfg["head_dim"], "inter": cfg["intermediate_size"], "window": cfg["sliding_window"], "rope_theta": cfg["rope_parameters"]["rope_theta"],
         "eps": cfg["rms_norm_eps"], "block": dc["block_size"], "conv_group": dc["conv_group_size"], "conv_kernel": dc["conv_kernel_size"],
         "mask_token": dc["mask_token_id"], "rank": dc["selector_rank"], "top_k": dc["selector_top_k"], "taps": dc["target_layer_ids"],
-        "vocab": cfg["vocab_size"], "source": "incoai/Qwen3.8-Flash-Next-DFlash2 a22a1744",
+        "vocab": cfg["vocab_size"], "source": _source(st_path),
     }
     # offsets: relative to the end of the (padded) index; 256-byte aligned
     off = 0

@@ -3385,19 +3385,51 @@ int main(int argc, char** argv) {
     }
 #endif
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
-    {   // CUDA sm_86 / sm_60: the switches that are exact AND faster there are on by default (strata/core/nv_defaults.hpp), when every
-        // visible card has that one compute capability; before any engine code reads its switches, the user's own settings are kept
+    {   // CUDA sm_86 / sm_60: the switches that are exact AND faster there are on by default (strata/core/nv_defaults.hpp),
+        // before any engine code reads them; the user's own settings are kept.  The table is applied when every visible
+        // card has ONE compute capability - the case it was measured in.
+        //
+        // A MIXED fleet is the normal shape on the P100 + 3x P104 boxes (sm_60 + sm_61): there the table never fired
+        // (measured: 0 firings in every log on 192.168.1.98, where it is worth +17.8 % on the P100 alone), and it cannot
+        // be applied as it stands, because the switches are READ FROM THE PROCESS ENVIRONMENT and every card shares one
+        // environment: a table picked for the primary would also drive the helper cards (g_side_mixer, up75_on,
+        // b6_rows_mode and adapt_nowait all return the env var without asking which card they are on).  So a mixed
+        // fleet keeps today's byte-identical behaviour unless the operator asks for the primary card's table by name:
+        //     STRATA_NV_DEFAULTS_PRIMARY=1
+        // which applies the primary card's table to the whole process and says so on stderr.  The helpers then run
+        // switches that were measured on another card; on 192.168.1.98 that was measured faster and the token ids of the
+        // identity gate were identical (see docs/WHITTLE45B.md).
         int nd = 0;
         if (cudaGetDeviceCount(&nd) == cudaSuccess && nd > 0) {
             int m0 = 0, n0 = 0;
-            bool same = cudaDeviceGetAttribute(&m0, cudaDevAttrComputeCapabilityMajor, 0) == cudaSuccess &&
-                        cudaDeviceGetAttribute(&n0, cudaDevAttrComputeCapabilityMinor, 0) == cudaSuccess;
-            for (int d = 1; same && d < nd; ++d) {
+            bool have0 = cudaDeviceGetAttribute(&m0, cudaDevAttrComputeCapabilityMajor, 0) == cudaSuccess &&
+                         cudaDeviceGetAttribute(&n0, cudaDevAttrComputeCapabilityMinor, 0) == cudaSuccess;
+            int mixed = 0;   // the first card whose compute capability differs from the primary's
+            for (int d = 1; have0 && d < nd; ++d) {
                 int m = 0, n = 0;
-                same = cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
-                       cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess && m == m0 && n == n0;
+                if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess ||
+                    cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) != cudaSuccess)
+                    continue;   // an unreadable card cannot disagree
+                if ((m != m0 || n != n0) && mixed == 0) mixed = d;
             }
-            if (same) { strata::core::apply_nv_defaults(m0, n0); strata::core::apply_spec_adapt_default(m0, n0); }
+            const char* prim = std::getenv("STRATA_NV_DEFAULTS_PRIMARY");
+            const bool want_primary = prim != nullptr && prim[0] == '1';
+            if (have0 && (mixed == 0 || want_primary)) {
+                const std::vector<std::string> set = strata::core::apply_nv_defaults(m0, n0);
+                strata::core::apply_spec_adapt_default(m0, n0);
+                if (mixed > 0 && !set.empty())
+                    std::fprintf(stderr, "strata: STRATA_NV_DEFAULTS_PRIMARY=1: the %zu exact speed switches above are the "
+                                         "primary card's (CUDA0, compute capability %d.%d); CUDA%d (first of %d other card%s) "
+                                         "runs a different one and shares this process's environment, so it takes the same "
+                                         "switches - STRATA_SM%d%d_PERF=0 turns them all off\n",
+                                 set.size(), m0, n0, mixed, nd - 1, nd == 2 ? "" : "s", m0, n0);
+            } else if (mixed > 0 && prim != nullptr) {
+                // only when the operator asked: a mixed fleet prints nothing by default, as before this variable existed
+                std::fprintf(stderr, "strata: STRATA_NV_DEFAULTS_PRIMARY is set but not 1: the exact speed switches stay off "
+                                     "(the %d visible cards do not share one compute capability; CUDA0 is %d.%d, CUDA%d is "
+                                     "not).  Set STRATA_NV_DEFAULTS_PRIMARY=1 to apply CUDA0's table to every card\n",
+                                 nd, m0, n0, mixed);
+            }
         }
         (void) cudaGetLastError();
     }

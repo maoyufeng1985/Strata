@@ -1,11 +1,15 @@
-// include/strata/core/dflash2.hpp - the DFlash2 drafter for Qwen3.8-Flash-Next on the GPU (CUDA and HIP).
+// include/strata/core/dflash2.hpp - the DFlash2 block drafter on the GPU (CUDA and HIP).
 //
-// incoai/Qwen3.8-Flash-Next-DFlash2 (Apache-2.0) is a block drafter: 5 transformer layers of hidden 2560 that read the target's hidden
-// states (the mean of the 4 hyper-connection streams after layers 5, 15, 25, 35, 45) as context and, from the last accepted token plus
-// 7 mask tokens, produce 7 draft tokens in one forward pass.  A candidate selector (the head's top-16 per row, a rank-256 bilinear
-// score between the previous pick and each candidate) picks the path left to right.  tools/dflash2_pack.py packs it as Q8_0.
+// A DFlash2 drafter (incoai, Apache-2.0) is a block drafter: a few transformer layers that read the target's hidden states at a list of
+// layer taps as context and, from the last accepted token plus 7 mask tokens, produce 7 draft tokens in one forward pass.  A candidate
+// selector (the head's top-16 per row, a rank-256 bilinear score between the previous pick and each candidate) picks the path left to
+// right.  tools/dflash2_pack.py packs one as Q8_0.
 //
-//   context    taps (5 x 2560 per accepted row) -> fc (12800 -> 2560) -> hidden_norm -> per layer K (norm + rope) and V -> ring slot pos % R
+// The shape comes from the pack, not from a target: incoai/Qwen3.8-Flash-Next-DFlash2 is 5 layers of hidden 2560 with 5 taps (the mean
+// of the 4 hyper-connection streams after layers 5, 15, 25, 35, 45); incoai/Qwen3.6-35B-A3B-DFlash2 is 6 layers of hidden 2048 with 8
+// taps.  What the kernels fix is the draft attention (32 query heads, 8 K/V heads, head 128) and the selector rank (256).
+//
+//   context    taps (n_taps x n_embd per accepted row) -> fc -> hidden_norm -> per layer K (norm + rope) and V -> ring slot pos % R
 //   block      8 rows: embed(anchor), embed(mask) x 7; per layer
 //                rms -> dynamic 2-tap conv (prepare) -> q, k, v -> q/k norm + rope -> attention over the ring + the block's own keys
 //                -> o -> conv (finish) + residual -> rms -> conv (prepare) -> gate/up -> silu*up -> down -> conv (finish) + residual

@@ -21,7 +21,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -5011,12 +5013,125 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     if (d.remote_count > 0) {
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r) {
-            if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+        // STRATA_REMOTE_HELPER_PARALLEL=1: the helpers' begin() calls run on worker threads so the three cards
+        // stage and launch at once (each begin does a pinned memcpy plus a few launches on its own stream; serially
+        // the host pays them one after another - 1.9 ms/round of staging on the measured box).  This mirrors the
+        // Q36 engine's HELPER_PARALLEL_MARSHAL, including its trap: the mask each helper reads must be the SAME
+        // snapshot taken before any begin runs.  Handing a later helper the kind[] that an earlier begin already
+        // stamped with 2 makes it skip experts it holds - Q36 measured that losing 12.8 % of the entries (60 -> 40
+        // tok/s, plans/2026-10-25-q36-mixer-graph.md:88-91).  So: snapshot kind, run the begins concurrently, then
+        // stamp kind from each helper's own owned_ rows on this thread (owns() reads that helper's window, so the
+        // stamping itself is not a race).
+        static const bool par = [] {
+            const char* v = std::getenv("STRATA_REMOTE_HELPER_PARALLEL");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
+        if (par && d.remote_count > 1) {
+            std::array<std::array<int32_t, kMaxWindowEntries>, 3> kind_snap{};
+            const int64_t n = n_tok * k;
+            for (int r = 0; r < d.remote_count; ++r) std::memcpy(kind_snap[(size_t) r].data(), kind, (size_t) n * sizeof(int32_t));
+            std::array<uint8_t, 3> ok{};
+            std::array<double, 3> ms{};
+            // One error slot per helper: the workers must not write a shared std::string.  They live in a function-static
+            // array so the pointer `d.fail` keeps (a const char*) outlives this call, each worker writes only its own
+            // element (no race), and the join below is what makes them readable on this thread.
+            static std::array<std::string, 3> errs;
+            // PERSISTENT workers, not one std::thread per call.  A dispatch is one call per layer, i.e. 40 per token,
+            // and each begin() is a few microseconds of host work (a 64 KB memcpy plus launches): creating three
+            // threads per dispatch costs ~70 us each, measured at 37.7x the serial memcpy time over 10240 dispatches,
+            // which is what made the first version of this branch 30 % SLOWER than the serial loop.  The pool is
+            // created once, wakes on a generation counter and parks again.
+            struct Pool {
+                std::mutex mu;
+                std::condition_variable cv;
+                uint64_t gen = 0;
+                std::array<uint64_t, 3> seen{};
+                bool stop = false;
+                std::array<std::thread, 3> th;
+                std::array<uint8_t, 3> ok{};
+                std::array<double, 3> ms{};
+                std::array<std::array<int32_t, kMaxWindowEntries>, 3> kind_snap{};
+                ExpertDispatch* d = nullptr;
+                const float* x_f = nullptr;
+                const int32_t* ids = nullptr;
+                int64_t n_tok = 0, k = 0;
+                int count = 0;
+                std::array<std::string, 3>* errs = nullptr;
+                std::atomic<bool> done{false};
+                int finished = 0;
+
+                ~Pool() {
+                    { std::lock_guard<std::mutex> lk(mu); stop = true; ++gen; }
+                    cv.notify_all();
+                    for (auto& t : th) if (t.joinable()) t.join();
+                }
+                void run(int r) {
+                    uint64_t last = 0;
+                    for (;;) {
+                        {
+                            std::unique_lock<std::mutex> lk(mu);
+                            cv.wait(lk, [&] { return stop || gen != last; });
+                            if (stop) return;
+                            last = gen;
+                        }
+                        const auto t0 = std::chrono::steady_clock::now();
+                        ok[(size_t) r] = d->remote[r]->begin(d->layers, x_f, ids, n_tok, k, kind_snap[(size_t) r].data(),
+                                                             d->host_res, (*errs)[r]);
+                        ms[(size_t) r] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        {
+                            std::lock_guard<std::mutex> lk(mu);
+                            if (++finished == count) { finished = 0; done = true; }
+                        }
+                        cv.notify_all();
+                    }
+                }
+                void go(ExpertDispatch* dd, const float* x, const int32_t* id, int64_t nt, int64_t kk, int cnt,
+                        const int32_t* kind_src, std::array<std::string, 3>* e) {
+                    d = dd; x_f = x; ids = id; n_tok = nt; k = kk; count = cnt; errs = e;
+                    for (int r = 0; r < cnt; ++r)
+                        std::memcpy(kind_snap[(size_t) r].data(), kind_src, (size_t) (nt * kk) * sizeof(int32_t));
+                    done = false;
+                    { std::lock_guard<std::mutex> lk(mu); ++gen; }
+                    cv.notify_all();
+                }
+                void wait() {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return done.load(); });
+                }
+            };
+            static Pool pool;
+            if (!pool.th[0].joinable()) {
+                // the first call starts them; `r` is captured per thread
+                for (int r = 0; r < 3; ++r) pool.th[(size_t) r] = std::thread([&pool, r] { pool.run(r); });
             }
-            for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
+            pool.go(&d, x_f, ids, n_tok, k, d.remote_count, kind, &errs);
+            pool.wait();
+            for (int r = 0; r < d.remote_count; ++r) {
+                if (!pool.ok[(size_t) r]) {
+                    // every helper's own message, first failure first; the wait() above means this is the only reader.
+                    // The joined text lands back in errs[r], whose storage outlives d.fail (a const char*).
+                    std::string msg = errs[r];
+                    for (int q = 0; q < d.remote_count; ++q)
+                        if (q != r && !pool.ok[(size_t) q] && !errs[q].empty()) msg += "; " + errs[q];
+                    errs[r] = msg;
+                    d.failed = true; d.fail = errs[r].c_str(); d.fail_layer = d.layers;
+                    // the helpers that did launch hold a busy window: let the next call's begin drain it
+                    return;
+                }
+                for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
+            }
+            if (static const bool dbg = std::getenv("STRATA_REMOTE_HELPER_TIMING") != nullptr; dbg) {
+                std::fprintf(stderr, "strata remote: layer %lld parallel begin: %.2f / %.2f / %.2f ms at once\n",
+                             (long long) d.layers, pool.ms[0], pool.ms[1], pool.ms[2]);
+            }
+        } else {
+            static thread_local std::string remote_error;   // outlives d.fail, which is a const char*
+            for (int r = 0; r < d.remote_count; ++r) {
+                if (!d.remote[r]->begin(d.layers, x_f, ids, n_tok, k, kind, d.host_res, remote_error)) {
+                    d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                }
+                for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
+            }
         }
     }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
@@ -5212,11 +5327,29 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     }
     if (d.remote_count > 0) {
-        static thread_local std::string remote_error;
-        for (int r = 0; r < d.remote_count; ++r)
-            if (!d.remote[r]->finish(out, remote_error)) {
-                d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
-            }
+        // The three drains are independent: each waits on its own card's stream.  Taking them in a loop makes the
+        // waits ADD, and each drain is a blocking cudaStreamSynchronize for rings == 1 (remote_experts.cpp:624).
+        // With STRATA_REMOTE_FINISH_PAR=1 each card's stream is polled to completion first (drain_all), so the wait
+        // is the slowest card's rather than the sum; the finish() calls after it only scatter rows, which is host
+        // work.  Off by default: the flag-off loop below is the byte-identical path.
+        static const bool fin_par = [] {
+            const char* v = std::getenv("STRATA_REMOTE_FINISH_PAR");
+            return v != nullptr && v[0] == '1' && v[1] == '\0';
+        }();
+        if (fin_par && d.remote_count > 1) {
+            for (int r = 0; r < d.remote_count; ++r) d.remote[r]->drain_all();
+            static thread_local std::string remote_error;
+            for (int r = 0; r < d.remote_count; ++r)
+                if (!d.remote[r]->finish(out, remote_error)) {
+                    d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                }
+        } else {
+            static thread_local std::string remote_error;
+            for (int r = 0; r < d.remote_count; ++r)
+                if (!d.remote[r]->finish(out, remote_error)) {
+                    d.failed = true; d.fail = remote_error.c_str(); d.fail_layer = d.layers; return;
+                }
+        }
     }
     if (d.peer != nullptr) {                 // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;

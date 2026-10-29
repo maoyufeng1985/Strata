@@ -19,6 +19,7 @@
 #include <atomic>
 #include <initializer_list>
 #include <stdexcept>
+#include <string>
 
 namespace strata::core {
 namespace {
@@ -164,8 +165,38 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
             total = std::max(total, t.off + t.bytes);
         }
     }
-    if (tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || N_ != 2560 || L_ > 8 || window_ + 16 > kRing) {
-        err = "dflash2: the pack's shape is not the Flash-Next drafter this engine was written for";
+    // The shape comes from the pack's config, not from a target's: any DFlash2 drafter whose widths the kernels can take loads, so a
+    // pack trained for a different hidden size works as long as it is the DFlash2 architecture.  What the kernels fix is the attention
+    // (32 query heads, 8 K/V heads, head 128: those are compile-time in kernels/dflash2.cu), the selector rank (df2_select rejects
+    // anything but 256) and the block row count (kRows).  Everything else is checked against the pack's own tensors below, so a
+    // mismatched fc, a tap list that does not match it, or a width the Q8 GEMM cannot take fails here rather than in a kernel.
+    const Tensor* fc = nullptr;
+    for (const Tensor& t : tensors_) if (t.name == "fc.weight") fc = &t;
+    const int64_t fc_expect = (int64_t) taps_.size() * (int64_t) N_;
+    // A column width one of the Q8 GEMMs will be handed must be a multiple of 512 (kernels/cuda/dflash2.cu:719 throws
+    // otherwise), and every one of them feeds that GEMM its input width: fc's, each layer's q/k/v/gate/up/o/down, the
+    // two conv projections.  Checking N_ and I_ alone misses the case where the pack's fc or o_proj disagrees with its
+    // config, which is exactly what a mis-packed or hand-edited pack looks like.
+    std::string bad_w;
+    if (!tensors_.empty()) {
+        for (const Tensor& t : tensors_) {
+            if (t.dtype != "q8_0") continue;
+            if (t.cols % 512 != 0) { bad_w = t.name + " has " + std::to_string(t.cols) + " input columns (needs a multiple of 512)"; break; }
+            if (t.rows % 16 != 0) { bad_w = t.name + " has " + std::to_string(t.rows) + " output rows (needs a multiple of 16)"; break; }
+        }
+    }
+    if (!bad_w.empty() || tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || L_ <= 0 || L_ > 8 ||
+        window_ + 16 > kRing || N_ <= 0 || N_ % 512 != 0 || group_ <= 0 || N_ % group_ != 0 || I_ <= 0 || I_ % 512 != 0 ||
+        taps_.empty() || fc == nullptr || fc->rows != N_ || fc->cols != fc_expect) {
+        char why[256];
+        if (!bad_w.empty()) std::snprintf(why, sizeof why, "%s", bad_w.c_str());
+        else if (fc == nullptr) std::snprintf(why, sizeof why, "the pack has no fc.weight");
+        else if (!taps_.empty() && (fc->rows != N_ || fc->cols != fc_expect))
+            std::snprintf(why, sizeof why, "fc.weight is [%lld, %lld] but %zu taps of a %d-wide hidden make it [%d, %lld]", (long long) fc->rows,
+                          (long long) fc->cols, taps_.size(), N_, N_, (long long) fc_expect);
+        else std::snprintf(why, sizeof why, "hidden %d, layers %d, inter %d, heads %d/%d, head dim %d, rank %d, window %d, %zu taps",
+                           N_, L_, I_, NH_, NKV_, HD_, rank_, window_, taps_.size());
+        err = std::string("dflash2: the pack is not a DFlash2 drafter these kernels run: ") + why;
         return false;
     }
     if (cudaMalloc((void**) &blob_, total) != cudaSuccess) { err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)"; return false; }
@@ -232,9 +263,14 @@ bool Dflash2Drafter::alloc(std::string& err) {
         return true;
     };
     const size_t B = kRows;
-    bool ok = dev(&d_meta_, 32) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + 4096) && dev(&xqp_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&xqc_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&rt_ctx_, B * 128) && dev(&rt_blk_, B * 128) &&
+    // the planar activation widths the taps and the conv read: tap_n = taps * N (the fc input) and 4 * groups for dyn (two taps of
+    // groups each, at the two conv offsets), where groups = N / conv_group.  Both were 12800 and 640 on the Flash-Next drafter
+    // (5 taps of 2560, 160 groups); they follow the pack's own config now.
+    const size_t tap_n = taps_.size() * (size_t) N_;
+    const size_t dyn_w = (size_t) 4 * (size_t) (N_ / group_);
+    bool ok = dev(&d_meta_, 32) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + 4096) && dev(&xqp_, tap_n * 8 + 4096) && dev(&xdp_, tap_n / 32 * 8 + 64) && dev(&xqc_, tap_n * 8 + 4096) && dev(&xdc_, tap_n / 32 * 8 + 64) && dev(&rt_ctx_, B * 128) && dev(&rt_blk_, B * 128) &&
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, B * NKV_ * HD_) && dev(&vc_, B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
-              dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
+              dev(&xc_, B * N_) && dev(&dyn_, B * dyn_w) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
               dev(&part_, (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
               dev(&hsel_, kDrafts * rank_) && dev(&topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
@@ -250,10 +286,10 @@ bool Dflash2Drafter::alloc(std::string& err) {
     out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
     out_prob_ = (float*) dd + 16;        // ... and their probabilities at +16 ints
     cudaMemset(rt_ctx_, 0, B * 128 * 4);
-    cudaMemset(xqp_, 0, (size_t) 5 * N_ * 8 + 4096);
-    cudaMemset(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
-    cudaMemset(xqc_, 0, (size_t) 5 * N_ * 8 + 4096);
-    cudaMemset(xdc_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
+    cudaMemset(xqp_, 0, tap_n * 8 + 4096);
+    cudaMemset(xdp_, 0, (tap_n / 32 * 8 + 64) * 4);
+    cudaMemset(xqc_, 0, tap_n * 8 + 4096);
+    cudaMemset(xdc_, 0, (tap_n / 32 * 8 + 64) * 4);
     for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); cudaMemset(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); }
     return cudaDeviceSynchronize() == cudaSuccess;
 }
@@ -376,6 +412,11 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
     using namespace kernels;
     try {
         const int B = kRows;
+        // the conv's slices of the projection output: groups = N / conv_group, and the kernel_projection writes 2 taps at each of the
+        // two conv offsets, so one convolution reads 2 * groups and the buffer holds 4 * groups (the attention conv then the mlp conv).
+        const int conv_groups = N_ / group_;
+        const int dyn_stride = 4 * conv_groups;
+        const int dyn_half = 2 * conv_groups;
         df2_rope_table(d_meta_ + 8, B, theta_, rt_blk_, cs);
         stamp("df2_rope_table");
         embed_(d_meta_ + 24, B, h_, cs);
@@ -391,7 +432,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             const std::string gp = p + "mlp.gate_proj.weight", up = p + "mlp.up_proj.weight";
             if (!skip_part("tiny")) gemm({akp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
             stamp("gemm:akp");
-            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_a, B, N_, group_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, dyn_stride, base_a, B, N_, group_, xqp_, xdp_, cs);
             stamp("df2_conv_quant");
             if (!skip_part("qkvo")) gemm({qp.c_str(), kp.c_str(), vp.c_str()}, {q_, k_, v_}, B, cs, xqp_, xdp_);
             stamp("gemm:qp");
@@ -402,11 +443,11 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             stamp("df2_attention");
             if (!skip_part("qkvo")) gemm({(p + "self_attn.o_proj.weight").c_str()}, {o_}, B, cs, xqp_, xdp_);
             stamp("gemm:o_proj");
-            if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, B, N_, group_, eps_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + dyn_half, dyn_stride, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, B, N_, group_, eps_, xqp_, xdp_, cs);
             stamp("df2_conv_rms_quant");
             if (!skip_part("tiny")) gemm({mkp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
             stamp("gemm:mkp");
-            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_m, B, N_, group_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, dyn_stride, base_m, B, N_, group_, xqp_, xdp_, cs);
             stamp("df2_conv_quant");
             if (!skip_part("mlp")) gemm({gp.c_str(), up.c_str()}, {gate_, up_}, B, cs, xqp_, xdp_);
             stamp("gemm:gp");
@@ -416,7 +457,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             stamp("gemm:mlp.down_proj");
             // the next layer's input norm, or after the last layer the final norm (-> fn_, the rows the head and the selector read)
             const std::string next_gamma = l + 1 < L_ ? "layers." + std::to_string(l + 1) + ".input_layernorm.weight" : std::string("norm.weight");
-            if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + dyn_half, dyn_stride, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs);
             stamp("df2_conv_rms_quant");
         }
         native_quantize_q8_1(fn_ + N_, xq_, N_, kDrafts, cs);   // rows 1..7, the head's format
