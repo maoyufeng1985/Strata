@@ -53,6 +53,130 @@ free win, and it must be said that way.
 | `STRATA_ADAPT_NOWAIT` / `STRATA_ADAPT_LAG=2` alone | −0.1 % / +0.2 %, sign flips — they only matter inside the table |
 | `FUSE_DECODE`, `B6_MMVQ_ROWS`, `GR_UP75` (drop-one from the table) | all within 0.11 % of the table, signs disagree — dead weight on this box |
 
+### 2026-10-29 — the line-by-line audit, re-triaged by provenance
+
+The read-only source audit (8 module agents + synthesizer, 44 candidate points) is re-triaged here because
+several of the agents marked "measured" what was actually **upstream's number on a different card**.
+Graded by provenance:
+
+**A — upstream explicitly measured on a P100, positive, but this box's config is gated out. Test these first.**
+| switch | upstream evidence | this box |
+|---|---|---|
+| `STRATA_ADAPT_OVERLAP=1` (+ `ADAPT_LAG=1 ADAPT_NOWAIT=0`) | `DETAILS.md:1010` — P100 **+4 to +8 %** | needs the whole arena in RAM + one GPU; the 3-helper MMQ config may not qualify — **must test** |
+| `STRATA_ADAPT_LAG=2`, `SIDE_MIXER=2`, `GR_UP75=1`, `B6_MMVQ_ROWS=1`, `FUSE_WAIT=2`, `FUSE_DECODE=1` | the sm_60 table, `nv_defaults.cpp:36-48` (P100 +17.8 %) | gated off on the mixed fleet; the **whole table already measured −5.02 %** (round `_r2.log`), so these are known — only the drop-one split is open |
+
+**B — 0.2.7's Pascal opt-in family, unmeasured here. `release-notes-0.2.7.md:53` says their speed numbers are the
+authors', not ours.** Test, do not assume:
+`STRATA_DOWN_WS=1`, `STRATA_MTP_Q8_SM60=1`, `STRATA_MMQ_WS=1`, `STRATA_PATTN_SM60=1`, `STRATA_EXPERT_NIBBLE=1`.
+All compile in (`STRATA_EXPERIMENTAL_SM60=ON`), all need an A/B.
+
+**C — mechanism-plausible, derivation-only (the agent's "measured X ms" is unsupported).** Worth a probe only
+after A and B: the PLE compact copy-stream (`prefill.cpp:157`), the GDN recurrence kernel, `ps_frac`
+residency allocation (`prefill.cpp:3539`), prompt chunk-size retuning (`prefill.cpp:3131`), offloading the
+dense GDN/QSA projections to a helper (`prefill.cpp:3933,3977`), and the Q5_K native-head path
+(`generate.cpp:6394,7939`).
+
+**The Q5_K head (the "biggest per-token cost") was probed this session and the lever is smaller than the
+docs' 10 % framing suggests.** Three facts, each read from code or a run:
+1. It is **already on by default**: `--native "$M"` sets `native_head_gguf` (`generate.cpp:3851`), and the
+   startup log reads `experimental native Q5_K head, 417177600 bytes` in every combo arm — no switch to flip.
+   `STRATA_Q8_SM60` does not touch it: Whittle's `output.weight` is **Q5_K** (ggml type 13), and that switch
+   only packs the Q8_0 path (`native_head.cpp:78-79`).
+2. **There is no off switch**, so a clean on/off A/B cannot be built from the tree.
+3. **The dedicated GPU-floor measurement does not run on Whittle**: `--gpu-only-full`
+   (`generate.cpp:3058`) replays per-layer `pre`+`post` graphs, but a native/IQ pack captures **no post
+   graphs** (`generate.cpp:8083`), so it exits `session_replay_full: not captured with post graphs` (rc 1).
+   Whittle's head therefore cannot be isolated on its own with the measure flags.
+
+The only reproducible head number is the **share of the per-request decode** in the serve log: 22.5-23.1
+ms/token total (combo `DONE` lines: 2884-2962 ms over 128 tokens) against `WHITTLE45B.md:175`'s single-row
+breakdown of **2.23 ms head of 22.58 ms = ~9.9 %**. Two independent sources agree on ~10 %. What is left
+that actually moves that 10 %: quantising the 417 MB head matrix to a lower native format (Q4_0/Q2) — but
+that changes the logits, so it is a quality item, not a pure speed win, and is out of scope for the
+"make it faster without changing the answer" pass. **C-grade verdict: the Q5_K native head is already
+optimal-as-shipped on this model; the remaining lever is a quant change, parked.**
+
+### 2026-10-29 — C-grade PLE compact and Q8_SM60, both measured zero on this box
+
+`R-combo2.sh`, post-rebase binary `5f63a48e`, 2-helper + `--remote-expert-opt` base, one process per
+config, 3 GEN batches (batch 1 warms, batches 2-3 timed). 275-token prompt, 128 tokens out:
+
+| arm | timed_pp (ms) | timed_dec (ms, 128 tok) | verdict |
+|---|---:|---:|---|
+| base | 1088.5 | 2651.95 | ref |
+| `STRATA_PLE_COMPACT=1` | 1090.5 | 2652.3 | +0.01 % — **0** |
+| `+ STRATA_PLE_COPY_STREAM=1` | 1090.5 | 2659.1 | noise — **0** |
+| `STRATA_Q8_SM60=1` | 1092.5 | 2656.4 | +0.17 % — **0** |
+| `Q8_SM60 + PLE_COMPACT` | 1093.5 | 2651.7 | noise — **0** |
+
+Two points closed as measured-zero:
+1. **`STRATA_PLE_COMPACT` / `PLE_COPY_STREAM` (7x fewer PLE bytes over PCIe):** the box runs
+   `--ple-io ram` (the 39 M-row table locked in RAM, `WHITTLE45B.md:79` — PLE is 0.04 ms/token, off the
+   critical path), so the PLE rows never ride PCIe and the "7x fewer bytes" lever has nothing to act on.
+   The prediction (0) held: +0.01 % prompt, 0.01 % decode.
+2. **`STRATA_Q8_SM60` (GP100 packed Q8_0 expert GEMV):** Whittle's experts are **Q4_K_M on the MMQ
+   path**, not Q8_0 GEMV, so the packed Q8_0 kernel is not dispatched. +0.17 % is within the session's
+   noise floor. The Q36-era "+5.3 % Q8_SM60" number does not transfer — different expert quant, different
+   engine path.
+
+With these two and the Q5_K head, the three remaining C-grade points that had real switches or a clean
+probe are all exhausted on this box. The only C-grade item left is the **GDN recurrence kernel**
+(`prefill.cpp:3952`), which upstream already measured within-noise (`WHITTLE45B.md:165`, `GDN_CHUNKED`
++1.3 %/+1.0 %), so it is not worth a dedicated run either.
+
+**D — demoted or rejected.** `STRATA_PF_PAD` (gfx11-only, `prefill.cpp:529`); `STRATA_HANDOFF_PIPE`
+(`prefill.cpp:420`, only fires with a layer split + hand-off, single-card prefill gets nothing, and its
+design assumes separate PCIe links); the 512 MiB expert-cache reserve and slot-alignment items
+(`remote_experts.cpp:267`, `peer_experts.cpp:202`) — VRAM-only, no speed lever; the `STRATA_GDN_CHUNKED`
+item — already measured within-noise on this box.
+
+**Box note:** the new post-rebase binary is `5f63a48e0ac1` (v0.1.53), built 08:31; re-measure any number
+against it, not against the earlier `315469d836bf`.
+
+### 2026-10-29 — combined one-load session: the best config is `QFUSE + sm_60-table + ADAPT_LAG/NOWAIT` on 2 helpers
+
+`R-combo.sh`, post-rebase binary `5f63a48e`, 275-token prompt, 256 tokens out. Each config = one
+`strata` process; the process fires 3 GEN batches and only batches 2-3 are timed, so the 18.16 GiB
+expert arena and the 1217-expert prefetch are loaded **once per config**, not per batch. Six configs:
+
+| arm | timed_pp (ms) | timed_dec (ms, 256 tok) | dec vs `h2` |
+|---|---:|---:|---:|
+| `h3` (3 helpers) | 1094.5 | 2664.1 | +0.16 % |
+| **`h2` (2 helpers, `--remote-expert-opt`)** | **1089** | **2668.35** | base |
+| `h2_nopref` (2 helpers, no `--remote-expert-opt`) | 1011 | 2707.25 | +1.45 % |
+| `h2_qfuse` (`+ STRATA_QFUSE`) | 1095.5 | 2652.5 | **−0.60 %** |
+| `h2_table` (`+ STRATA_NV_DEFAULTS_PRIMARY=1`) | 1090 | 2635.8 | **−1.22 %** |
+| **`h2_all` (`QFUSE + table + ADAPT_LAG=2 NOWAIT=1`)** | 1096.5 | **2585.5** | **−3.10 %** |
+
+Three findings, each now confirmed on the post-rebase binary in one coherent session:
+
+1. **Two helpers beat three.** `h3` is 0.16 % *slower* on decode and 0.5 % slower on the timed prompt.
+   The "2 is the knee" conclusion from 2026-10-28 holds on `5f63a48e`.
+2. **`--remote-expert-opt` pays: +1.45 % decode.** Dropping it (`h2_nopref`) is the only arm slower than
+   the base in decode. It also makes the warm prompt faster (1011 vs 1089-1096 ms) but that is the
+   first batch, which carries the prefetch — not a signal.
+3. **The best decode config is `h2_all`: `STRATA_QFUSE=1` + `STRATA_NV_DEFAULTS_PRIMARY=1` +
+   `ADAPT_LAG=2 ADAPT_NOWAIT=1` on two helpers with `--remote-expert-opt` → 2585.5 ms, −3.10 % over the
+   plain `h2` (47.7 → 49.1 tok/s).** The sm_60 table alone (`h2_table`, −1.22 %) beats `QFUSE` alone
+   (−0.60 %), so the table is the bigger contributor and `QFUSE` stacks on top of it. This is the most
+   solid decode number of the run: one session, hot batches, same binary, all arms against one base.
+
+**Caveat, recorded per the run's own rule:** these timed numbers are the mean of *hot* batches 2-3 inside
+one process, so the expert arena and graphs are warm; they are not directly comparable to the earlier
+cold single-batch numbers (53xx ms decode on `315469d8`). The −3.10 % is a same-session, same-binary,
+same-batch-state result and is the one to quote for "best Whittle config"; absolute tok/s across
+different harnesses must not be mixed.
+
+**Two "upstream says wins" switches were refuted on this box this session:**
+- `STRATA_ADAPT_OVERLAP` — the startup log prints `adaptive overlap: off: not with --remote-expert-opt`;
+  it does not engage under the 3-helper + remote-opt config, and its two rounds went +1.1 % / −0.8 %
+  (noise). The P100 "+4..8 %" upstream figure does not transfer here.
+- `STRATA_PATTN_SM60=1` — **crashes**: `dequant launch: an illegal memory access` in the prompt's
+  QSA attention, zero `PP`/`DONE` lines, `rc=1`. Reproducible across two attempts. Recorded as a hard
+  defect on this build, not a win.
+
+## Log
+
 **Two harness defects found that invalidate earlier claims:**
 1. **Serve-mode token streams are not reproducible on this box** under `--expert-cache auto` (base_1 vs base_2
    diverge at token 18 with `ram_reads` 60862 vs 61602). `tok_md5` proves only the first ~17 tokens match and
@@ -105,6 +229,192 @@ costs amortise over more tokens). The number is recorded correctly above; the re
 spoken.
 
 ## Log
+
+### 2026-10-29 13:22-13:27 — aclass-trim reconfirm; box idle; hold
+
+Re-ran `R-aclass-trim.sh` after FINAL1000 idle gap (prior 13:14 run already refuted mtpq8).
+Same verdict:
+
+| arm | prompt ms | decode ms |
+|---|---:|---:|
+| `base_1` | 1,138 | 5,351.1 |
+| `mtpq8_1` | 1,160 | 5,344.0 |
+| `base_2` | 1,151 | 5,368.3 |
+| `mtpq8_2` | 1,135 | 5,359.0 |
+
+Mean decode base 5,360 / mtpq8 5,352 (−0.1 %, noise). `mtp_max=0`, drafts 0/0.
+
+Box idle after exit. **Hold — no further engine from this agent.**
+
+### 2026-10-29 13:18-13:21 — RAM0 settled
+
+**RAM0 settled** (`--mmap-experts --ple-io direct`, auto expert-cache, compress on, N=2):
+
+| PP | ms | tok/s |
+|---|---:|---:|
+| cold (29999/30000) | 48,842 | **614.2** |
+| warm reuse | 22,567 | 603.3 |
+
+`arena_mib=0` (no 18 GiB pinned expert arena). Prefill **−3.2 %** vs baseline ~634. File-tier
+path: page-cached GGUF (`UNBUFFERED_LOAD` ignored without `--resident-budget-gib`). Cold GEN1
+decode waited **24.0 s** in 12802 file fetches (OS read 18.4 GB); warm GEN2 wait **1.3 s**.
+VRAM warn 418 MiB free (#2065).
+
+**Verdict:** mmap saves host RAM arena, costs ~3 % cold 30k prefill + first-request I/O hit.
+Keep for RAM-starved serves; not a path to 1000 tok/s.
+
+### 2026-10-29 13:14-13:18 — ACLASS-TRIM confirmed; `MTP_Q8_SM60` no-op
+
+**aclass-trim** (binary `9893029d`, GEN 256 / 275-tok prompt, `--prefill 512`
+`--max-context 4096 --spec 2 --suffix-draft 0`, 2 repeats):
+
+| arm | prompt ms | decode ms | tok/s | drafts |
+|---|---:|---:|---:|---:|
+| `base_1` | 1,142 | 5,353.9 | **47.8** | 0/0 |
+| `mtpq8_1` (`STRATA_MTP_Q8_SM60=1`) | 1,147 | 5,359.1 | **47.8** | 0/0 |
+| `base_2` | 1,138 | 5,355.4 | **47.8** | 0/0 |
+| `mtpq8_2` | 1,123 | 5,374.6 | 47.6 | 0/0 |
+
+**Refuted:** `STRATA_MTP_Q8_SM60=1` on this pack/config. All arms `drafts accepted 0 of 0`
++ `mtp_max=0` — flag never engages (`--suffix-draft 0`). Skip further mtpq8 on Q4_K_M.
+
+**Reconfirm 13:28–13:33** (same binary `9893029d`, same script): base 5373.9 / 5379.1,
+mtpq8 5370.3 / 5344.0 ms; all `mtp_max=0`. Noise-equal; MTP still no-op. Box idle after.
+
+**Prefill settled ~634–636 tok/s** (FINAL30K / PLE / VRAM / HDGIB0 / COLD base).
+
+### 2026-10-29 13:03-13:06 — FINAL1000 settled; `--expert-cache 0` ignored
+
+**FINAL1000 settled** (intended: `--expert-cache 0 --ple-io direct` + `HEADROOM_GIB=0` +
+`UNBUFFERED_LOAD=1`, N=2). Actual load: **expert-cache auto → 4581 primary slots** — the
+`0` CLI did **not** disable main-card experts (same packing as HDGIB0). Prefill matches
+baseline:
+
+| PP | ms | tok/s |
+|---|---:|---:|
+| cold (29999/30000) | 47,450 | **632.2** |
+| warm reuse | 22,032 | 618.0 |
+
+VRAM warn 422 MiB free (#2065). `ple-io direct` + unbuffered load: no prefill gain vs ram/
+auto. To actually empty primary cache, need a different flag path (verify CLI parse /
+`expert-cache 0` vs `none`).
+
+**COLD1000** (partial; no `== COLD1000 DONE ==`):
+
+| arm | envs | cold ms | cold tok/s |
+|---|---|---:|---:|
+| `cold_base` | none | 47,267 | **634.7** |
+| `cold_warm` | `PREFILL_WARM=1` | 46,870 | **640.0** |
+| `cold_warm_io` | WARM + IO_PF_SCHED/AHEAD | **invalid** | PP only at 14469 tok |
+
+`cold_warm` ≈ +0.8 % (noise). `cold_warm_io` prompt truncated — discard.
+
+Box idle after FINAL1000. **Next (one engine):** `aclass-trim` base+mtpq8 only.
+
+### 2026-10-29 12:58-13:04 — COLD1000 partial; FINAL1000 owned box
+
+See above for settled numbers. `aclass-trim` was uploaded earlier, not launched then.
+
+### 2026-10-29 12:42-12:51 — HDGIB0 settled; box idle
+
+**HDGIB0 settled** (`STRATA_RESIDENT_HEADROOM_GIB=0`, `--ple-io ram`, expert-cache auto,
+cap16384, compress on, N=3):
+
+| PP | ms | tok/s |
+|---|---:|---:|
+| cold (29999/30000) | 47,172 | **636.0** |
+| warm reuse #1 | 21,945 | 620.4 |
+| warm reuse #2 | 21,955 | 620.1 |
+
+Prefill matches FINAL30K / PLE / VRAM (~634–636). `HEADROOM_GIB=0` packs primary cache to
+4581 slots / 8.16 GiB → `vram_free_mib=568` at load, **422 MiB free at request start**
+(WARNING #2065). Prefill untouched; decode risk if driver pages. Keep default headroom
+(or `--vram-reserve-mib 832`) for serve configs.
+
+Box idle after exit (`strata=0`, GPU mem 0). Skip STEADY `cmp_on` — compress-on cold settled.
+**Next (one engine, if still idle):** optional `mtpq8` A/B only.
+
+### 2026-10-29 12:37-12:42 — VRAM30K settled; HDGIB0 owned box
+
+**VRAM30K `ple_direct` settled** (auto expert-cache, `--ple-io direct`, compress on):
+
+| arm | cold ms | cold tok/s | warm tok/s |
+|---|---:|---:|---:|
+| `ple_direct` | 47,227 | **635.2** | 620.3 |
+
+Matches FINAL30K / PLE030K `ple_off` (634.7). `ple-io direct` at auto cache = free host
+RAM (~5.6 GiB) with **no prefill loss** vs ram. Earlier MEMSWEEP e1500_direct looked slower
+only because expert-cache=1500 collapsed `prefill_cap` to 4096.
+
+**PLE030K `ple_off`:** cold 634.7 / warm 622.0 (same config, ram PLE).
+
+### 2026-10-29 12:15-12:39 — MEMSWEEP30K done; STEADY cmp_on missing; box owned by VRAM30K
+
+`R-vram30k.sh` owned the box then; now done (see above). `RB030K` SKIP'd on collision.
+
+**STEADY30K2 incomplete** (`pickup-20261028/STEADY30K2/`): only `cmp_off` finished;
+script died before `cmp_on`. Cold full PP without COMPRESS (3h + F16_ACC, ch32768):
+
+| arm | cold ms | cold tok/s | warm reuse tok/s |
+|---|---:|---:|---:|
+| `cmp_off` | 55,997 | 535.7 | ~525 |
+
+**MEMSWEEP30K settled** (binary `9893029d`, always `DENSE_F16_ACC` + `PF_PEER_COMPRESS` +
+3 helpers; vary `--expert-cache` + `--ple-io`). Cold / warm final `PP` (29999/30000):
+
+| arm | expert-cache | ple-io | prefill_cap | cold ms | cold tok/s | warm tok/s | vram_free |
+|---|---:|---|---:|---:|---:|---:|---:|
+| `e1500_ram` | 1500 | ram | 4096 | 55,605 | 539.5 | 526.9 | 6008 |
+| `e1500_direct` | 1500 | direct | 4096 | 56,331 | 532.5 | 521.0 | 6008 |
+| `e2500_direct` | 2500 | direct | 8192 | 51,532 | **582.1** | 569.9 | 4058 |
+
+No crash / OOM on any arm. `ple-io direct` vs `ram` at e1500: −1.3 % (noise / SSD read),
+saves ~5.6 GiB host RAM. Shrinking expert-cache to 1500 collapses `prefill_cap` to 4096 and
+costs ~15 % vs FINAL30K's auto-cache + cap16384 path (**633 tok/s**). e2500 recovers some
+(cap8192 → 582) but still −8 % vs auto.
+
+`e2500_direct` was missing after the original MEMSWEEP driver died mid-run; relaunched once
+with a request-file LF script (`/tmp/e2500_direct.sh`) after a CRLF upload failed and a
+pipeline redirect leaked GEN tokens into the launch log.
+
+**PLE030K `ple_off`** (auto cache, no PLE flag change): cold **634.7** / warm 622.0 — matches
+FINAL30K. **VRAM30K `ple_direct`** in flight: cold PP so far 635.2.
+
+**Next when VRAM30K exits (one engine):** finish STEADY `cmp_on` A/B (or skip — FINAL30K +
+PLE already settle compress-on cold ~634); optional `mtpq8` only.
+
+### 2026-10-29 12:08-12:18 — box back; FINAL30K settled; B-class no-fire on Q4_K_M
+
+SSH recovered after reboot (`up ~7–9 min`).
+
+**FINAL30K settled** (`pickup-20261028/FINAL30K/`, binary `9893029d`, 3 helpers +
+`DENSE_F16_ACC` + peer compress). Cold full-prompt PP (second `PP` after `RESUME 0`,
+29999/30000):
+
+| run | ms | tok/s |
+|---|---:|---:|
+| r1 | 47,364 | 633.4 |
+| r2 | 47,507 | 631.5 |
+| r3 | 47,294 | **634.3** |
+
+**Settled cold 30k prefill: median 633.4 tok/s** (mean 633.1). Warm reuse after
+`RESUME 16384` ~618–621 tok/s.
+
+**B-class switches vs Whittle Q4_K_M — source audit, no fire (do not spend box time):**
+- `STRATA_EXPERT_NIBBLE` — only IQ2_S / IQ3_XXS / IQ3_S (`expert_nibble.hpp`)
+- `STRATA_DOWN_WS` — only IQ4_NL / Q2_0 down at `n_ff==640` (`iq_kernels.cu:down_ws_on`)
+- `STRATA_MMQ_WS` — gate/up IQ2_* / IQ3_* and down Q2_0 / IQ4_NL (`moe_ws.cu:supported`)
+- Whittle pack is **Q4_K_M** → all three silent no-ops
+- Still measurable: `STRATA_MTP_Q8_SM60=1`. Skip: `PATTN_SM60` (crash); `ADAPT_OVERLAP` (refuted)
+
+`.run/R-aclass-trim.sh` trimmed to `base` + `mtpq8` only.
+
+### 2026-10-29 11:32-11:50 — box SSH dead (ping OK, tcp22 False)
+
+Anomaly recorded (resolved by reboot ~12:08). From the Windows host:
+- ping 192.168.1.98 replies (1 ms TTL=64)
+- TCP 22 opened then stopped accepting (`tcp22=False` / plink timeout / 15–25 s no banner)
+- Classic OOM / sshd hung pattern (2026-10-18/20); many stale local `plink` killed
 
 ### 2026-10-28 20:30-21:00 — what the box settled before the run
 
@@ -679,6 +989,51 @@ dependent, and the generated tokens are not reproducible on this box**. Two cons
   rates. That is where part of the ±1.3 % spread comes from. A 1 % result therefore needs a same-direction
   repeat to be believed, and `VERIFY_DEVICE_PLAN`'s 0.01 % agreement across rounds is the exception, not
   the rule.
+
+### 2026-10-29 — prefill 30k: the `combine` phase is the dominant cost, and it is a PCIe wait, not a kernel
+
+`STRATA_PREFILL_TIMING=1` on a 30k prompt (`R-pftiming.sh`, binary `5f63a48e`, 2 helpers + `STRATA_PREFILL_REMOTE_PEERS=1`):
+
+| phase | ms | % |
+|---|---:|---:|
+| **combine** | **21,230** | **28.2 %** |
+| gemm gate/up | 12,567 | 16.7 % |
+| gdn | 9,754 | 13.0 % |
+| gemm down | 6,344 | 8.4 % |
+| hc read | 5,683 | 7.6 % |
+| qsa attn | 4,580 | 6.1 % |
+
+**The helper cards are idle 77 % of the wall-clock** (`idle 58,132 ms` out of the 75,221 ms GPU timeline;
+`moe in 6,245 + moe gemm 10,785 + moe out 27` = 17,057 ms busy). The prefill is entirely bound on the primary.
+
+**Why `combine` is 28 %**: the `kPfCombine` mark at `prefill.cpp:5652` lands *before* the peer-return wait;
+the `moe_combine` call at `:5691` comes after `cudaStreamWaitEvent(m.cs, P.ev_done, 0)` at `:5681`, so the
+phase includes the helper-return window. On this box (no P2P) the helper caches force `sums=false`
+(`prefill.cpp:2402`), so the return path is the **rows mode**: `copy_f32_wide(m.Dm + back_at*N,
+P.host_rows, back_rows*N)` where `P.host_rows` is `cudaHostAllocMapped` pinned host memory. The P100 reads
+`back_rows × N × 4` bytes of per-layer expert output through the PCIe mapped route (6 GB/s) inside the
+combine window. At the default 512-token chunk, `back_rows ≈ 2560` per helper per layer × 2 helpers × 40
+layers = 204,800 rows × 2048 × 4 B = 1.7 GB ÷ 6 GB/s ≈ 280 s — still far short of 21.2 s, so the
+*wait* dominates, not the copy itself: the P100's compute stream blocks on `ev_done` while the P104 is
+still running its `moe gemm` (10,785 ms per helper), and the P104's own input wait (`moe in`, 6,245 ms) is
+the D2H upload of `T×N` activations (512×2048×4 = 4 MB per layer, trivial at 6 GB/s) plus the P104's
+`f16_to_f32_wide` read from mapped host. The net effect: **the primary and each helper run in lockstep,
+neither overlapping the other's PCIe window**, and the total is bounded by the sum of all sequential
+PCIe waits, not by any single copy.
+
+`R-pfenv30k2` (chunk 512/4096/8192/16384, 30k prompt, 2 helpers) settled the chunk-size question:
+
+| chunk | prefill ms | tok/s | vs ch512 |
+|---|---:|---:|---:|
+| 512 | 79,544 | 377.2 | — |
+| 4096 | 68,324 | 439.1 | −14.1 % |
+| 8192 | 67,214 | 446.3 | −15.8 % |
+| **16384** | **66,727** | **449.6** | **−16.2 %** |
+
+The gain is front-loaded: 512→4096 is −14.1 %, the next two steps add only 2.1 % between them.
+**ch16384 is the new prefill default at 449.6 tok/s** (was 399 at ch512). `R-pfenv30k3` (ch16384 with and
+without `STRATA_DENSE_F16_ACC=1`, plus a timing breakdown at the winning chunk) is running to confirm
+the combine share at ch16384 and whether the FP16-accumulate GEMM adds to it.
 
 ### 2026-10-28 23:04-23:10 — `--mtp-hnorm stream`: the Q36 port with upstream numbers, and it is NEUTRAL
 
