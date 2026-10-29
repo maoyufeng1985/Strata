@@ -46,6 +46,7 @@
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
+#include "strata/prefill/moe_f16_kq_cuda.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -885,6 +886,15 @@ struct PeerPrefill {
     std::vector<int32_t> ntok, tcur, touched;
     uint16_t *sum16 = nullptr, *host_x16 = nullptr, *host_sum16 = nullptr;
     float *sum = nullptr, *wk = nullptr;
+    // STRATA_PF_F16_PEER: the helper's own FP16 path (the primary's path, on the helper's card): the
+    // activations per TOKEN in the kernels' int8 layout, the H per group-local row, and the tile tables.
+    uint8_t* f16_x = nullptr;
+    uint8_t* f16_h = nullptr;
+    size_t f16_h_rows = 0;
+    int2* f16_tiles = nullptr;
+    int32_t* f16_ts = nullptr;
+    int32_t* f16_off = nullptr;
+    int f16_tile_cap = 0;
     int32_t* pair = nullptr;
     float *host_w = nullptr, *host_sum = nullptr;
     int32_t* host_pair = nullptr;
@@ -905,6 +915,7 @@ struct PeerPrefill {
             if (s) cudaStreamSynchronize(s);
             ctx.reset();
             up_ring.release();
+            if (f16_h) cudaFree(f16_h);   // the F16 path's H (reallocated as the routing changes)
             for (void* p : owned) cudaFree(p);
             if (ev_done) cudaEventDestroy(ev_done);
             if (s_out) cudaStreamSynchronize(s_out);
@@ -1087,6 +1098,18 @@ struct Prefill::Impl {
     ws::Chunk* ws_chunks = nullptr;
     std::vector<ws::Chunk> ws_chunks_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
+    // STRATA_PF_F16_PEER: the primary's own rows on the fused FP16 K-quant kernels (f16kqc) - the tile table
+    // of the whole layer's experts (64-row tiles), the per-expert tile offsets, and the two buffers the
+    // kernels' own layout needs: the activations per TOKEN and the H per GROUP-LOCAL row.  MMQ's q8_1
+    // rows are a different layout, so the F16 path cannot share them.
+    int2* f16_tiles = nullptr;
+    int32_t* f16_ts = nullptr;
+    int32_t* f16_off = nullptr;
+    int f16_tile_cap = 0;
+    uint8_t* f16_x = nullptr;   // the activations, per token (fused::act_bytes(T, N))
+    size_t f16_x_rows = 0;      // the activation buffer's capacity, in tokens
+    uint8_t* f16_h = nullptr;   // the H, per group-local row ((n_ff / 64) * 80 bytes a row)
+    size_t f16_h_rows = 0;      // the H's capacity, in rows
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`), the rows the pool writes
     // (Dm's tail, in Dm's row order), ones for row_sd (the CPU's rows carry s_down already), all pinned; and the
@@ -1315,6 +1338,7 @@ void Prefill::release() {
     for (cudaEvent_t e : impl_->cpu_wall)
         if (e) cudaEventDestroy(e);
     for (void* p : impl_->owned) cudaFree(p);
+    if (impl_->f16_h) cudaFree(impl_->f16_h);   // the F16 path's H (reallocated as the routing changes)
 }
 
 namespace {
@@ -1464,6 +1488,43 @@ const MmqPlan& mmq_plan() {
     }();
     return plan;
 }
+// STRATA_PF_F16_PEER=1: the prompt's routed experts take the fused FP16 K-quant kernels (f16kqc's register
+// dequant, no FP16 copy of the weights), on the primary AND on the helper cards (the peer mode).  Every visible
+// CUDA card must be Pascal or newer - the kernel's HFMA2 needs FP16 - and the primary's card the sm_60 pass that
+// compiles the f16kqc kernels (P100: yes, P104 is sm_61).
+bool f16_peer_primary() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_F16_PEER");
+        const bool want = e != nullptr && e[0] == '1';
+        if (!want) return false;   // the default path: no CUDA call, no line, nothing touched
+        // The setup leaves errors behind (the PCIe probe and the peer-access probes try and undo things), and
+        // cudaGetLastError() reports the LAST error of ANY call, not this one's: an error from the setup would
+        // silently turn this path off, which is what happened (the switch was on and the path never ran).  So the
+        // slate is cleared first and the verdict rests on this function's own calls.
+        cudaGetLastError();
+        int n = 0;
+        const bool counted = cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+        int p = 0;
+        cudaGetDevice(&p);
+        bool pascal = counted;
+        for (int d = 0; pascal && d < n; ++d) {
+            int major = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess || major < 6)
+                pascal = false;
+        }
+        const bool yes = counted && pascal;
+        std::fprintf(stderr,
+                     "strata: the fused FP16 K-quant prompt path is %s (STRATA_PF_F16_PEER=%s, %d CUDA card(s) %s)\n",
+                     yes ? "on" : "off", e ? e : "unset", counted ? n : 0,
+                     pascal ? "of Pascal or newer" : "of which one is below Pascal");
+        return yes;
+    }();
+    return on;
+#endif
+}
 // the FP16 buffers (Xs, Hh): the FP16 path's, or pf_wmma's activations and down input
 bool fp16_bufs(const MmqPlan& mp) { return mp.fallback || pf_wmma(); }
 // #136 P3: a layout whose chunks run the fused experts (STRATA_PF_FUSED=1, the Q2_0 pack, a streamed chunk of
@@ -1506,6 +1567,12 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
         // APR: the rotated copy of `mixed` for the MMQ path (carve's m.Xr) - it must be counted here too, or the MoE
         // set outgrows the region `carve` sizes from this, and `init` fails with "do not fit" at any chunk
         if (strata::kernels::cpu::hadamard_spec().any()) a.take<float>(T * N, ok);
+        // STRATA_PF_F16_PEER: the primary's fused FP16 tile tables (carve's m.f16_tiles / ts / off)
+        if (f16_peer_primary()) {
+            a.take<int32_t>(2 * (T * K + 2 * n_expert), ok);
+            a.take<int32_t>(n_expert + 1, ok);
+            a.take<int32_t>(n_expert + 1, ok);
+        }
     }
     return a.used;
 }
@@ -1894,6 +1961,13 @@ bool Prefill::carve(size_t T, void* alloc) {
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+    }
+    if (mmq_plan().any && f16_peer_primary()) {
+        const int64_t cap = (T * K + 63) / 64 + m.g->n_expert + 1;
+        m.f16_tiles = (int2*) o.take<int32_t>(2 * cap, ok);
+        m.f16_tile_cap = (int) cap;
+        m.f16_ts = o.take<int32_t>(m.g->n_expert + 1, ok);
+        m.f16_off = o.take<int32_t>(m.g->n_expert + 1, ok);
     }
     m.ring = ring_slots(T);
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
@@ -2425,6 +2499,17 @@ std::unique_ptr<PeerPrefill> Prefill::open_peer_exec(Impl& m, const PeerSource& 
     pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
     pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
     pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL);
+    if (f16_peer_primary()) {
+        // STRATA_PF_F16_PEER: the helper's FP16 path (the primary's path, on the helper's card): the activations
+        // per TOKEN in the kernels' int8 layout (80 bytes per 64 values), the tile tables (the 64-row tiles, the
+        // per-expert tile offsets and the row offsets) and the H (grown with the layer's biggest group).
+        pp->f16_x = (uint8_t*) take((size_t) m.T_max * (size_t) (N / 64) * 80);
+        const int64_t cap16 = (m.T_max * K + 63) / 64 + NE + 1;
+        pp->f16_tiles = (int2*) take((size_t) cap16 * sizeof(int2));
+        pp->f16_tile_cap = (int) cap16;
+        pp->f16_ts = (int32_t*) take((size_t) (NE + 1) * 4);
+        pp->f16_off = (int32_t*) take((size_t) (NE + 1) * 4);
+    }
     if (ok) {
         pp->ctx = std::make_unique<mmq::Context>();
         pp->run_ctx = pp->ctx.get();
@@ -2475,8 +2560,8 @@ std::unique_ptr<PeerPrefill> Prefill::open_peer_exec(Impl& m, const PeerSource& 
                  pp->dev, (long long) pp->cap_rows,
                  pp->p2p ? "" : (pp->sums ? (pp->f16 ? ", no P2P: through mapped host memory in FP16, one weighted sum per token back"
                                                      : ", no P2P: through mapped host memory, one weighted sum per token back")
-                                          : (pp->compress ? ", no P2P: through mapped host memory in FP16 rows"
-                                                         : ", no P2P: through mapped host memory")),
+                                         : (pp->compress ? ", no P2P: through mapped host memory in FP16 rows"
+                                                          : ", no P2P: through mapped host memory")),
                  pp->compact ? (pp->ps_frac > 0.0 ? (", compact group buffers, streams " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
                                                     "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
                                                  : ", compact group buffers") : "", fb >> 20);
@@ -4347,6 +4432,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && !had_gu && !had_d &&
                                            fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    // STRATA_PF_F16_PEER: the layer's fused FP16 path.  The flag lives here (the block that computes
+                    // it is narrower), because the debug check below reads it from this scope.
+                    bool f16p_outer = false;
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -4833,6 +4921,66 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill: an IQ1_M layer in the MMQ grouping needs the WMMA tiles, which this chunk cannot take";
                             return false;
                         }
+                        const bool direct_l = use_mmq && lay.native && m.cache && mmq_plan().direct[(size_t) l] && !wmma_l;
+                        // the LAYER's condition for the fused FP16 K-quant path (the primary's own rows and the
+                        // helper cards' rows alike): the K-quants the kernels cover, no APR, no NVFP4, and the
+                        // layer's own geometry (the kernels take n_embd and n_ff from it).
+                        const bool f16p_layer = use_mmq && f16_peer_primary() && !fused_l && lay.native &&
+                                                strata::prefill::fused::f16kq::covers(mmq_gt) &&
+                                                strata::prefill::fused::f16kq::covers_down(mmq_dt) &&
+                                                !had_gu && !had_d && !lay.fmt[(size_t) l].tail_off &&
+                                                !mmq::fp4_activations(mmq_gt) && !mmq::fp4_activations(mmq_dt) &&
+                                                lay.fmt[(size_t) l].n_embd == N && lay.fmt[(size_t) l].n_ff == FF;
+                        // the primary's own rows: the direct path reads the experts in place (no gather) and the
+                        // FP16 kernels read the gathered bytes
+                        const bool f16p_l = f16p_layer && !direct_l;
+                        f16p_outer = f16p_l;
+                        if (f16_peer_primary()) {
+                            // STRATA_PF_F16_PEER: one line per layer (the first chunk), so a run says which path
+                            // the routed experts took and why a layer does not take it.
+                            static std::vector<uint8_t> f16p_reported;
+                            if ((size_t) l >= f16p_reported.size()) f16p_reported.resize((size_t) l + 1, 0);
+                            if (!f16p_reported[(size_t) l]) {
+                                f16p_reported[(size_t) l] = 1;
+                                std::fprintf(stderr, "strata: layer %lld: the fused FP16 expert path is %s (gate/up %d, down %d)%s\n",
+                                             (long long) l, f16p_layer ? "ON" : "OFF", mmq_gt, mmq_dt,
+                                             f16p_layer ? "" : (direct_l ? " [the experts are read in place]"
+                                                                       : " [the condition above does not hold]"));
+                            }
+                        }
+                        if (f16p_l) {
+                            // STRATA_PF_F16_PEER: the fused FP16 kernels' activations - the layer's input
+                            // quantized per TOKEN in the kernels' own layout (80 bytes per 64 values: the
+                            // codes, the two scales and the two code sums).  MMQ's q8_1 rows are a different
+                            // layout, so the F16 path has its own buffer (on this card, like the tile tables).
+                            const core::OnDevice on_f16(m.device);
+                            // the buffer follows the chunk: a later chunk may have more tokens than the first.
+                            if (m.f16_x == nullptr || m.f16_x_rows < (size_t) T) {
+                                if (m.f16_x != nullptr) {
+                                    cudaStreamSynchronize(m.cs);
+                                    cudaFree(m.f16_x);
+                                    // the old pointer is in `owned` (release frees that list): drop it, or the
+                                    // release would free it twice.
+                                    for (size_t i = 0; i < m.owned.size(); ++i)
+                                        if (m.owned[i] == (void*) m.f16_x) { m.owned.erase(m.owned.begin() + (long) i); break; }
+                                    m.f16_x = nullptr;
+                                    m.f16_x_rows = 0;
+                                }
+                                void* fp = nullptr;
+                                const size_t xb = (size_t) T * (size_t) (N / 64) * 80;
+                                if (cudaMalloc(&fp, xb) != cudaSuccess) {
+                                    cudaGetLastError();
+                                    fp = nullptr;
+                                }
+                                m.f16_x = (uint8_t*) fp;
+                                m.f16_x_rows = m.f16_x != nullptr ? (size_t) T : 0;
+                                if (m.f16_x != nullptr) m.owned.push_back(m.f16_x);
+                            }
+                            if (m.f16_x == nullptr) {
+                                err = "prefill: the fused FP16 experts' activation buffer could not be allocated";
+                                return false;
+                            }
+                        }
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, GW, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, FF) : 0;
                         bool ws_layer = false;   // STRATA_MMQ_WS: this layer's products weight-stationary (below)
@@ -4846,7 +4994,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // from its rotated copy `Xr`): each token quantized once and written to its K rows
                             // (slot_dev, the inverse of src_dev).
                             // NVFP4 w4a4 activations carry a per-row scale (Xscale): that mode keeps the gather.
-                            if (wmma_l) {   // FP16 rows (pf_wmma); APR: Hadamard-folded gate/up take H, rotated in fp16 storage as the FP16 path does
+                            if (f16p_l) {
+                                // the fused FP16 kernels' activations: the layer's input quantized per token in
+                                // the kernels' layout (the codes, the two scales and the two code sums per 64
+                                // values).  No APR here (f16p_l excludes the folded layers), so the input is
+                                // m.mixed itself.
+                                fused::quantize_act_native(xsrc, T, N, m.f16_x, m.cs);
+                            } else if (wmma_l) {   // FP16 rows (pf_wmma); APR: Hadamard-folded gate/up take H, rotated in fp16 storage as the FP16 path does
                                 gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                                 if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
                             } else {
@@ -4982,6 +5136,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (P.p2p) cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
                             else if (P.f16) f16_to_f32_wide(P.mixed, P.host_x16, T * N, ps);
                             else copy_f32_wide(P.mixed, P.host_x, T * N, ps);
+                            if (f16p_layer && P.f16_x != nullptr) {
+                                // STRATA_PF_F16_PEER: the fused FP16 kernels' activations on this card: the layer's
+                                // input quantized per TOKEN in the kernels' own layout (80 bytes per 64 values: the
+                                // codes, the two scales and the two code sums).  MMQ's q8_1 rows are a different
+                                // layout, so the F16 path has its own buffer here too.
+                                strata::prefill::fused::quantize_act_native(P.mixed, (int64_t) T, N, P.f16_x, ps);
+                            }
                             P.back_at = rows_local;
                             P.back_rows = rows_peer;
                             if (P.p2p) {
@@ -5111,26 +5272,81 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const int64_t r0 = P.bounds_host[j0], nr = P.bounds_host[j1] - r0;
                                     if (nr <= 0) continue;
                                     const int32_t* rel = P.bounds + n + 1 + g2 * (MMQ_GROUP + 1);
-                                    cudaMemsetAsync(P.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, ps);
-                                    cudaMemsetAsync(P.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, ps);
-                                    mmq::quantize(P.mixed, P.src + r0, P.Xq_g, mmq_gt, N, N, nr, ps);
-                                    mmq::Product gu;
-                                    gu.w = P.grp_gu; gu.type = mmq_gt; gu.w_rows = GW; gu.w_cols = N; gu.expert_bytes = mmq_gub;
-                                    gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
-                                    gu.total_rows = nr; gu.max_rows = maxr; gu.dst = P.GU_g; gu.ld_dst = GW;
-                                    P.run_ctx->run(gu, ps);
-                                    mmq::swiglu(P.GU_g, P.H_g, nr, FF, !lay.native, ps);
-                                    if (had_d)   // APR: folded down weights take H (s * h), on this card as on the primary
-                                        strata::kernels::hadamard_rows(P.H_g, P.H_g, nr, FF, had_block, P.had_sh[(size_t) l], ps);
-                                    mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, FF, FF, nr, ps);
                                     const int b = (int) (g2 & 1);
                                     if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
-                                    mmq::Product dn;
-                                    dn.w = P.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = FF; dn.expert_bytes = mmq_db;
-                                    dn.n = ngx; dn.xq = P.Hq_g; dn.bounds = rel;
-                                    dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm_b[b];
-                                    dn.ld_dst = N;
-                                    P.run_ctx->run(dn, ps);
+                                    if (f16p_layer && P.f16_x != nullptr) {
+                                        // STRATA_PF_F16_PEER: this group's products on the fused FP16 K-quant kernels
+                                        // (the same path the primary takes for its own rows): the gate/up and the
+                                        // down read the gathered bytes, the activations are the layer's input
+                                        // quantized per token in the kernels' layout, the row map is the identity
+                                        // over the group's rows and the rows land in the group's Dm block.
+                                        if (P.f16_h == nullptr || P.f16_h_rows < (size_t) nr) {
+                                            if (P.f16_h != nullptr) {
+                                                cudaStreamSynchronize(ps);
+                                                cudaFree(P.f16_h);
+                                                P.f16_h = nullptr;
+                                                P.f16_h_rows = 0;
+                                            }
+                                            void* fp = nullptr;
+                                            const size_t hb = (size_t) nr * (size_t) (FF / 64) * 80;
+                                            if (cudaMalloc(&fp, hb) != cudaSuccess) {
+                                                cudaGetLastError();
+                                                fp = nullptr;
+                                            }
+                                            P.f16_h = (uint8_t*) fp;
+                                            P.f16_h_rows = P.f16_h != nullptr ? (size_t) nr : 0;
+                                            if (P.f16_h == nullptr) {
+                                                err = "prefill: the helper's fused FP16 H buffer could not be allocated";
+                                                cudaSetDevice(prevd);
+                                                return false;
+                                            }
+                                        }
+                                        const auto& f16f = lay.fmt[(size_t) l];
+                                        strata::prefill::fused::NativeGeom ng_gu{f16f.gu_type, f16f.d_type, f16f.gu_row,
+                                                                                  f16f.d_row, (size_t) (mmq_gub / 2),
+                                                                                  f16f.down_off, f16f.n_embd, f16f.n_ff};
+                                        strata::prefill::fused::NativeGeom ng_d{f16f.gu_type, f16f.d_type, f16f.gu_row,
+                                                                                f16f.d_row, (size_t) (mmq_gub / 2), 0,
+                                                                                f16f.n_embd, f16f.n_ff};
+                                        strata::prefill::fused::Batch fb_gu, fb_d;
+                                        fb_gu.e0 = 0; fb_gu.e1 = ngx;
+                                        fb_d.e0 = 0; fb_d.e1 = ngx;
+                                        for (int i = 0; i < ngx; ++i) {
+                                            fb_gu.blob[(size_t) i] = P.grp_gu + (size_t) i * mmq_gub;
+                                            fb_d.blob[(size_t) i] = P.grp_d + (size_t) i * mmq_db;
+                                        }
+                                        // the group's tiles: its relative bounds (the MMQ path's), its own rows
+                                        strata::prefill::fused::f16kqc::build_tiles(rel, 0, ngx, (int) nr, P.f16_tiles,
+                                                                                   P.f16_tile_cap, P.f16_ts, P.f16_off, ps);
+                                        const int64_t fwb = (nr + 63) / 64 + ngx + 1;
+                                        strata::prefill::fused::f16kq::gate_up(fb_gu, ng_gu, P.f16_ts, P.f16_tiles,
+                                                                                 P.f16_off, nr, ngx, fwb,
+                                                                                 (const uint8_t*) P.f16_x, P.src + r0,
+                                                                                 (uint8_t*) P.f16_h, ps);
+                                        strata::prefill::fused::f16kqc::down_rows(fb_d, ng_d, P.f16_ts, P.f16_tiles,
+                                                                                P.f16_off, nr, ngx, fwb,
+                                                                                (const uint8_t*) P.f16_h,
+                                                                                P.Dm_b[b], P.ident, ps);
+                                    } else {
+                                        cudaMemsetAsync(P.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, ps);
+                                        cudaMemsetAsync(P.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, ps);
+                                        mmq::quantize(P.mixed, P.src + r0, P.Xq_g, mmq_gt, N, N, nr, ps);
+                                        mmq::Product gu;
+                                        gu.w = P.grp_gu; gu.type = mmq_gt; gu.w_rows = GW; gu.w_cols = N; gu.expert_bytes = mmq_gub;
+                                        gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
+                                        gu.total_rows = nr; gu.max_rows = maxr; gu.dst = P.GU_g; gu.ld_dst = GW;
+                                        P.run_ctx->run(gu, ps);
+                                        mmq::swiglu(P.GU_g, P.H_g, nr, FF, !lay.native, ps);
+                                        if (had_d)   // APR: folded down weights take H (s * h), on this card as on the primary
+                                            strata::kernels::hadamard_rows(P.H_g, P.H_g, nr, FF, had_block, P.had_sh[(size_t) l], ps);
+                                        mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, FF, FF, nr, ps);
+                                        mmq::Product dn;
+                                        dn.w = P.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = FF; dn.expert_bytes = mmq_db;
+                                        dn.n = ngx; dn.xq = P.Hq_g; dn.bounds = rel;
+                                        dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm_b[b];
+                                        dn.ld_dst = N;
+                                        P.run_ctx->run(dn, ps);
+                                    }
                                     if (P.sums && P.gather) {   // into the per-token sums, one launch for the group
                                         const int32_t* a = P.adds + P.adds_at[g2];
                                         const int64_t nt = P.ntok[g2];
@@ -5509,6 +5725,83 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                     ns ? m.grp_gu + (size_t) ns * mmq_gub : nullptr,
                                                     ns ? m.grp_d + (size_t) ns * mmq_db : nullptr, MMQ_TAIL, m.cs);
                                 }
+                                if (f16p_l) {
+                                    // STRATA_PF_F16_PEER: this group's own experts on the primary's fused FP16 K-quant
+                                    // kernels (f16kqc's register dequant, no FP16 copy of the weights).
+                                    //
+                                    // The row space is the GROUP-LOCAL one (0..nr-1), the same convention the MMQ
+                                    // path uses (a group's bounds are relative to the group's first expert), so:
+                                    //   - the tiles come from the group's relative bounds (m.bounds_dev, already
+                                    //     on the device): build_tiles counts the group's tiles from 0;
+                                    //   - the kernel's src[row] is the group's row's token: the layer's row map
+                                    //     offset by the group's first row (m.src_dev + r0);
+                                    //   - the H is the group's own rows in the kernels' layout (per row: n_ff / 64
+                                    //     blocks of 80 bytes), and the down reads the same rows;
+                                    //   - the down's row map is the identity (m.ids_identity) with dm at the
+                                    //     group's block (m.Dm + r0 * N), as the MMQ path does.
+                                    // The gathered bytes in m.grp_gu are the gate/up blobs and the gathered bytes in
+                                    // m.grp_d the down ones (the gather wrote the same bytes MMQ would read, so the
+                                    // down's over-read guard is the gather's MMQ_TAIL, not mmq_plan's d_over); the
+                                    // two are in their own buffers, so the two kernels get their own batch.
+                                    // The helpers' share keeps the int8 MMQ and runs on its own card; the rows land
+                                    // in Dm on both sides, so the combine is unchanged.
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    // the gate/up blob: the gate rows, then the up rows (the gather's layout); the
+                                    // down blob: the down rows alone.
+                                    strata::prefill::fused::NativeGeom ng_gu{f.gu_type, f.d_type, f.gu_row, f.d_row,
+                                                                              (size_t) (mmq_gub / 2), f.down_off,
+                                                                              f.n_embd, f.n_ff};
+                                    strata::prefill::fused::NativeGeom ng_d{f.gu_type, f.d_type, f.gu_row, f.d_row,
+                                                                            (size_t) (mmq_gub / 2), 0, f.n_embd, f.n_ff};
+                                    strata::prefill::fused::Batch fb_gu, fb_d;
+                                    fb_gu.e0 = 0; fb_gu.e1 = ngx;
+                                    fb_d.e0 = 0; fb_d.e1 = ngx;
+                                    for (int i = 0; i < ngx; ++i) {
+                                        fb_gu.blob[(size_t) i] = m.grp_gu + (size_t) i * mmq_gub;
+                                        fb_d.blob[(size_t) i] = m.grp_d + (size_t) i * mmq_db;
+                                    }
+                                    // the group's tiles: its relative bounds (the MMQ path's), its own rows.
+                                    const int32_t* rel = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                                    strata::prefill::fused::f16kqc::build_tiles(rel, 0, ngx, (int) nr, m.f16_tiles,
+                                                                               m.f16_tile_cap, m.f16_ts, m.f16_off, cs);
+                                    // work_bound: this group's tile count, not the whole-layer cap.  The kernel's
+                                    // grid spans work_bound blocks in the tile dimension and tiles[] holds only the
+                                    // group's tiles (k_tiles counts from 0 within [e0, e1)); the full-layer cap as
+                                    // work_bound launched blockIdx.y past the written tiles and read past them (IMA).
+                                    const int64_t fwb = (nr + 63) / 64 + ngx + 1;
+                                    // the H of this group's rows: it grows with the layer's biggest group (the
+                                    // routing changes from layer to layer), so it is reallocated when it must.
+                                    if (m.f16_h == nullptr || m.f16_h_rows < (size_t) nr) {
+                                        if (m.f16_h != nullptr) {
+                                            cudaStreamSynchronize(m.cs);
+                                            cudaFree(m.f16_h);
+                                            m.f16_h = nullptr;
+                                            m.f16_h_rows = 0;
+                                        }
+                                        void* fp = nullptr;
+                                        const size_t hb = (size_t) nr * (size_t) (f.n_ff / 64) * 80;
+                                        if (cudaMalloc(&fp, hb) != cudaSuccess) {
+                                            cudaGetLastError();
+                                            fp = nullptr;
+                                        }
+                                        m.f16_h = (uint8_t*) fp;
+                                        m.f16_h_rows = m.f16_h != nullptr ? (size_t) nr : 0;
+                                        if (m.f16_h == nullptr) {
+                                            err = "prefill: the fused FP16 experts' H buffer could not be allocated";
+                                            return false;
+                                        }
+                                    }
+                                    strata::prefill::fused::f16kq::gate_up(fb_gu, ng_gu, m.f16_ts, m.f16_tiles, m.f16_off,
+                                                                           nr, ngx, fwb,
+                                                                           (const uint8_t*) m.f16_x, m.src_dev + r0,
+                                                                           (uint8_t*) m.f16_h, cs);
+                                    pt.mark(kPfGemmD, cs);
+                                    strata::prefill::fused::f16kqc::down_rows(fb_d, ng_d, m.f16_ts, m.f16_tiles, m.f16_off,
+                                                                              nr, ngx, fwb,
+                                                                              (const uint8_t*) m.f16_h,
+                                                                              m.Dm + r0 * N, m.ids_identity, cs);
+                                    return true;
+                                }
                                 mmq::Product gu;
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = GW; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
@@ -5718,10 +6011,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         };
                         // (fused: GU and H hold the grouping tables and int8 rows, not floats)
                         // (the CPU's rows, the last rows_cpu of GU and H, are never written by the GPU: not checked)
+                        // (the fused FP16 path: GU and H are not written at all - the kernel writes the H in its own
+                        //  layout and the down writes Dm - so the two are not read here)
                         const int64_t gpu_rows = T * K - rows_cpu;
-                        const int64_t bgu = fused_l ? 0 : bad(m.GU, gpu_rows * GW), bdm = bad(m.Dm, T * K * N),
+                        const int64_t bgu = (fused_l || f16p_outer) ? 0 : bad(m.GU, gpu_rows * GW), bdm = bad(m.Dm, T * K * N),
                                       bbo = bad(m.bo, T * N);
-                        const int64_t bh = m.H && !fused_l ? bad(m.H, gpu_rows * FF) : -1;
+                        const int64_t bh = (m.H && !fused_l && !f16p_outer) ? bad(m.H, gpu_rows * FF) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;

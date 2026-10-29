@@ -1093,3 +1093,82 @@ Caveat on the number: one cold prompt per arm, not interleaved rounds, so it car
 this box showed elsewhere (the 30k prefill moved ~2 % between identical runs). The direction is not in doubt
 — it is the PCIe traffic halving — but the last digit of "17.3 %" is worth ±2 points.
 
+### 2026-10-29 — `STRATA_PF_F16_PEER=1`: the fused FP16 K-quant prompt path was on for two hours and never ran; fixed, it is 2.9× slower than the int8 MMQ here
+
+**The switch was on and the path never executed.** `STRATA_PF_F16_PEER=1` has been in the tree since the q36
+port (`25bd055b`, `fd106354`, `81a4d1d0`): the prompt's routed experts go through the fused FP16 K-quant
+kernels (f16kqc — the codes dequantized in registers, no FP16 copy of the weights) instead of the int8 MMQ.
+The first 30k A/B on this box read **+0.84 %** (605.8 vs 600.7 tok/s over four rounds), and that number was an
+artifact: the path had never run. Three things said so before anything was rebuilt:
+
+- the two arms' phase timings were **identical to the millisecond** exactly where the path would have shown
+  (`gemm gate/up 5398` in both), and the deterministic phases beside it (`qsa select 1949`, `hc write 1003`)
+  are just as exact, so the equality is real and not a rounding of the print;
+- the `STRATA_DBG_NAN` non-finite counts were **exactly the same** in both arms (`GU 4293 H 23546 Dm 0 bo 0`),
+  and a path that overwrites the GU and the H with different numbers cannot leave the same counts;
+- the kernel was never the suspect: the repo's own `prefill_f16_kq_cuda_test` passes on the P100 (sm_60) and
+  on the P104 (sm_61), value by value against ggml.
+
+**Root cause: `f16_peer_primary()` asked CUDA about an error that was not its own.** The gate was
+
+```cpp
+int p = 0;
+cudaGetDevice(&p);
+if (cudaGetLastError() != cudaSuccess) return false;
+```
+
+`cudaGetLastError()` returns the last error of **any** earlier call, not this one's, and the engine's setup
+leaves one behind (the PCIe probe and the peer-access probes try things and undo them). So the switch was on,
+the setup had dirtied the error slot, and the path was silently off — with nothing anywhere saying so. The
+fix clears the slot before the question and then asks only about this function's own calls, and the engine
+now prints one line per process, so the state is never a guess again:
+
+```
+strata: the fused FP16 K-quant prompt path is on (STRATA_PF_F16_PEER=1, 4 CUDA card(s) of Pascal or newer)
+```
+
+**Seven wiring defects sat on top of that, all of the same shape: the MMQ layout fed to a kernel that wants
+another one.** The expert pointer was the absolute one where the kernel reads the group's own; the row map
+was the layer's where the kernel reads the group's; the bounds table was the expert-indexed one that had to
+be uploaded; the activations were MMQ's q8_1 rows instead of the kernel's per-token codes; and the H was
+written into MMQ's pooled buffer past its end — which is where the non-finite counts and the IMA came from.
+The path now owns its buffers (the activations per token, the H per group-local row), works in the
+group-local row space throughout (the same convention the MMQ path uses, so the already-uploaded relative
+bounds work and no new H2D sync appears), and takes the gate/up and the down from their own gathered
+buffers (two batches, two geometries: the gather puts the gate/up in `m.grp_gu` and the down in `m.grp_d`).
+
+**Now it runs — and it is much slower than the MMQ.** 30k prompt, 3 helper caches, `--prefill 32768`,
+`STRATA_DENSE_F16_ACC=1`, `STRATA_PF_PEER_COMPRESS=1` (`R-f16ab.sh`, the cold prompt of the first GEN):
+
+| arm | prefill ms | tok/s |
+|---|---:|---:|
+| `F16=0` | 48,878 | **613.8** |
+| `F16=1` | 144,095 | 208.2 |
+
+**2.9× slower** (−66 % tok/s). Where the time went, from the arms' own phase timings:
+
+| phase | F16=0 | F16=1 |
+|---|---:|---:|
+| the peers' `moe gemm` (per card, 80 layers, ~19,000 rows a layer) | 7,281 / 8,060 / 6,736 ms | **79,186 / 79,700 / 73,584 ms** |
+| the primary's `gather` | 168 ms | **11,407 ms** |
+| the primary's `gemm gate/up` | 5,381 ms | 5,334 ms |
+| the primary's `gemm down` | 2,817 ms | 3,116 ms |
+| the primary's `combine` (the wait for the peers) | 17,449 ms | **101,281 ms** |
+
+So the primary's own GEMM barely moves, and the whole loss is on the **helper cards**: their MoE GEMM is
+**11× slower** with the fused FP16 kernel, and the primary then sits in the combine waiting for them. The
+primary's `gather` grows 68× as well, which the phase timings show but this run did not isolate (the F16
+path's per-group tile rebuild and the H buffer's reallocation are both inside that window; the MMQ path does
+neither). Both arms are correct: the non-finite counts are the same, no illegal memory access, `rc=0`, and
+the decode is unaffected (48.7 vs 53.2 tok/s).
+
+The 4000-token pair (`R-f16v.sh`, both arms on the **same** binary `70b90ed76928`) says the same with less
+noise: `F16=0` 34,586 ms (115.6 tok/s) against `F16=1` 40,707 ms (98.2 tok/s), the peers' `moe gemm`
+1,055 / 1,142 / 894 ms against **11,036 / 11,275 / 10,541 ms**, and the primary's `gather` 56 ms against
+2,055 ms.
+
+**Conclusion: `STRATA_PF_F16_PEER` is not a speed win on this box and stays off.** The +0.84 % it seemed to
+promise was the path not running at all, and the honest number is 2.9× slower. The fix is still worth
+keeping — the path is correct now, it is observable, and the switch tells the truth — but the default stays
+as it is, and the box's best prefill remains the MMQ with `PEER_COMPRESS` and `DENSE_F16_ACC` on it.
+
