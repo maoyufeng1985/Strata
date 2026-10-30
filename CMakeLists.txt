@@ -2230,6 +2230,84 @@ if(STRATA_NATIVE_EXPERTS)
       endif()
       add_dependencies(strata_mmq strata_kq)
     endif()
+    # ===================== hdp4a t4: the sm_61 MMQ config overlay (upstream #31352) =====================
+    # BEGIN hdp4a-t4 sm61-mmq-config overlay wiring
+    # STRATA_MMQ_SM61_CONFIG: apply upstream llama.cpp #31352 (2026-10-29; I=64 -> I=128 in the two J=64 rows,
+    # 11 types; the companion issue #30235 measured +12% pp512 on an sm_61 card) to the MMQ config table of the
+    # pinned ggml-cuda, through a configure-time copy of the pinned ggml-cuda header set
+    # (cmake/strata_ggml_sm61_mmq_overlay.cmake): a SHA-256 gate keyed on the 3cf03257f pin, the diff onto the
+    # build-tree copy only, and a copy byte-identical to the pin when the diff is off (the companion ctest
+    # proves it).  Unavailable - and the table byte-identical by construction - wherever the build does not
+    # compile sm_61 code: the option is guarded to CMAKE_CUDA_ARCHITECTURES with 61 and STRATA_EXPERIMENTAL_SM60=ON.
+    option(STRATA_MMQ_SM61_CONFIG "sm_61 (P104-class) MMQ config: upstream llama.cpp #31352's I=128 J=64 rows for 11 quant types, via a build-tree overlay of the pinned ggml-cuda headers (neutral where sm_61 is not compiled or the pin moved)" OFF)
+    set(_strata_sm61_patch OFF)
+    if(STRATA_MMQ_SM61_CONFIG AND STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
+      # cc 610 guard: the pascal-dp4a table is picked at run time only for compute 6.1 devices
+      # (ggml_cuda_mmq_get_config: the highest compiled cc >= GGML_CUDA_CC_DP4A and < GGML_CUDA_CC_VOLTA), so
+      # the diff matters only where this build actually compiles sm_61 code
+      set(_strata_sm61_archs "")
+      foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        if(_a STREQUAL "native")
+          set(_strata_sm61_archs ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+        elseif(_a MATCHES "^all(-major)?$")
+          # a 12.x toolkit's `all` compiles sm_61; `all-major` stays at sm_60, and the 13.x line dropped sm_60/61/70
+          if(NOT _a MATCHES "major" AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+            list(APPEND _strata_sm61_archs 61)
+          endif()
+        else()
+          list(APPEND _strata_sm61_archs ${_a})
+        endif()
+      endforeach()
+      foreach(_a IN LISTS _strata_sm61_archs)
+        if(_a MATCHES "^61(-real|-virtual)?$")
+          set(_strata_sm61_patch ON)
+        endif()
+      endforeach()
+      if(NOT _strata_sm61_patch)
+        message(STATUS "STRATA_MMQ_SM61_CONFIG: unavailable - '${CMAKE_CUDA_ARCHITECTURES}' compiles no sm_61 (cc 610) code: the overlay stays neutral")
+      endif()
+    elseif(STRATA_MMQ_SM61_CONFIG)
+      message(STATUS "STRATA_MMQ_SM61_CONFIG: unavailable - the sm_61 table needs STRATA_EXPERIMENTAL_SM60=ON and a non-gfx906 CUDA build: the overlay stays neutral")
+    endif()
+    if(STRATA_MMQ_SM61_CONFIG)
+      get_filename_component(_strata_sm61_llama "${_strata_gg}" DIRECTORY)   # the llama.cpp dir the pinned ggml comes from
+      set(_strata_sm61_overlay_dir "${CMAKE_BINARY_DIR}/ggml-sm61-mmq-overlay")
+      include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_ggml_sm61_mmq_overlay.cmake)
+      strata_ggml_sm61_mmq_overlay("${_strata_sm61_llama}" "${_strata_sm61_overlay_dir}" "${_strata_sm61_patch}")
+      if(STRATA_SM61_MMQ_OVERLAY_OK)
+        if(_strata_sm61_patch)
+          # first on the include path of the two MMQ targets: the overlay's mmq.cuh / configs shadow the pinned
+          # ones for these targets only.  Attaching BOTH is mandatory: the pinned K-quant instances compile into
+          # strata_kq (its own DSO, STRATA_MMQ_KQUANTS), so with strata_mmq alone the P100/K-quant path keeps the
+          # pinned table; the P104 helpers' K-quants live in strata_kq.
+          if(_strata_mmq_tq_overlay)
+            # the TQ overlay's dirs are already ahead: appending keeps its patched mmq.cuh / ggml.h in front of
+            # this copy, so strata_mmq keeps the TQ routing and the sm61 diff stays out of it (neutral there);
+            # strata_kq carries the diff, as before
+            target_include_directories(strata_mmq PRIVATE ${_strata_sm61_overlay_dir})
+          else()
+            target_include_directories(strata_mmq BEFORE PRIVATE ${_strata_sm61_overlay_dir})
+          endif()
+          if(TARGET strata_kq)
+            target_include_directories(strata_kq BEFORE PRIVATE ${_strata_sm61_overlay_dir})
+          endif()
+          message(STATUS "STRATA_MMQ_SM61_CONFIG on: #31352's diff (I=128 on the J=64 rows, 11 types) on ${_strata_sm61_overlay_dir}")
+        else()
+          # unavailable: the copy is byte-identical to the pin and is NOT attached - no object code changes
+          message(STATUS "STRATA_MMQ_SM61_CONFIG: neutral - the copy at ${_strata_sm61_overlay_dir} is byte-identical to the pin and is not attached")
+        endif()
+        if(STRATA_BUILD_TESTS)
+          add_test(NAME ggml_sm61_mmq_overlay COMMAND ${CMAKE_COMMAND} -DLLAMA=${_strata_sm61_llama} -DPATCH=ON
+                   -DOUT=${CMAKE_BINARY_DIR}/ggml-sm61-mmq-overlay-test -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml_sm61_mmq_overlay_test.cmake)
+          add_test(NAME ggml_sm61_mmq_overlay_off COMMAND ${CMAKE_COMMAND} -DLLAMA=${_strata_sm61_llama} -DPATCH=OFF
+                   -DOUT=${CMAKE_BINARY_DIR}/ggml-sm61-mmq-overlay-test-off -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml_sm61_mmq_overlay_test.cmake)
+        endif()
+      else()
+        message(STATUS "STRATA_MMQ_SM61_CONFIG: off - the overlay disabled itself (the pin moved or the anchors moved): the default object code is untouched")
+      endif()
+    endif()
+    # END hdp4a-t4 sm61-mmq-config overlay wiring
+    # =====================================================================================================
     if(STRATA_ORCA_Q4KS_MMQ)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
     endif()
@@ -2277,6 +2355,18 @@ if(STRATA_NATIVE_EXPERTS)
       target_link_libraries(prefill_f16_kq_cuda_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_f16_kq_cuda_test COMMAND prefill_f16_kq_cuda_test)
       set_tests_properties(prefill_f16_kq_cuda_test PROPERTIES TIMEOUT 300)
+      # the per-row INT8 activation route (moe_f16_kq_cuda.cu's i8q, STRATA_PF_PEER_I8): the quantize and
+      # dequantize against a host-side reference, the row independence and the error bounds
+      add_executable(prefill_peer_i8q_test tests/cuda/prefill_peer_i8q_test.cu)
+      target_link_libraries(prefill_peer_i8q_test PRIVATE strata_mmq ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_peer_i8q_test COMMAND prefill_peer_i8q_test)
+      set_tests_properties(prefill_peer_i8q_test PROPERTIES TIMEOUT 300)
+      # the fused i8 -> q8_1 activation quantize (moe_mmq.cu's i8q::i8_rows_to_q8_1, the STRATA_PF_PEER_I8 helper
+      # route): the q8_1 bytes against the two-step route it replaces (i8_rows_to_f32 + mmq::quantize), every layout
+      add_executable(i8_to_q8_1_test tests/cuda/i8_to_q8_1_test.cpp)
+      target_link_libraries(i8_to_q8_1_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME i8_to_q8_1_test COMMAND i8_to_q8_1_test)
+      set_tests_properties(i8_to_q8_1_test PROPERTIES TIMEOUT 300)
       # the dequantizer's wide stores (iq_kernels.cu's put4): the values against ggml's and
       # llama.cpp's, and the aligned and the unaligned destination (the guarded fallback)
       add_executable(iq_dequant_store_test tests/cuda/iq_dequant_store_test.cu)
