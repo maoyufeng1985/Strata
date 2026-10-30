@@ -152,6 +152,20 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 }  // namespace strata::metal_engine
 #endif
 
+// STRATA_PF_PEER_I8's transport kernels (moe_f16_kq_cuda.cu, the CUDA build): one block per row, the
+// row's max two warp reductions.  Declared at file scope, OUTSIDE the file's anonymous namespace below:
+// a `namespace strata::prefill::fused::i8q` block inside it would introduce an inner `strata` name that
+// shadows the global one for every later `strata::...` reference in the anonymous namespace.
+namespace strata::prefill::fused::i8q {
+void f16_rows_to_i8(const uint16_t*, int64_t, int64_t, int8_t*, float*, cudaStream_t);
+void f32_rows_to_i8(const float*, int64_t, int64_t, int8_t*, float*, cudaStream_t);
+void i8_rows_to_f32(const int8_t*, const float*, float*, int64_t, int64_t, cudaStream_t);
+// the fused i8 -> q8_1 activation quantize (moe_mmq.cu): the peer's INT8 codes + row scale straight to the MMQ's
+// q8_1 activations, one pass, no FP32 buffer.  `type` (a ggml_type) selects the q8_1 scale layout; `ids` the
+// compact-row -> source-INT8-row map; `y` the q8_1 buffer (the same one mmq::quantize would fill).
+void i8_rows_to_q8_1(const int8_t*, const float*, const int32_t*, void*, int cols, int n_rows, int type, cudaStream_t);
+}  // namespace strata::prefill::fused::i8q
+
 namespace {
 // STRATA_PLE_COMPACT=1 (opt-in): the prompt chunk's PLE rows go up raw and are dequantized on the device (IQ4_NL tables
 // held in memory); the same floats as the host dequant, 7x fewer bytes over PCIe
@@ -790,6 +804,19 @@ struct Stager {
     }
 };
 
+// STRATA_PF_PEER_I8_SHARED: the pinned INT8 activations buffer shared by the host-route helpers - one
+// allocation, one D2H, three independent PCIe host reads.  It belongs to this handle instead of to the
+// peer that allocated it, so the LAST live executor to be destroyed frees it: every executor syncs its
+// own streams in its own destructor before its members are released, so by the last destruction all
+// readers' reads are done and the free is safe in every destruction order (the re-plan path reopens the
+// helpers, freeing the owner before the readers, and the session end frees the readers first).
+struct I8Shared {
+    int8_t* buf = nullptr;
+    ~I8Shared() {
+        if (buf) cudaFreeHost(buf);
+    }
+};
+
 // multi-GPU: the peer GPU's share of a prompt chunk's experts.  Per MoE layer the primary copies its normed
 // activations over P2P, the peer quantizes the rows routed to the experts it holds, runs the same MMQ products the
 // primary would (gathered from its own slots), and copies the result rows back into the primary's Dm rows - the rows
@@ -814,6 +841,12 @@ struct PeerPrefill {
     cudaStream_t s = nullptr;
     cudaEvent_t ev_in = nullptr;    // on the primary: the activations and the row tables are ready
     cudaEvent_t ev_done = nullptr;  // on the peer: its rows have landed in the primary's Dm
+    // STRATA_PF_PEER_I8: the peer has finished READING the activations out of the mapped host buffer
+    // (its dequantize kernel is recorded right after it).  ev_done comes much later - after this
+    // card's GEMMs - so without this the primary's next D2H could overwrite host_i8x while the peer
+    // is still reading it.  That is the intermittent illegal access the i8 route showed (1 run in 4).
+    cudaEvent_t ev_act = nullptr;
+    bool act_pending = false;
     // multi-GPU: the result rows go back group by group on a second stream while the next group computes
     cudaStream_t s_out = nullptr;
     static constexpr int kGrpEv = NE / 16 + 2;
@@ -886,6 +919,21 @@ struct PeerPrefill {
     std::vector<int32_t> ntok, tcur, touched;
     uint16_t *sum16 = nullptr, *host_x16 = nullptr, *host_sum16 = nullptr;
     float *sum = nullptr, *wk = nullptr;
+    // STRATA_PF_PEER_I8: the INT8 transport's buffers: the activations' rows (the codes per chunk,
+    // the scales after them, Portable|Mapped so the primary's kernel writes them over the P2P link
+    // when the route is multi-GPU and the primary's read-back runs in a kernel) and the result rows'
+    // codes and scales (the return side, the primary's combine dequantizes them).
+    int8_t *host_i8x = nullptr, *host_i8r = nullptr;
+    float *host_i8r_scales = nullptr;
+    size_t host_i8x_cap = 0, host_i8r_cap = 0, host_i8r_scales_cap = 0;
+    bool i8r_live = false;   // this layer's result rows are in host_i8r (INT8), not the FP16/FP32 routes
+    // STRATA_PF_PEER_I8_SHARED: the shared INT8 activations buffer (one D2H, three readers).  i8_sh holds
+    // the pinned allocation (nullptr: the peer owns host_i8x itself, the default).  i8_owner is whose
+    // allocation host_i8x points into (the owner itself when it owns the shared buffer); a reader's own
+    // D2H never happens - it waits on the owner's ev_i8 (the single copy's completion) instead.
+    std::shared_ptr<I8Shared> i8_sh;
+    PeerPrefill* i8_owner = nullptr;
+    cudaEvent_t ev_i8 = nullptr;
     // STRATA_PF_F16_PEER: the helper's own FP16 path (the primary's path, on the helper's card): the
     // activations per TOKEN in the kernels' int8 layout, the H per group-local row, and the tile tables.
     uint8_t* f16_x = nullptr;
@@ -905,6 +953,7 @@ struct PeerPrefill {
     std::vector<const float*> had_sh;
     std::vector<void*> owned;
     int64_t layers = 0, experts = 0, rows = 0, over_cap = 0;   // stats
+    uint64_t i8x_bytes = 0;   // the INT8 activation bytes that crossed this helper's link (the timing line's feed rate)
     ~PeerPrefill() {
         int prev = 0;
         cudaGetDevice(&prev);
@@ -918,6 +967,7 @@ struct PeerPrefill {
             if (f16_h) cudaFree(f16_h);   // the F16 path's H (reallocated as the routing changes)
             for (void* p : owned) cudaFree(p);
             if (ev_done) cudaEventDestroy(ev_done);
+            if (ev_act) cudaEventDestroy(ev_act);
             if (s_out) cudaStreamSynchronize(s_out);
             for (cudaEvent_t e : ev_grp) if (e) cudaEventDestroy(e);
             for (cudaEvent_t e : ev_dm) if (e) cudaEventDestroy(e);
@@ -932,9 +982,13 @@ struct PeerPrefill {
         if (ev_in) cudaEventDestroy(ev_in);
         if (x_stream) { cudaStreamSynchronize(x_stream); cudaStreamDestroy(x_stream); }
         if (ev_x) cudaEventDestroy(ev_x);
+        if (ev_i8) cudaEventDestroy(ev_i8);
         if (host_x) cudaFreeHost(host_x);
         if (host_rows) cudaFreeHost(host_rows);
         if (host_rows16) cudaFreeHost(host_rows16);
+        if (host_i8x && !i8_sh) cudaFreeHost(host_i8x);   // the shared buffer belongs to its I8Shared handle
+        if (host_i8r) cudaFreeHost(host_i8r);
+        if (host_i8r_scales) cudaFreeHost(host_i8r_scales);
         if (host_src) cudaFreeHost(host_src);
         if (host_bounds) cudaFreeHost(host_bounds);
         if (host_w) cudaFreeHost(host_w);
@@ -1108,8 +1162,19 @@ struct Prefill::Impl {
     int f16_tile_cap = 0;
     uint8_t* f16_x = nullptr;   // the activations, per token (fused::act_bytes(T, N))
     size_t f16_x_rows = 0;      // the activation buffer's capacity, in tokens
+    // STRATA_PF_PEER_I8: the activations' INT8 stage on this card (the codes per chunk, the scales
+    // after them): the host route's D2H takes the half-bytes to the helper's pinned buffer.  Grown
+    // geometrically like the FP16 one (a reallocation per chunk would drain this card).
+    int8_t* i8_dev = nullptr;
+    size_t i8_dev_rows = 0;
     uint8_t* f16_h = nullptr;   // the H, per group-local row ((n_ff / 64) * 80 bytes a row)
     size_t f16_h_rows = 0;      // the H's capacity, in rows
+    // STRATA_PF_PEER_DMA: the helper's FP16 rows' read-back over the primary's copy engine (a slice of the
+    // helper's mapped host buffer comes up on the engine's link, then the conversion runs on the primary's
+    // VRAM instead of reading the mapped memory in a kernel - the two differ by the link's speed, not its
+    // protocol).  Grown lazily, the first layer that takes it; the chunk's release frees it with `owned`.
+    uint16_t* row16_dma = nullptr;
+    size_t row16_dma_rows = 0;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`), the rows the pool writes
     // (Dm's tail, in Dm's row order), ones for row_sd (the CPU's rows carry s_down already), all pinned; and the
@@ -1488,6 +1553,85 @@ const MmqPlan& mmq_plan() {
     }();
     return plan;
 }
+// STRATA_PF_PEER_DMA=1: the helper's FP16 rows come back on the primary's copy engine (the mapped host read in
+// a kernel is link-bound on a Gen1 card at a few GB/s, the engine's link is faster; the values are the same
+// bytes).  Off by default: the mapped read is what every build has done since the host route.  Measured on
+// 192.168.1.98 (2026-10-29) the engine's H2D is slower than the P100's zero-copy read here - a net loss, so
+// the default stays off and this flag is a documented alternative, not a recommendation.
+bool pf_peer_dma_read() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_PEER_DMA");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+// STRATA_PF_F16_HELPER=dp4a (or =mmq): the primary's own rows take the fused FP16 K-quant kernels while the
+// helper cards keep their integer DP4A (the K-quant MMQ's) expert kernels - the per-card split of the
+// STRATA_PF_F16_PEER path.  On this box the helper's FP16 GEMM is ~17x its MMQ GEMM (no FP16 tensor cores on
+// the Pascal helper cards, measured 2026-10-29), so the split is the fast combination: the primary's FP16
+// GEMMs cost its MMQ GEMMs, and the helpers run the fast integer kernels.  The activation transfer, the
+// helper's row return and the combine are the MMQ ones either way (the helper quantizes its own copy of the
+// layer input).  Off by default: without it the helper follows the primary into the FP16 path, as before.
+bool f16_helper_dp4a() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_F16_HELPER");
+        if (e == nullptr) return false;
+        if (std::strcmp(e, "dp4a") == 0 || std::strcmp(e, "mmq") == 0) {
+            std::fprintf(stderr, "strata: STRATA_PF_F16_HELPER=%s: the primary's own rows take the fused FP16 "
+                                 "K-quant kernels; the helper cards keep the integer DP4A (MMQ) expert kernels "
+                                 "for theirs\n", e);
+            return true;
+        }
+        return false;
+    }();
+    return on;
+}
+// STRATA_PF_PEER_I8=1: the activations to the helper cards, and the helpers' result rows back, carry
+// in per-row INT8 instead of FP16 or FP32: one 8-bit code and one FP32 scale per row (the grid of
+// amax / 127; rounding bounds the code's error by amax/254 and its rms by ~0.23% of the row's peak,
+// uncorrelated row to row).  The helper link's bytes halve
+// against the FP16 route (the row is N codes + 4 bytes), so on a Gen1 x4 helper (~0.8 GB/s, measured
+// 2026-10-29 on 192.168.1.98) the transfer and the read-back get half their link time.  Off by
+// default: the FP16 route is the release behavior.  Measured on 192.168.1.98 (2026-10-30): 30k cold
+// 48.62 s -> 36.29-36.43 s (617 -> 824-827 tok/s, four consecutive runs on one binary), and a
+// 275-token prompt + 64 decode tokens prints a byte-identical output line on and off.
+bool pf_peer_i8() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_PEER_I8");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+// STRATA_PF_PEER_I8_FUSED=1 (with STRATA_PF_PEER_I8=1): the helper's gate/up activation quantize reads its
+// per-row INT8 codes straight to the MMQ's q8_1 activations (i8_rows_to_q8_1, one pass) instead of the two-step
+// i8_rows_to_f32 to FP32 then the MMQ's q8_1 quantize (a full FP32 buffer written and read between).  The fused
+// kernel is bit-exact with the two-step (the FP32 value is (float)code * scale, the same expression), so this is a
+// pure DRAM-traffic saving on the helper - it does not change the arithmetic.  Off by default: without it the i8
+// route keeps the two-step, so the switch is A/B-able on the box and the default i8 path is byte-identical.
+bool i8_fused_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_PEER_I8_FUSED");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+// STRATA_PF_PEER_I8_SHARED=1 (with STRATA_PF_PEER_I8=1, the host route): the helpers' INT8 activation buffer
+// is ONE shared pinned allocation instead of one per helper.  The primary still quantizes once per layer
+// and makes ONE D2H (into the owner's - the first i8 host-route peer's - buffer) instead of one per helper;
+// every helper then reads the same mapped host bytes with its own PCIe read (independent, no helper-to-
+// helper dependency), gated on the single copy's event (ev_i8).  The slot-reuse straggler wait (each
+// reader's ev_act, recorded right after its read) runs on the owner's copy stream before the D2H.  The
+// i8x_bytes counter counts the D2H's bytes once on the primary's side (the owner's feed line) and each
+// reader's own read bytes on its own line (the line says "its link").  Off by default: without it every
+// helper keeps its own buffer and its own D2H, and the default i8 path is byte-identical.
+bool i8_shared_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_PEER_I8_SHARED");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+// the per-row INT8 transport's kernels live at file scope (above, before the anonymous namespace).
 // STRATA_PF_F16_PEER=1: the prompt's routed experts take the fused FP16 K-quant kernels (f16kqc's register
 // dequant, no FP16 copy of the weights), on the primary AND on the helper cards (the peer mode).  Every visible
 // CUDA card must be Pascal or newer - the kernel's HFMA2 needs FP16 - and the primary's card the sm_60 pass that
@@ -2273,7 +2417,8 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     ok = ok && cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
          cudaStreamCreateWithFlags(&pp->s_out, cudaStreamNonBlocking) == cudaSuccess &&
          cudaStreamCreateWithFlags(&pp->s_cp, cudaStreamNonBlocking) == cudaSuccess &&
-         cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
+         cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess &&
+         cudaEventCreateWithFlags(&pp->ev_act, cudaEventDisableTiming) == cudaSuccess;
     for (int i = 0; ok && i < PeerPrefill::kGrpEv; ++i)
         ok = cudaEventCreateWithFlags(&pp->ev_grp[i], cudaEventDisableTiming) == cudaSuccess;
     for (int b = 0; ok && b < 2; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
@@ -2404,13 +2549,21 @@ std::unique_ptr<PeerPrefill> Prefill::open_peer_exec(Impl& m, const PeerSource& 
             err = "prefill peer: copy stream";
             return nullptr;
         }
+        // STRATA_PF_PEER_I8_SHARED: the shared copy's completion (recorded on the copy stream above, in the
+        // primary's context, as ev_x is).  Every reader's copy stream waits on it before its own read.
+        if (i8_shared_on() && cudaEventCreateWithFlags(&pp->ev_i8, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            err = "prefill peer: event";
+            return nullptr;
+        }
     }
     int prev = 0;
     cudaGetDevice(&prev);
     pp->dev = src.device;
     cudaSetDevice(pp->dev);
     bool ok = cudaStreamCreateWithFlags(&pp->s, cudaStreamNonBlocking) == cudaSuccess &&
-              cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess;
+              cudaEventCreateWithFlags(&pp->ev_done, cudaEventDisableTiming) == cudaSuccess &&
+              cudaEventCreateWithFlags(&pp->ev_act, cudaEventDisableTiming) == cudaSuccess;
     {
         const char* v = std::getenv("STRATA_PF_PEER_OUT_PIPE");   // =0: one copy after the last group (the A/B)
         pp->out_pipe = (v == nullptr || std::atoi(v) != 0) || pp->compact;   // compact always pipes
@@ -2541,6 +2694,35 @@ std::unique_ptr<PeerPrefill> Prefill::open_peer_exec(Impl& m, const PeerSource& 
         } else if (ok) {
             host(pp->host_rows, pp->host_rows_cap, (size_t) pp->cap_rows * N);
             if (pp->compress) host(pp->host_rows16, pp->host_rows16_cap, (size_t) pp->cap_rows * N);
+            if (ok && pf_peer_i8()) {
+                // the activations' codes + scales per chunk, the result rows' codes + scales
+                if (i8_shared_on()) {
+                    // STRATA_PF_PEER_I8_SHARED: one pinned buffer, owned by the first i8 host-route peer
+                    // that opened; the others read its mapped bytes over their own PCIe links.
+                    PeerPrefill* own = nullptr;
+                    if (m.pp != nullptr && !m.pp->p2p && m.pp->i8_owner == m.pp.get()) own = m.pp.get();
+                    if (own == nullptr)
+                        for (int j = 0; j < m.rpp_n; ++j)
+                            if (!m.rpp[j]->p2p && m.rpp[j]->i8_owner == m.rpp[j].get()) { own = m.rpp[j].get(); break; }
+                    if (own != nullptr) {
+                        pp->i8_sh = own->i8_sh;
+                        pp->i8_owner = own;
+                        pp->host_i8x = own->host_i8x;
+                        pp->host_i8x_cap = own->host_i8x_cap;
+                    } else {   // the first one: the owner
+                        host(pp->host_i8x, pp->host_i8x_cap, (size_t) m.T_max * N + m.T_max * 4);
+                        if (ok) {
+                            // ev_i8 was created with ev_x above (the same primary-side context)
+                            pp->i8_sh = std::make_shared<I8Shared>();
+                            pp->i8_sh->buf = pp->host_i8x;
+                            pp->i8_owner = pp.get();
+                        }
+                    }
+                }
+                else host(pp->host_i8x, pp->host_i8x_cap, (size_t) m.T_max * N + m.T_max * 4);
+                if (ok) host(pp->host_i8r, pp->host_i8r_cap, (size_t) pp->cap_rows * N);
+                if (ok) host(pp->host_i8r_scales, pp->host_i8r_scales_cap, pp->cap_rows);
+            }
         }
         if (ok) host(pp->host_src, pp->host_src_cap, (size_t) pp->cap_rows);
         if (ok) host(pp->host_bounds, bounds_cap, PeerPrefill::kHostBounds);
@@ -2941,11 +3123,11 @@ namespace {
 // host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
 // are folded at every MoE layer's host sync, after which all of them have completed.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
-               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
+               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfCombineRead, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
                kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
-                                        "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
+                                        "gemm gate/up", "gemm down", "combine", "combine read", "ple", "kv stage", "gdn conv+gates",
                                         "gdn recurrence", "gdn out proj", "hc write"};
 struct PfTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
@@ -2981,8 +3163,8 @@ struct PfTimer {
     }
 };
 // multi-GPU: the peer's own timeline (STRATA_PREFILL_TIMING): marks on the peer stream, folded with the primary's
-enum PePhase { kPeIdle, kPeMoeIn, kPeMoeGemm, kPeMoeOut, kPeCount };
-const char* const kPeNames[kPeCount] = {"idle", "moe in", "moe gemm", "moe out"};
+enum PePhase { kPeIdle, kPeMoeIn, kPeMoeCopy, kPeMoeGemm, kPeMoeOut, kPeCount };
+const char* const kPeNames[kPeCount] = {"idle", "moe in", "moe copy", "moe gemm", "moe out"};
 struct PeTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     int dev = -1;
@@ -5103,6 +5285,99 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // multi-GPU: the peers' shares, enqueued before the primary's own experts so every card works at once
                         peer_now = use_mmq && rows_peer > 0;
                         if (peer_now) {
+                            if (pf_peer_i8()) {
+                                // STRATA_PF_PEER_I8: a host-route helper takes the activations as per-row INT8
+                                // (the codes, the row's scale).  The stage is sized ONCE for the largest chunk
+                                // (m.T_max, the same figure P.host_i8x is sized with): growing it mid-run
+                                // would free a buffer that this chunk's earlier layers have already queued
+                                // copies out of on the peers' x_streams, which is a race, not a reallocation.
+                                bool host_route = false;
+                                for (PeerPrefill* P2 : peers) host_route = host_route || !P2->p2p;
+                                const size_t need_rows = (size_t) std::max<int64_t>(T, m.T_max);
+                                if (host_route && (m.i8_dev == nullptr || m.i8_dev_rows < need_rows)) {
+                                    if (m.i8_dev != nullptr) {
+                                        // every stream that could still read it must be idle first
+                                        cudaStreamSynchronize(m.cs);
+                                        for (PeerPrefill* P2 : peers)
+                                            if (P2->x_stream) cudaStreamSynchronize(P2->x_stream);
+                                        cudaFree(m.i8_dev);
+                                        for (size_t i = 0; i < m.owned.size(); ++i)
+                                            if (m.owned[i] == (void*) m.i8_dev) { m.owned.erase(m.owned.begin() + (long) i); break; }
+                                        m.i8_dev = nullptr;
+                                        m.i8_dev_rows = 0;
+                                    }
+                                    void* p8 = nullptr;
+                                    if (cudaMalloc(&p8, need_rows * (size_t) N + need_rows * 4) != cudaSuccess) {
+                                        cudaGetLastError();
+                                        p8 = nullptr;
+                                    }
+                                    m.i8_dev = (int8_t*) p8;
+                                    m.i8_dev_rows = m.i8_dev != nullptr ? need_rows : 0;
+                                    if (m.i8_dev != nullptr) m.owned.push_back(m.i8_dev);
+                                }
+                                if (host_route && m.i8_dev == nullptr) {
+                                    err = "prefill: the host route's INT8 activation buffer could not be allocated";
+                                    return false;
+                                }
+                                // Quantize ONCE per layer on the compute stream: every helper takes the same
+                                // activations, so a per-peer quantization would both repeat the work three
+                                // times and race on this one buffer (each peer's copies run on its own
+                                // x_stream).  Each peer's copy below waits on ev_x, which is recorded on this
+                                // stream after this launch, so the order is safe.
+                                if (host_route) {
+                                    // mixed_h is filled only for a peer that took the FP16 route, so the FP16
+                                    // source is safe only when EVERY host-route peer wants it; one DP4A
+                                    // helper (STRATA_PF_F16_HELPER=dp4a) means the FP32 source for all.
+                                    bool all_f16 = true, any_host = false;
+                                    for (PeerPrefill* P2 : peers)
+                                        if (!P2->p2p) { any_host = true; all_f16 = all_f16 && P2->f16; }
+                                    int8_t* c8 = m.i8_dev;
+                                    float* s8 = (float*) (c8 + (size_t) T * N);
+                                    if (any_host && all_f16)
+                                        strata::prefill::fused::i8q::f16_rows_to_i8((const uint16_t*) m.mixed_h, T, N,
+                                                                                   c8, s8, m.cs);
+                                    else if (any_host)
+                                        strata::prefill::fused::i8q::f32_rows_to_i8(m.mixed, T, N, c8, s8, m.cs);
+                                }
+                                // STRATA_PF_PEER_I8_SHARED: the single D2H for every host-route helper,
+                                // beside the compute stream on the owner's copy stream as each per-peer
+                                // copy was (it never stalls the primary).  Before it overwrites the shared
+                                // bytes it waits for every reader's previous read (each reader's ev_act,
+                                // recorded right after its dequantize - the slot-reuse straggler wait);
+                                // every reader's copy stream then waits for this copy (ev_i8) before its
+                                // own activations' read.  The bytes are counted once here, on the
+                                // primary's side (the owner's feed line).
+                                if (i8_shared_on() && host_route) {
+                                    bool any_i8_rows = false;   // no reader takes these bytes: no copy (as the per-peer copies, each skipped with its rows)
+                                    for (size_t pj = 0; pj < peers.size(); ++pj)
+                                        if (peers[pj]->i8_sh != nullptr && peer_rows[pj] > 0) { any_i8_rows = true; break; }
+                                    PeerPrefill* own_peer = nullptr;
+                                    for (PeerPrefill* P2 : peers)
+                                        if (P2->i8_sh != nullptr && P2->i8_owner == P2) { own_peer = P2; break; }
+                                    if (own_peer != nullptr && any_i8_rows) {
+                                        const cudaStream_t xsO = own_peer->x_stream != nullptr ? own_peer->x_stream : m.cs;
+                                        for (PeerPrefill* P2 : peers)
+                                            if (P2->i8_sh != nullptr && P2->act_pending) {
+                                                cudaStreamWaitEvent(xsO, P2->ev_act, 0);
+                                                P2->act_pending = false;
+                                            }
+                                        if (own_peer->x_stream != nullptr) {
+                                            cudaEventRecord(own_peer->ev_x, m.cs);
+                                            cudaStreamWaitEvent(xsO, own_peer->ev_x, 0);
+                                        }
+                                        if ((size_t) T * ((size_t) N + 4) <= own_peer->host_i8x_cap) {
+                                            cudaMemcpyAsync(own_peer->host_i8x, m.i8_dev, T * ((size_t) N + 4),
+                                                            cudaMemcpyDeviceToHost, xsO);
+                                            own_peer->i8x_bytes += (uint64_t) T * ((size_t) N + 4);
+                                            cudaEventRecord(own_peer->ev_i8, xsO);
+                                        }
+                                        else {   // the init sized the buffer for the largest chunk: refuse, do not overrun
+                                            err = "prefill: the helper's INT8 activation buffer is smaller than this chunk";
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
                           for (size_t pi = 0; pi < peers.size(); ++pi) {
                             PeerPrefill& P = *peers[pi];
                             const std::vector<int32_t>& order_peer = order_pp[pi];
@@ -5117,7 +5392,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cudaStreamWaitEvent(P.x_stream, P.ev_x, 0);
                                 xs = P.x_stream;
                             }
-                            if (!P.p2p && P.f16) cudaMemcpyAsync(P.host_x16, m.mixed_h, (size_t) T * N * 2, cudaMemcpyDeviceToHost, xs);
+                            if (pf_peer_i8() && !P.p2p) {
+                                // STRATA_PF_PEER_I8: per-row INT8 over the helper's link - half the FP16
+                                // route's bytes (N codes + 4 per row), the FP32 route's quarter.  The source
+                                // is this card's layer input: FP16 when this card's own experts took the
+                                // fused FP16 kernels this layer (the H buffer's input copy), FP32 otherwise.
+                                // the quantization itself ran once for the layer, on the compute stream
+                                // (above); this peer only carries its own copy of it.  The previous
+                                // layer's read of this buffer must be finished first (ev_act is recorded
+                                // right after the peer's dequantize, long before its ev_done).
+                                if (i8_shared_on() && P.i8_sh != nullptr) {
+                                    // STRATA_PF_PEER_I8_SHARED: the one D2H for all the readers was issued
+                                    // before this loop, on the owner's copy stream.  This link's read begins
+                                    // only after that copy; the straggler wait (the readers' ev_acts) ran
+                                    // there, before it.  A reader's read bytes are counted here, on its own
+                                    // feed line ("its link"); the owner's D2H bytes were counted once above.
+                                    cudaStreamWaitEvent(xs, P.i8_owner->ev_i8, 0);
+                                    if (P.i8_owner != &P) P.i8x_bytes += (uint64_t) T * ((size_t) N + 4);
+                                }
+                                else {
+                                    if (P.act_pending) { cudaStreamWaitEvent(xs, P.ev_act, 0); P.act_pending = false; }
+                                    if ((size_t) T * ((size_t) N + 4) <= P.host_i8x_cap) {
+                                        cudaMemcpyAsync(P.host_i8x, m.i8_dev, T * ((size_t) N + 4), cudaMemcpyDeviceToHost, xs);
+                                        P.i8x_bytes += (uint64_t) T * ((size_t) N + 4);
+                                    }
+                                    else {   // the init sized the buffer for the largest chunk: refuse, do not overrun
+                                        err = "prefill: the helper's INT8 activation buffer is smaller than this chunk";
+                                        return false;
+                                    }
+                                }
+                            }
+                            else if (!P.p2p && P.f16) cudaMemcpyAsync(P.host_x16, m.mixed_h, (size_t) T * N * 2, cudaMemcpyDeviceToHost, xs);
                             else if (!P.p2p) cudaMemcpyAsync(P.host_x, m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, xs);
                             if (P.sums) {   // the routing weights, and each peer row's routed pair (t * K + k)
                                 cudaMemcpyAsync(P.host_w, m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, xs);
@@ -5133,18 +5438,56 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaStreamWaitEvent(ps, P.ev_in, 0);
                             if (P.out_pending) { cudaStreamWaitEvent(ps, P.ev_done, 0); P.out_pending = false; }
                             pe_pp[pi]->mark(kPeMoeIn, ps);
-                            if (P.p2p) cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
+                            // A (the fused i8 -> q8_1 activation quantize, no FP32 buffer): this peer's gate/up
+                            // takes the MMQ route (not the F16 fused kernels) and its activations cross as
+                            // per-row INT8, so the gate/up quantize below reads P.host_i8x straight to P.Xq_g /
+                            // P.Xq and P.mixed is never written for it.  A F16-helper gate/up (reads P.mixed),
+                            // a p2p / FP16 / FP32 route, or a too-small i8 buffer keeps the two-step i8_rows_to_f32.
+                            const bool i8_fused_gu = i8_fused_on() && pf_peer_i8() && !P.p2p
+                                    && P.host_i8x != nullptr && (size_t) T * ((size_t) N + 4) <= P.host_i8x_cap
+                                    && !(f16p_layer && P.f16_x != nullptr && !f16_helper_dp4a());
+                            if (pf_peer_i8() && !P.p2p) {
+                                // STRATA_PF_PEER_I8: the primary quantized the layer input per row (the codes,
+                                // the row's scale) into this card's mapped buffer: dequantize in a kernel -
+                                // the bytes cross the link over the read, as the FP16 route's read does.
+                                // The rows must fit the buffer the init sized for the largest chunk: a
+                                // smaller chunk (a KV-resident run re-plans prefill to 8192) reads fewer.
+                                if (P.host_i8x != nullptr && (size_t) T * ((size_t) N + 4) <= P.host_i8x_cap) {
+                                    if (!i8_fused_gu) {
+                                        strata::prefill::fused::i8q::i8_rows_to_f32(
+                                            P.host_i8x, (const float*) (P.host_i8x + (size_t) T * N), P.mixed, T, N, ps);
+                                        // the primary may not overwrite host_i8x until this read has finished
+                                        cudaEventRecord(P.ev_act, ps);
+                                        P.act_pending = true;
+                                    }
+                                    // i8_fused_gu: the gate/up quantize below reads host_i8x directly (no FP32
+                                    // buffer) and records ev_act right after that read, guarding the D2H.
+                                }
+                                else {
+                                    err = "prefill: the helper's INT8 activation buffer is smaller than this chunk";
+                                    cudaSetDevice(prevd);
+                                    return false;
+                                }
+                            }
+                            else if (P.p2p) cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
                             else if (P.f16) f16_to_f32_wide(P.mixed, P.host_x16, T * N, ps);
                             else copy_f32_wide(P.mixed, P.host_x, T * N, ps);
-                            if (f16p_layer && P.f16_x != nullptr) {
+                            if (f16p_layer && P.f16_x != nullptr && !f16_helper_dp4a()) {
                                 // STRATA_PF_F16_PEER: the fused FP16 kernels' activations on this card: the layer's
                                 // input quantized per TOKEN in the kernels' own layout (80 bytes per 64 values: the
                                 // codes, the two scales and the two code sums).  MMQ's q8_1 rows are a different
-                                // layout, so the F16 path has its own buffer here too.
+                                // layout, so the F16 path has its own buffer here too.  STRATA_PF_F16_HELPER=dp4a:
+                                // this helper keeps the integer DP4A (MMQ) kernels, so its activations take the
+                                // MMQ's q8_1 path (the quantize below) and this one is not filled.
                                 strata::prefill::fused::quantize_act_native(P.mixed, (int64_t) T, N, P.f16_x, ps);
                             }
+                            // STRATA_PREFILL_TIMING: the peer's own copy of the activations (the mapped host read and
+                            // the fp32 write) and its quantization, apart from the host's group tables below: the
+                            // gap to the next mark is the host's work on the critical path.
+                            pe_pp[pi]->mark(kPeMoeCopy, ps);
                             P.back_at = rows_local;
                             P.back_rows = rows_peer;
+                            P.i8r_live = pf_peer_i8() && !P.p2p;   // cleared below if any group falls back
                             if (P.p2p) {
                                 // multi-GPU: the mapped table when on; src_host (a pageable vector) goes up from a pinned slot (#1996)
                                 if ((grp_mapped ? cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4,
@@ -5274,13 +5617,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const int32_t* rel = P.bounds + n + 1 + g2 * (MMQ_GROUP + 1);
                                     const int b = (int) (g2 & 1);
                                     if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
-                                    if (f16p_layer && P.f16_x != nullptr) {
+                                    if (f16p_layer && P.f16_x != nullptr && !f16_helper_dp4a()) {
                                         // STRATA_PF_F16_PEER: this group's products on the fused FP16 K-quant kernels
                                         // (the same path the primary takes for its own rows): the gate/up and the
                                         // down read the gathered bytes, the activations are the layer's input
                                         // quantized per token in the kernels' layout, the row map is the identity
                                         // over the group's rows and the rows land in the group's Dm block.
                                         if (P.f16_h == nullptr || P.f16_h_rows < (size_t) nr) {
+                                            // The buffer grows GEOMETRICALLY: a reallocation per group would cost a
+                                            // device drain every time (cudaMalloc and cudaFree both synchronise
+                                            // the device), and that drain lands on the layer's critical path.
+                                            size_t want = (size_t) nr;
+                                            if (P.f16_h_rows > 0) want = P.f16_h_rows * 2;
+                                            if (want < (size_t) nr) want = (size_t) nr;
                                             if (P.f16_h != nullptr) {
                                                 cudaStreamSynchronize(ps);
                                                 cudaFree(P.f16_h);
@@ -5288,13 +5637,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                 P.f16_h_rows = 0;
                                             }
                                             void* fp = nullptr;
-                                            const size_t hb = (size_t) nr * (size_t) (FF / 64) * 80;
+                                            const size_t hb = want * (size_t) (FF / 64) * 80;
                                             if (cudaMalloc(&fp, hb) != cudaSuccess) {
                                                 cudaGetLastError();
                                                 fp = nullptr;
                                             }
                                             P.f16_h = (uint8_t*) fp;
-                                            P.f16_h_rows = P.f16_h != nullptr ? (size_t) nr : 0;
+                                            P.f16_h_rows = P.f16_h != nullptr ? want : 0;
                                             if (P.f16_h == nullptr) {
                                                 err = "prefill: the helper's fused FP16 H buffer could not be allocated";
                                                 cudaSetDevice(prevd);
@@ -5330,7 +5679,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     } else {
                                         cudaMemsetAsync(P.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, ps);
                                         cudaMemsetAsync(P.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, ps);
-                                        mmq::quantize(P.mixed, P.src + r0, P.Xq_g, mmq_gt, N, N, nr, ps);
+                                        if (i8_fused_gu) {
+                                            strata::prefill::fused::i8q::i8_rows_to_q8_1(
+                                                P.host_i8x, (const float*) (P.host_i8x + (size_t) T * N), P.src + r0,
+                                                P.Xq_g, N, nr, mmq_gt, ps);
+                                            // the fused read of host_i8x just finished: guard the next D2H now
+                                            cudaEventRecord(P.ev_act, ps);
+                                            P.act_pending = true;
+                                        }
+                                        else
+                                            mmq::quantize(P.mixed, P.src + r0, P.Xq_g, mmq_gt, N, N, nr, ps);
                                         mmq::Product gu;
                                         gu.w = P.grp_gu; gu.type = mmq_gt; gu.w_rows = GW; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                         gu.n = ngx; gu.xq = P.Xq_g; gu.bounds = rel; gu.ids = P.ident;
@@ -5364,14 +5722,33 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (P.p2p)
                                         cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm_b[b], P.dev,
                                                             (size_t) nr * N * 4, P.s_out);
+                                    else if (pf_peer_i8() &&
+                                             (size_t) rows_peer <= (size_t) (P.host_i8r_cap / (size_t) N) &&
+                                             (size_t) rows_peer <= P.host_i8r_scales_cap) {
+                                        // STRATA_PF_PEER_I8: the rows' bytes back over the link halved - one 8-bit
+                                        // code and one FP32 scale per row; the primary's combine dequantizes.
+                                        // The buffers are sized for cap_rows: a run that plans a bigger helper
+                                        // share than that (a KV-resident run re-plans the chunk) falls back to
+                                        // the FP16 route below rather than writing past the end.
+                                        strata::prefill::fused::i8q::f32_rows_to_i8(P.Dm_b[b] + (size_t) r0 * N, nr, N,
+                                                                                   P.host_i8r + (size_t) r0 * N,
+                                                                                   P.host_i8r_scales + r0,
+                                                                                   P.s_out);
+                                        // P.i8r_live stays as the layer set it: one flag covers the peer's whole
+                                        // back_rows block, so a group that took the i8 route must not re-arm it
+                                        // after an earlier group fell back to FP16.
+                                    }
                                     else if (P.compress && P.host_rows16 != nullptr) {
                                         // STRATA_PF_PEER_COMPRESS: quantize the rows to FP16 on this card, then the host
+                                        P.i8r_live = false;   // this group's rows are FP16, not the i8 route's
                                         // route carries half the bytes; the primary's combine reads FP16 mapped memory
                                         sums_to_f16(P.Dm_b[b], P.host_rows16 + (size_t) r0 * N, nr * N, P.s_out);
                                     }
-                                    else   // the primary reads them when it combines (below)
+                                    else {   // the primary reads them when it combines (below)
+                                        P.i8r_live = false;
                                         cudaMemcpyAsync(P.host_rows + (size_t) r0 * N, P.Dm_b[b], (size_t) nr * N * 4,
                                                         cudaMemcpyDeviceToHost, P.s_out);
+                                    }
                                     cudaEventRecord(P.ev_dm[b], P.s_out);
                                     P.dm_live[b] = true;
                                 }
@@ -5394,7 +5771,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     std::memcpy(P.host_bounds, P.bounds_host.data(), P.bounds_host.size() * 4);
                                     copy_i32(P.bounds, P.host_bounds, (int64_t) P.bounds_host.size(), ps);
                                 }
-                                mmq::quantize(P.mixed, P.src, P.Xq, mmq_gt, N, N, rows_peer, ps);
+                                if (i8_fused_gu) {
+                                    strata::prefill::fused::i8q::i8_rows_to_q8_1(
+                                        P.host_i8x, (const float*) (P.host_i8x + (size_t) T * N), P.src,
+                                        P.Xq, N, rows_peer, mmq_gt, ps);
+                                    // the fused read of host_i8x just finished: guard the next D2H now
+                                    cudaEventRecord(P.ev_act, ps);
+                                    P.act_pending = true;
+                                }
+                                else
+                                    mmq::quantize(P.mixed, P.src, P.Xq, mmq_gt, N, N, rows_peer, ps);
                                 pe_pp[pi]->mark(kPeMoeGemm, ps);
                                 const auto& f = lay.fmt[(size_t) l];
                                 for (size_t j = 0; j < n; ++j) {
@@ -5772,6 +6158,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     // the H of this group's rows: it grows with the layer's biggest group (the
                                     // routing changes from layer to layer), so it is reallocated when it must.
                                     if (m.f16_h == nullptr || m.f16_h_rows < (size_t) nr) {
+                                        // geometric growth (see the helper's copy above): a reallocation per group
+                                        // would drain the device on every layer.
+                                        size_t want = (size_t) nr;
+                                        if (m.f16_h_rows > 0) want = m.f16_h_rows * 2;
+                                        if (want < (size_t) nr) want = (size_t) nr;
                                         if (m.f16_h != nullptr) {
                                             cudaStreamSynchronize(m.cs);
                                             cudaFree(m.f16_h);
@@ -5779,13 +6170,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                             m.f16_h_rows = 0;
                                         }
                                         void* fp = nullptr;
-                                        const size_t hb = (size_t) nr * (size_t) (f.n_ff / 64) * 80;
-                                        if (cudaMalloc(&fp, hb) != cudaSuccess) {
+                                        const size_t hb = want * (size_t) (f.n_ff / 64) * 80;
+                                        const cudaError_t ma = cudaMalloc(&fp, hb);
+                                        if (ma != cudaSuccess) {
                                             cudaGetLastError();
                                             fp = nullptr;
+                                            err = std::string("prefill: the fused FP16 experts' H buffer could not be allocated (") +
+                                                  cudaGetErrorString(ma) + ", " + std::to_string((long long) (hb >> 20)) + " MiB)";
+                                            return false;
                                         }
                                         m.f16_h = (uint8_t*) fp;
-                                        m.f16_h_rows = m.f16_h != nullptr ? (size_t) nr : 0;
+                                        m.f16_h_rows = m.f16_h != nullptr ? want : 0;
                                         if (m.f16_h == nullptr) {
                                             err = "prefill: the fused FP16 experts' H buffer could not be allocated";
                                             return false;
@@ -5800,6 +6195,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                               nr, ngx, fwb,
                                                                               (const uint8_t*) m.f16_h,
                                                                               m.Dm + r0 * N, m.ids_identity, cs);
+                                    if (std::getenv("STRATA_PF_F16_CHECK") != nullptr) {
+                                        // a diagnosis: the FP16 kernels' errors surface asynchronously, so the stream
+                                        // is synchronized here and the first failure is named where it happens
+                                        const cudaError_t se = cudaStreamSynchronize(cs);
+                                        if (se != cudaSuccess) {
+                                            err = std::string("prefill: the fused FP16 experts failed: ") + cudaGetErrorString(se);
+                                            return false;
+                                        }
+                                    }
                                     return true;
                                 }
                                 mmq::Product gu;
@@ -5984,11 +6388,50 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         for (PeerPrefill* P : peers) {
                             if (P->back_rows <= 0) continue;
                             cudaStreamWaitEvent(m.cs, P->ev_done, 0);
-                            if (!P->p2p && !P->sums && P->compress && P->host_rows16 != nullptr)
+                            if (!P->p2p && !P->sums && P->i8r_live && P->host_i8r != nullptr) {
+                                // STRATA_PF_PEER_I8: the helper's rows came back as per-row INT8 (the codes, the
+                                // row's scale): the dequantize in a kernel takes the half-bytes' read over the
+                                // link.  The helper wrote its rows at the GROUP-LOCAL offsets r0 (its bounds are
+                                // already relative to rows_local), so the buffer holds back_rows rows from 0 -
+                                // exactly the layout the FP16 route above reads.  Adding back_at here would
+                                // point past what the helper wrote; it is only the DESTINATION's offset in Dm.
+                                strata::prefill::fused::i8q::i8_rows_to_f32(P->host_i8r,
+                                                                            P->host_i8r_scales,
+                                                                            m.Dm + (size_t) P->back_at * N,
+                                                                            P->back_rows, N, m.cs);
+                            }
+                            else if (!P->p2p && !P->sums && P->compress && P->host_rows16 != nullptr) {
+                                // STRATA_PF_PEER_DMA: the mapped host read in a kernel is link-bound on a Gen1 card at
+                                // a few GB/s; the engine's link is faster.  The engine's D2H on the helper card
+                                // already finished before ev_done, so this reads the helper's pinned rows up over
+                                // the PRIMARY's link, the conversion runs on the primary's VRAM, and the values are
+                                // the same bytes.  Grown lazily (64 MiB as FP16 at n_embd 2048), one slice at a time.
+                                const size_t need = (size_t) P->back_rows * N;
+                                if (pf_peer_dma_read() && m.row16_dma == nullptr && need > 0) {
+                                    const size_t rows = std::max<size_t>(1, (64u << 20) / ((size_t) N * 2));
+                                    void* fp = nullptr;
+                                    if (cudaMalloc(&fp, rows * (size_t) N * 2) == cudaSuccess) {
+                                        m.row16_dma = (uint16_t*) fp;
+                                        m.row16_dma_rows = rows;
+                                        m.owned.push_back(fp);
+                                    }
+                                }
+                                if (pf_peer_dma_read() && m.row16_dma != nullptr) {
+                                    for (size_t o = 0; o < need; o += m.row16_dma_rows) {
+                                        const size_t n = std::min(m.row16_dma_rows, need - o);
+                                        cudaMemcpyAsync(m.row16_dma, P->host_rows16 + o, n * 2, cudaMemcpyHostToDevice, m.cs);
+                                        f16_to_f32_wide(m.Dm + (size_t) P->back_at * N + o, m.row16_dma, n, m.cs);
+                                    }
+                                    continue;
+                                }
                                 f16_to_f32_wide(m.Dm + (size_t) P->back_at * N, P->host_rows16, P->back_rows * N, m.cs);
+                            }
                             else if (!P->p2p && !P->sums)
                                 copy_f32_wide(m.Dm + (size_t) P->back_at * N, P->host_rows, P->back_rows * N, m.cs);
                         }
+                        // STRATA_PREFILL_TIMING: the gap to this mark is the peers' rows' read (the mapped host
+                        // memory over PCIe and the FP32 write); the gap before it is the wait for the peers.
+                        pt.mark(kPfCombineRead, cs);
                     }
                     // the sums mode (one weighted sum per token back) is the one peer tier's: several helper caches
                     // use the rows mode, where every slot's row is in Dm and the plain combine covers them all
@@ -6295,10 +6738,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     std::snprintf(b, sizeof b, " %s %.0f", kPeNames[i], t.ms[i]);
                     pl += b;
                 }
+                char fb[128] = "";
+                if (P->i8x_bytes > 0 && t.ms[kPeMoeIn] > 0.0)
+                    std::snprintf(fb, sizeof fb, "; i8 activations %lld MB over its link at ~%.2f GB/s effective feed",
+                                  (long long) (P->i8x_bytes / 1000000), (double) P->i8x_bytes / 1e9 / (t.ms[kPeMoeIn] / 1000.0));
                 std::fprintf(stderr, "strata prefill timing (peer GPU %d, ms):%s; MoE layers %lld, rows/layer %.0f of %lld cap, experts/layer %.0f, "
-                                     "over the cap %lld\n", P->dev, pl.c_str(), (long long) P->layers,
+                                     "over the cap %lld%s\n", P->dev, pl.c_str(), (long long) P->layers,
                              P->layers ? (double) P->rows / P->layers : 0.0, (long long) P->cap_rows,
-                             P->layers ? (double) P->experts / P->layers : 0.0, (long long) P->over_cap);
+                             P->layers ? (double) P->experts / P->layers : 0.0, (long long) P->over_cap, fb);
+                // STRATA_PF_PEER_I8_SHARED: say which side of the shared copy this line's MB counts.  The A/B reads
+                // the P100 side's D2H total off the owner's line (the shared copy is 1x it, the baseline is 3x);
+                // a reader's line is its own PCIe reads of the shared host bytes.
+                if (i8_shared_on() && P->i8_sh != nullptr)
+                    std::fprintf(stderr, "strata prefill timing: peer GPU %d: i8 activations = %s\n", P->dev,
+                                 P->i8_owner == P ? "the single D2H into the shared buffer (P100 side)"
+                                                  : "its reads of the shared host buffer (this link)");
                 if (P->ps_frac > 0.0)
                     std::fprintf(stderr, "strata prefill timing: peer-streamed experts %lld (%.0f per MoE layer)\n",
                                  (long long) P->ps_experts, P->layers ? (double) P->ps_experts / P->layers : 0.0);
