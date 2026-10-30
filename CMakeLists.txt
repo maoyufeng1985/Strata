@@ -2407,6 +2407,13 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME prefill_mmq_kquant_test COMMAND prefill_mmq_kquant_test)
       # the K-quant MMQ is opt-in at run time (STRATA_MMQ_KQ=1), and on CUDA it is strata_kq next to the test
       set_tests_properties(prefill_mmq_kquant_test PROPERTIES TIMEOUT 120 ENVIRONMENT STRATA_MMQ_KQ=1)
+      # the host-decidable core of the K-quant DSO's J probe (STRATA_MMQ_KQ_J_PROBE): the bucket boundaries, candidate
+      # sets, KQ_J override precedence and cache-hit semantics against the seam src/prefill/mmq_kq_probe.hpp - no GPU
+      add_executable(mmq_kq_probe_test tests/cuda/mmq_kq_probe_test.cpp)
+      target_include_directories(mmq_kq_probe_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+      target_link_libraries(mmq_kq_probe_test PRIVATE ggml-base)
+      add_test(NAME mmq_kq_probe_test COMMAND mmq_kq_probe_test)
+      set_tests_properties(mmq_kq_probe_test PROPERTIES TIMEOUT 120)
     endif()
     # the NVFP4 expert products (w4a8 / w4a4, STRATA_PREFILL_NVFP4) against a double-precision reference
     add_executable(mmq_nvfp4_parity src/prefill/mmq_nvfp4_parity.cpp)
