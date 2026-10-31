@@ -32,11 +32,16 @@ continues the layer. Each layer waits for all helpers.
 | `--expert-cache-device1 N\|auto` | Fill CUDA1 with N experts, or as many as fit. |
 | `--expert-cache-device2 N\|auto` | Fill CUDA2 with more experts. |
 | `--expert-cache-device3 N\|auto` | Fill CUDA3 with more experts. |
-| `--expert-cache-remote-placement stripe\|layer` | `stripe` (default) spreads the ranked expert list over the helpers. `layer` gives each layer to one helper (layer number modulo the number of cards), which can reduce device switches on USB4 but may be slower. |
+| `--expert-cache-remote-placement stripe\|layer\|expert` | `stripe` (default) spreads the ranked expert list over the helpers. `layer` gives each layer to one helper (layer number modulo the number of cards), which can reduce device switches on USB4 but may be slower. `expert` is the q36 row split: the helper at position k among the enabled ones takes the experts whose id is k modulo the number of helpers, of every layer. |
 
 The shipped profile ranks 8,000 `(layer, expert)` pairs. CUDA0 takes its usual `--expert-cache auto` share. With only CUDA1 it
 takes the first remaining pairs. With CUDA2 or CUDA3 the remaining ranked pairs go round robin to the helpers, then all other
 pairs in expert-then-layer order, so the extra VRAM fills even though unranked experts may rarely be routed.
+
+`expert` (the q36 row split) ignores that ranking: it gives each helper a fixed slice of the expert ids, of every layer,
+so a helper that runs out of VRAM keeps a thin but uniform slice of every layer. `stripe` gives each helper the same
+mixture of hot and cold experts; `expert` gives each helper a slice of the ids, whose hot and cold experts are wherever
+the model happens to have put them.
 
 `auto` fills each helper from its assigned ranking using actual aligned expert bytes and free VRAM, keeping the 512 MiB allowance.
 It sizes capacity at startup, not throughput, and a card's truncated tail is not moved to another card. Explicit numbers still work.

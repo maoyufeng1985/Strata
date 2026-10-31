@@ -1217,8 +1217,10 @@ void usage() {
                  "  --expert-cache-device2 N|auto  fill CUDA2 with more experts\n"
                  "  --expert-cache-device3 N|auto  fill CUDA3 with more experts\n"
                  "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
-                 "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
-                 "                       layers across CUDA1..3 (default: stripe)\n"
+                 "  --expert-cache-remote-placement stripe|layer|expert\n"
+                 "                       distribute the expert ranks (stripe), whole layers (layer) or every\n"
+                 "                       n-th expert of every layer (expert, the q36 row split) across\n"
+                 "                       CUDA1..3 (default: stripe)\n"
                  "  --peer-device N      a second GPU as an adaptive expert-cache tier (rows over P2P; it also\n"
                  "                       computes its experts' prompt rows).  Not with --layer-split or\n"
                  "                       --expert-cache-device1..3.  Default output unchanged without it.\n"
@@ -4358,8 +4360,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
     }
-    if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
-        std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
+    if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer" &&
+        o.expert_cache_remote_placement != "expert") {
+        std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe, layer or expert\n");
         return 2;
     }
     if (o.remote_expert_opt && !o.serve) {
@@ -8446,34 +8449,64 @@ int main(int argc, char** argv) {
             // secondary GPU to reduce switches and transfers over shared USB4.
             std::vector<uint8_t> assigned((size_t) g.n_layers * (size_t) g.n_expert, 0);
             const int devices = 1 + (o.expert_cache_remote[1] > 0) + (o.expert_cache_remote[2] > 0);
-            int next = 0;
-            for (const auto& pair : ranked) {
-                if (pair.first < 0 || pair.first >= g.n_layers || pair.second < 0 || pair.second >= g.n_expert ||
-                    xcache.slot_of(pair.first, pair.second) >= 0) continue;
-                const size_t index = (size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second;
-                if (assigned[index]) continue;
-                int target = -1;
-                if (o.expert_cache_remote_placement == "layer") {
-                    target = pair.first % devices;
-                    // Other layers' owners may still have room: keep scanning ranks.
-                    if (by_device[(size_t) target].size() >=
-                        (size_t) o.expert_cache_remote[(size_t) target]) continue;
-                } else {
-                    for (int i = 0; i < devices; ++i) {
-                        const int r = (next + i) % devices;
-                        if (by_device[(size_t) r].size() < (size_t) o.expert_cache_remote[(size_t) r]) {
-                            target = r;
-                            break;
+            if (o.expert_cache_remote_placement == "expert") {
+                // THE Q36 ROW SPLIT - the q36 engine's STRATA_Q36_HELPER_PARALLEL=1, ported here
+                // (q36_engine.cu:8006-8103).  Every helper takes a balanced share of EVERY layer's
+                // experts: the helper at position k among the enabled ones takes the experts whose id
+                // is k (mod n).  The list walks EXPERTS in the outer loop and layers in the inner one,
+                // so a helper that runs out of room keeps a thin but uniform slice of every layer
+                // instead of a full set of the first few layers and none of the rest.  Round-robin
+                // over the RANKED list (the 'stripe' mode below) is a different split: it gives each
+                // helper the same mixture of hot and cold experts, this one gives each helper a
+                // fixed slice of the expert ids.
+                // RemoteExperts::open sorts the pairs it takes by layer, so a layer's slots stay
+                // consecutive - the addressing the MMQ needs (remote_experts.cpp:284-297).
+                std::vector<int> enabled;
+                for (int r = 0; r < 3; ++r)
+                    if (o.expert_cache_remote[(size_t) r] > 0) enabled.push_back(r);
+                const int n = (int) enabled.size();
+                for (int k = 0; k < n; ++k) {
+                    const int r = enabled[(size_t) k];
+                    for (int64_t e = k; e < g.n_expert; e += n) {
+                        for (int64_t l = 0; l < g.n_layers; ++l) {
+                            if (xcache.slot_of(l, e) >= 0) continue;   // the primary holds it
+                            by_device[(size_t) r].emplace_back((int32_t) l, (int32_t) e);
                         }
                     }
-                    if (target < 0) break;
                 }
-                assigned[index] = 1;
-                by_device[(size_t) target].push_back(pair);
-                next = (target + 1) % devices;
+                std::fprintf(stderr, "strata generate: remote ranks split by expert id across %d CUDA devices "
+                                     "(the Q36 row split: the helper at position k takes the experts with id k mod %d)\n",
+                             n, n);
+            } else {
+                int next = 0;
+                for (const auto& pair : ranked) {
+                    if (pair.first < 0 || pair.first >= g.n_layers || pair.second < 0 || pair.second >= g.n_expert ||
+                        xcache.slot_of(pair.first, pair.second) >= 0) continue;
+                    const size_t index = (size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second;
+                    if (assigned[index]) continue;
+                    int target = -1;
+                    if (o.expert_cache_remote_placement == "layer") {
+                        target = pair.first % devices;
+                        // Other layers' owners may still have room: keep scanning ranks.
+                        if (by_device[(size_t) target].size() >=
+                            (size_t) o.expert_cache_remote[(size_t) target]) continue;
+                    } else {
+                        for (int i = 0; i < devices; ++i) {
+                            const int r = (next + i) % devices;
+                            if (by_device[(size_t) r].size() < (size_t) o.expert_cache_remote[(size_t) r]) {
+                                target = r;
+                                break;
+                            }
+                        }
+                        if (target < 0) break;
+                    }
+                    assigned[index] = 1;
+                    by_device[(size_t) target].push_back(pair);
+                    next = (target + 1) % devices;
+                }
+                std::fprintf(stderr, "strata generate: remote ranks %s across %d CUDA devices\n",
+                             o.expert_cache_remote_placement == "layer" ? "grouped by layer" : "striped", devices);
             }
-            std::fprintf(stderr, "strata generate: remote ranks %s across %d CUDA devices\n",
-                         o.expert_cache_remote_placement == "layer" ? "grouped by layer" : "striped", devices);
         } else {
             by_device[0] = std::move(ranked);
         }
