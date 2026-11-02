@@ -65,6 +65,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     for (cudaEvent_t e : ev_ctx_) if (e) cudaEventDestroy(e);
     if (ev_a_) cudaEventDestroy(ev_a_);
     if (ev_b_) cudaEventDestroy(ev_b_);
+    if (ev_self_) cudaEventDestroy(ev_self_);
 }
 
 // STRATA_DF2_PROFILE=1 (measurement only): the round runs without its graph and an event follows every stage; the per-stage averages print at exit
@@ -317,6 +318,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
     cudaMemset(xqc_, 0, tap_n * 8 + 4096);
     cudaMemset(xdc_, 0, (tap_n / 32 * 8 + 64) * 4);
     for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); cudaMemset(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); }
+    if (cudaEventCreateWithFlags(&ev_self_, cudaEventDisableTiming) != cudaSuccess) { err = "dflash2: events"; return false; }
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
@@ -1018,7 +1020,17 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
         kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
         log_stage(pos0 + r0, m);
         if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) return false;
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+        // The chunk's ring rows are consumed by the drafter's own block, so the chunk still gates itself: `record_context`
+        // on `cs_` is sequential on that stream, and the next chunk's kernel is ordered after this one.  Nothing moves
+        // between chunks host-side, so the blocking whole-card sync is dropped; what it published - the chunk's
+        // completion for any other stream that waits on it - is recorded on `ev_self_` instead, the same per-slot
+        // record shape the helpers use in remote_experts.cpp.
+        if (cudaEventRecord(ev_self_, cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+        // the debug log copies the chunk's mapped rows to host memory: only a sync makes them complete
+        if (log_on_ && cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
         log_flush();
     }
     have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
@@ -1106,7 +1118,14 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
     const int n_new = launch_n_;
     const int64_t pos0 = launch_pos0_, s = pos0 + n_new;
     const Clock::time_point t0 = launch_t0_;
-    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    // The round's own result is a host readback of `h_out_` (the 7 drafts and probabilities) below, so the round
+    // still has to see the graph finish on `cs_` before it leaves - that dependency is real and stays.  It is
+    // expressed as an event on `cs_` (record, then wait on the event) rather than a whole-card
+    // `cudaStreamSynchronize`: `ev_self_` is the same per-slot completion the helper expert caches publish
+    // (remote_experts.cpp, ev_done), so on a P100 primary the P104 helpers' in-flight expert windows no longer
+    // serialise behind the drafter's readback.
+    if (cudaEventRecord(ev_self_, cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    if (cudaEventSynchronize(ev_self_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     log_flush();
     for (int i = 0; i < kDrafts; ++i) {
         const bool made = i < ndraft_;

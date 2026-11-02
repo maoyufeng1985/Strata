@@ -8450,6 +8450,11 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> assigned((size_t) g.n_layers * (size_t) g.n_expert, 0);
             const int devices = 1 + (o.expert_cache_remote[1] > 0) + (o.expert_cache_remote[2] > 0);
             if (o.expert_cache_remote_placement == "expert") {
+                // STRATA_PEER_DEDUP: 1 lets the helper keep an expert the primary also holds.
+                static const bool allow_dedup = [] {
+                    const char* v = std::getenv("STRATA_PEER_DEDUP");
+                    return v && v[0] == '1' && v[1] == '\0';
+                }();
                 // THE Q36 ROW SPLIT - the q36 engine's STRATA_Q36_HELPER_PARALLEL=1, ported here
                 // (q36_engine.cu:8006-8103).  Every helper takes a balanced share of EVERY layer's
                 // experts: the helper at position k among the enabled ones takes the experts whose id
@@ -8469,7 +8474,7 @@ int main(int argc, char** argv) {
                     const int r = enabled[(size_t) k];
                     for (int64_t e = k; e < g.n_expert; e += n) {
                         for (int64_t l = 0; l < g.n_layers; ++l) {
-                            if (xcache.slot_of(l, e) >= 0) continue;   // the primary holds it
+                            if (xcache.slot_of(l, e) >= 0 && !allow_dedup) continue;   // the primary holds it
                             by_device[(size_t) r].emplace_back((int32_t) l, (int32_t) e);
                         }
                     }
@@ -8477,6 +8482,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: remote ranks split by expert id across %d CUDA devices "
                                      "(the Q36 row split: the helper at position k takes the experts with id k mod %d)\n",
                              n, n);
+                if (allow_dedup)
+                    std::fprintf(stderr, "strata generate: STRATA_PEER_DEDUP=1: the helpers keep experts the primary also holds\n");
             } else {
                 int next = 0;
                 for (const auto& pair : ranked) {

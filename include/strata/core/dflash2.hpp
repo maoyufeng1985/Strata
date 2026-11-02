@@ -277,6 +277,7 @@ private:
     int32_t epoch_ = 0;             ///< stamped into the ring tags: a new epoch makes every older slot invalid
     int64_t* tag_ = nullptr;        ///< per ring slot: (epoch << 32 | position) of the row it holds, -1 none
     cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr;
+    cudaEvent_t ev_self_ = nullptr;   ///< completion of the last context chunk / draft round, recorded on `cs_`
     bool timing_ = false;
     bool launched_ = false;         ///< draft_launch ran, draft_finish has not
     int launch_n_ = 0;
