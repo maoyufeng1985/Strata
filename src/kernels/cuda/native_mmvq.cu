@@ -2588,6 +2588,7 @@ std::unordered_map<const void*, Q8Packed>& q8_packed_registry() {
     return registry;
 }
 
+
 template<int NCOLS>
 void q8_packed_launch(const Q8Packed& w, const Q81Block* x, float* y, cudaStream_t s) {
     const bool persist = w.n_in <= Q8P_PERSIST_MAX_IN;
@@ -2814,6 +2815,7 @@ bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
     launch_check();
     return true;
 }
+
 } // namespace
 
 bool native_q8_0_packed_enabled() {
@@ -2837,6 +2839,22 @@ std::unordered_map<const void*, void*>& q8_sm60_owned() {
 }
 bool q8_sm60_pack_impl(const void* weights, int n_in, int n_out, const char* what, bool quiet);
 } // namespace
+
+// STRATA_GDN_PACKED_GEMV: the packed-Q8_0 planes of a native Q8_0 dense matrix (int8 codes + fp16 scales),
+// resolved from the registry the packed GEMV reads.  False where the packed path is off, the matrix is not
+// Q8_0, or it was never registered - the caller keeps its own GEMV.  External linkage: verify.cpp (the
+// strata_engine target) calls it across the target boundary.
+bool q8_packed_planes_of(const void* gguf_weight, int n_in, int n_out, const int8_t** qs, const void** d) {
+    *qs = nullptr;
+    *d = nullptr;
+    if (!native_q8_0_packed_enabled() || !gguf_weight || n_in <= 0 || n_out <= 0 || n_in % 32 != 0) return false;
+    const auto found = q8_packed_registry().find(gguf_weight);
+    if (found == q8_packed_registry().end() || found->second.n_in != n_in || found->second.n_out != n_out)
+        return false;
+    *qs = found->second.qs;
+    *d = found->second.d;
+    return true;
+}
 
 bool native_q8_0_sm60_pack(const void* weights, int n_in, int n_out, const char* what) {
     return q8_sm60_pack_impl(weights, n_in, n_out, what, false);
@@ -3112,8 +3130,13 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
     launch_check();
 }
 
+// STRATA_HEAD_PACKED=1: the packed-Q5_K head GEMV (defined below, after the Q5Packed registry).
+bool q5_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                    void* stream);
+
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
+    if (q5_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_HEAD_PACKED=1 heads
     validate_shape(n_in, ncols, QK);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -3151,6 +3174,196 @@ void native_q5_k_f32(const void* weights, const float* x, void* scratch_q8_1,
     validate_stream(stream);
     native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
     native_q5_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+// ============================ STRATA_HEAD_PACKED=1: the packed Q5_K output-head GEMV (opt-in) ============================
+//
+// The Q5_K output head's decode GEMV streams 417 MB of GGUF blocks block-by-block, capping a GP100 at ~187 GB/s
+// of its 730 GB/s (STRATA_DECODE_TIMING: the head stage, 2.23 ms/token).  The packed copy holds the same bytes as
+// four 256-byte-aligned planes - ql (128 B), qh (32 B), scales (12 B), dm (4 B) per 256-element block - so every
+// weight load is aligned.  A persistent workgroup grid-strides the rows; thread t takes 256-block t/16 (stride 8,
+// the exact one-column kernel's) and fragment iqs = 2*(t%16) (the exact kernel's kqs), so the per-block sums
+// accumulate in the exact kernel's order: every output is bitwise the one-column kernel's.  The default launch
+// stays the plain GGUF kernel; only when registered (STRATA_HEAD_PACKED=1, native_q5_k_pack at head load) does
+// native_q5_k_mmvq take over.  The packed kernel reads only the q8_1 copy the caller already has.
+namespace {
+
+struct Q5Packed { void* base; const int* ql; const int* qh; const uint16_t* sc; const int* dm; int n_in, n_out; };
+std::unordered_map<const void*, Q5Packed>& q5_packed_registry() {
+    static std::unordered_map<const void*, Q5Packed> registry;
+    return registry;
+}
+
+int q5p_grid() {
+    static const int grid = [] {
+        const char* v = std::getenv("STRATA_Q5P_GRID");
+        const int g = v ? std::atoi(v) : 0;
+        return g > 0 ? g : 640;
+    }();
+    return grid;
+}
+
+template<int NCOLS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_q5_k_packed_kernel(const int* __restrict__ ql, const int* __restrict__ qh,
+                                          const uint16_t* __restrict__ sc, const int* __restrict__ dm,
+                                          const Q81Block* __restrict__ x, float* __restrict__ y,
+                                          int n_in, int n_out, int row_step) {
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int nb = n_in / 256;
+    const int iqs = 2 * (tid % 16);
+    const int q8s2 = (iqs / 2) % 4;
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int jm = (bq8_offset / 2) & 1;
+    __shared__ float partials[2][WARPS - 1][NCOLS][WARP];
+    int buf = 0;
+    for (int row = int(blockIdx.x); row < n_out; row += row_step, buf ^= 1) {
+        float tmp[NCOLS] = {};
+        for (int kbx = tid / 16; kbx < nb; kbx += 8) {
+            const std::size_t wblk = std::size_t(row) * nb + kbx;
+            // ql plane: 32 int32s per block; in-block byte off 16*bq8_offset+4*q8s2 -> int32 off 4*bq8_offset+q8s2
+            const int ql_off = wblk * 32 + 4 * bq8_offset + q8s2;
+            // qh plane: 8 int32s per block; in-block byte off 4*q8s2 -> int32 off q8s2
+            const int vh_off = wblk * 8 + q8s2;
+            const int vl0 = STRATA_Q8P_LOAD(ql + ql_off);
+            const int vl1 = STRATA_Q8P_LOAD(ql + ql_off + 4);
+            const int vh0 = STRATA_Q8P_LOAD(qh + vh_off) >> bq8_offset;
+            const int vh1 = STRATA_Q8P_LOAD(qh + vh_off + 4) >> bq8_offset;
+            const int w4[4] = {vl0, vl1, vh0, vh1};
+            // sc plane: 6 uint16s per block; the exact kernel's scales[jm] reads a single uint16_t
+            const uint16_t* scp = sc + wblk * 6 + jm;
+            const uint32_t s0 = scp[0], s2 = scp[2], s4 = scp[4];
+            const uint32_t hi = uint32_t(-int32_t(bq8_offset / 2 >= 2));
+            const uint16_t aux0 = uint16_t(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+            const uint16_t aux1 = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+            const half2 dm5 = *reinterpret_cast<const half2*>(dm + wblk);
+            const uint8_t auxb[4] = {uint8_t(aux0), uint8_t(aux0 >> 8), uint8_t(aux1), uint8_t(aux1 >> 8)};
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                float d8[2];
+                int u[4];
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const Q81Block* xb = x + std::size_t(j) * (nb * 8) + kbx * 8 + bq8_offset + i;
+                    const int* q8 = reinterpret_cast<const int*>(xb->qs) + q8s2;
+                    u[2 * i] = q8[0];
+                    u[2 * i + 1] = q8[4];
+                    d8[i] = __low2float(xb->ds);
+                }
+                tmp[j] += q5_q8_dot_impl(&w4[0], &w4[2], u, auxb, auxb + 2, dm5, d8);
+            }
+        }
+        if (threadIdx.y > 0)
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) partials[buf][threadIdx.y - 1][j][threadIdx.x] = tmp[j];
+        __syncthreads();
+        if (threadIdx.y == 0) {
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                float sum = tmp[j];
+#pragma unroll
+                for (int l = 0; l < WARPS - 1; ++l) sum += partials[buf][l][j][threadIdx.x];
+                sum = warp_sum(sum);
+                if (threadIdx.x == 0) y[std::size_t(j) * n_out + row] = sum;
+            }
+        }
+    }
+}
+
+template<int NCOLS>
+void q5_packed_launch(const Q5Packed& w, const Q81Block* x, float* y, cudaStream_t s) {
+    const int grid = (std::min)(w.n_out, q5p_grid());
+    native_q5_k_packed_kernel<NCOLS><<<grid, dim3(WARP, WARPS), 0, s>>>(w.ql, w.qh, w.sc, w.dm, x, y, w.n_in, w.n_out, grid);
+}
+
+}  // namespace
+
+bool q5_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                    void* stream) {
+    auto& registry = q5_packed_registry();
+    if (registry.empty()) return false;
+    const auto found = registry.find(weights);
+    if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out) return false;
+    if (ncols > 1 && !g_multi_exact) return false;
+    validate_shape(n_in, ncols, 256);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 1: q5_packed_launch<1>(found->second, x, y, s); break;
+        case 2: q5_packed_launch<2>(found->second, x, y, s); break;
+        case 3: q5_packed_launch<3>(found->second, x, y, s); break;
+        case 4: q5_packed_launch<4>(found->second, x, y, s); break;
+        case 5: q5_packed_launch<5>(found->second, x, y, s); break;
+        case 6: q5_packed_launch<6>(found->second, x, y, s); break;
+        case 7: q5_packed_launch<7>(found->second, x, y, s); break;
+        case 8: q5_packed_launch<8>(found->second, x, y, s); break;
+#if STRATA_VERIFY_MAX_T > 8
+        case 9: q5_packed_launch<9>(found->second, x, y, s); break;
+        case 10: q5_packed_launch<10>(found->second, x, y, s); break;
+        case 11: q5_packed_launch<11>(found->second, x, y, s); break;
+        case 12: q5_packed_launch<12>(found->second, x, y, s); break;
+        case 13: q5_packed_launch<13>(found->second, x, y, s); break;
+        case 14: q5_packed_launch<14>(found->second, x, y, s); break;
+        case 15: q5_packed_launch<15>(found->second, x, y, s); break;
+        case 16: q5_packed_launch<16>(found->second, x, y, s); break;
+#endif
+        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= MAX_NCOLS");
+    }
+    launch_check();
+    return true;
+}
+
+bool native_q5_k_packed_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_HEAD_PACKED");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
+bool native_q5_k_pack(const void* weights, int n_in, int n_out, const char* what) {
+    if (!weights || n_in <= 0 || n_in % 256 || n_in / 256 < WARPS * WARP / 32 || n_out < 2048) return false;
+    if (q5_packed_registry().count(weights)) return true;
+    const std::size_t nb = std::size_t(n_in / 256) * std::size_t(n_out);
+    const std::size_t bytes = nb * sizeof(Q5KBlock);
+    std::vector<Q5KBlock> host(nb);
+    if (cudaMemcpy(host.data(), weights, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); return false; }
+    // planes: ql (qs, 128 B) | qh (32 B) | sc (scales, 12 B) | dm (4 B), each 256-byte aligned
+    const std::size_t o_qh = (nb * 128 + 255) & ~std::size_t(255);
+    const std::size_t o_sc = (o_qh + nb * 32 + 255) & ~std::size_t(255);
+    const std::size_t o_dm = (o_sc + nb * 12 + 255) & ~std::size_t(255);
+    const std::size_t total = o_dm + nb * 4;
+    std::vector<uint8_t> packed(total, 0);
+    for (std::size_t b = 0; b < nb; ++b) {
+        std::memcpy(packed.data() + b * 128, host[b].qs, 128);
+        std::memcpy(packed.data() + o_qh + b * 32, host[b].qh, 32);
+        std::memcpy(packed.data() + o_sc + b * 12, host[b].scales, 12);
+        std::memcpy(packed.data() + o_dm + b * 4, &host[b].dm, 4);
+    }
+    void* dev = nullptr;
+    if (cudaMalloc(&dev, total) != cudaSuccess) { cudaGetLastError(); return false; }
+    if (cudaMemcpy(dev, packed.data(), total, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dev); cudaGetLastError(); return false;
+    }
+    auto* base = static_cast<uint8_t*>(dev);
+    q5_packed_registry()[weights] = Q5Packed{dev, reinterpret_cast<const int*>(base),
+                                             reinterpret_cast<const int*>(base + o_qh),
+                                             reinterpret_cast<const uint16_t*>(base + o_sc),
+                                             reinterpret_cast<const int*>(base + o_dm), n_in, n_out};
+    std::fprintf(stderr, "strata: STRATA_HEAD_PACKED=1 packed the %s (%d x %d, +%.1f MiB)\n", what, n_out, n_in,
+                 total / 1048576.0);
+    return true;
+}
+
+void native_q5_k_unpack(const void* weights) {
+    auto& registry = q5_packed_registry();
+    const auto found = registry.find(weights);
+    if (found == registry.end()) return;
+    cudaFree(found->second.base);
+    registry.erase(found);
 }
 
 namespace {

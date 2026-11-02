@@ -37,11 +37,16 @@ std::vector<uint8_t> weights(ggml_type t, int64_t rows, int64_t cols, int expert
     std::uniform_int_distribution<int> byte(0, 255);
     for (auto& b : w) b = (uint8_t) byte(rng);
     const size_t bs = ggml_type_size(t), nblk = (size_t) experts * per / bs;
+    const bool kq = t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1 || t == GGML_TYPE_Q6_K;
     for (size_t i = 0; i < nblk; ++i) {
         uint8_t* blk = w.data() + i * bs;
         if (t != GGML_TYPE_NVFP4) {                                   // Q8_0, IQ3_S, IQ4_NL: an f16 d leads the block
             const uint16_t d = 0x2000 + (uint16_t) byte(rng);         // f16 ~ 0.0078..0.016
             std::memcpy(blk, &d, 2);
+            if (kq) {                                                 // the K-quants lead with two f32 scales (dmin, d)
+                const float dmin = -0.25f, d = 0.25f;
+                std::memcpy(blk, &dmin, 4); std::memcpy(blk + 4, &d, 4);
+            }
         } else {                                                      // NVFP4: the scales lead the block
             const int nsc = (int) (bs - (size_t) ggml_blck_size(t) / 2);
             for (int s = 0; s < nsc; ++s) blk[s] = (uint8_t) (0x30 + byte(rng) % 16);   // e4m3 ~ 0.5..1
@@ -116,7 +121,9 @@ int main(int argc, char** argv) {
                           {"nvfp4 down", GGML_TYPE_NVFP4, 2560, 640},
                           {"q8_0 down", GGML_TYPE_Q8_0, 2560, 640},
                           {"iq3_s gate/up", GGML_TYPE_IQ3_S, 1280, 2560},
-                          {"iq4_nl down", GGML_TYPE_IQ4_NL, 2560, 640}};
+                          {"iq4_nl down", GGML_TYPE_IQ4_NL, 2560, 640},
+                          {"q4_k gate/up", GGML_TYPE_Q4_K, 1280, 2560},
+                          {"q4_k down", GGML_TYPE_Q4_K, 2560, 640}};
     std::mt19937 rng(7);
     for (int R : Rs)
         for (const Case& c : cases) {

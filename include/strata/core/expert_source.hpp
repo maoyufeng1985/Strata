@@ -684,6 +684,12 @@ void set_tail_skip_rank(int r);
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
 
+/// #578 STRATA_DECODE_POOL_OFFLOAD=1 only: wait for the pool offload worker's settle+drain of the previous
+/// layer's helper rows.  A no-op with the env unset or 0 (the default).  verify.cpp calls it before the
+/// remote-opt begin() clears a helper window and after the last layer's dispatch, so the host combine and the
+/// next window never race the worker's drain writing the current one.
+void expert_pool_offload_wait_done();
+
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about
 /// expert caches.  Returns immediately when there are no hits, which is every layer until the cache is warm.

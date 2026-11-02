@@ -676,6 +676,13 @@ private:
     float* h_tap_ = nullptr;     float* m_tap_ = nullptr;       ///< the mapped copy of tap_dev_
     std::FILE* tap_file_ = nullptr;
     void tap_write(int T, const int32_t* tokens, int64_t pos0);
+    // STRATA_TAP_FINAL_R (off by default): the MTP retrain hook. After the last layer's gr_write the window's
+    // residual (final_R, g_->hc * g_->n_embd floats per row) is copied device -> mapped buffer and appended to a
+    // file as (int32 pos, int32 token, hc*n_embd floats) records.
+    bool final_r_on_ = false;
+    float* h_final_r_ = nullptr;     float* m_final_r_ = nullptr;   ///< the mapped copy of the residual rows
+    std::FILE* final_r_file_ = nullptr;
+    void final_r_write(int T, const int32_t* tokens, int64_t pos0);
     uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()

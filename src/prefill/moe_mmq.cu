@@ -17,6 +17,106 @@
 #include <cstdlib>
 #include <cstring>
 
+// ------------------------------------------------------------------ STRATA_PF_PEER_I8 (the fused i8 -> q8_1)
+// The peer's INT8 activation route (the i8q transport kernels, moe_f16_kq_cuda.cu) dequantizes the
+// primary's per-row INT8 codes to FP32 (i8_rows_to_f32) and the MMQ then requantizes that FP32 to its
+// q8_1 activations (quantize_mmq_q8_1_cuda above): two global passes and a full FP32 buffer between.
+// The fused kernel below reads the INT8 codes + the row's FP32 scale and writes the q8_1 block in one
+// pass - no FP32 buffer - so the helper's DRAM traffic drops one FP32 write and one FP32 read (the
+// ~8 bytes per value) against the two-step route.
+//
+// It is bit-exact with the two-step route: the FP32 value it uses is (float)code * scale, exactly what
+// i8_rows_to_f32 stores, and every per-32-subblock scale/sum/code is the SAME FP32 expression as
+// quantize_mmq_q8_1<...> in quantize.cu (amax, d_inv = 127/amax, round(value*d_inv), d = 1/d_inv, the
+// D4/DS4/D2S6 layouts).  The test i8_to_q8_1_test.cu locks it byte-for-byte against the two-step.
+namespace strata::prefill::fused::i8q {
+
+template <mmq_q8_1_ds_layout ds_layout>
+__global__ void k_i8_rows_to_q8_1(const int8_t* __restrict__ codes, const float* __restrict__ scales,
+                                  const int32_t* __restrict__ ids, void* __restrict__ vy, int cols, int n_rows) {
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+    const int i0 = ((int) blockDim.x * (int) blockIdx.y + (int) threadIdx.x) * 4;   // a multiple of 4
+    const int r = (int) blockIdx.x;          // the compact q8_1 row (the block's destination row)
+    const int src = ids ? ids[r] : r;        // the source INT8 row (the i8 transport's row map)
+    const float sc = scales[src];
+    // four INT8 codes, one 32-bit load; the y-padded tail (i0 >= cols) is zero, as the FP32 route's
+    // quantize_mmq_q8_1 pads it (the MMQ's K-tile runs to pad512(cols), the pad contributing 0 to the GEMM)
+    const bool real = i0 < cols;
+    const int cw = real ? *(const int*) (codes + (int64_t) src * cols + i0) : 0;
+    const float v0 = real ? (float) (int8_t) (cw & 0xff) * sc : 0.0f;
+    const float v1 = real ? (float) (int8_t) ((cw >> 8) & 0xff) * sc : 0.0f;
+    const float v2 = real ? (float) (int8_t) ((cw >> 16) & 0xff) * sc : 0.0f;
+    const float v3 = real ? (float) (int8_t) ((cw >> 24) & 0xff) * sc : 0.0f;
+    float amax = fabsf(v0);
+    amax = fmaxf(amax, fabsf(v1));
+    amax = fmaxf(amax, fabsf(v2));
+    amax = fmaxf(amax, fabsf(v3));
+#pragma unroll
+    for (int offset = vals_per_scale / 8; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, offset, 32));
+    float sum = 0.0f;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = v0 + v1 + v2 + v3;
+#pragma unroll
+        for (int offset = vals_per_sum / 8; offset > 0; offset >>= 1)
+            sum += __shfl_xor_sync(0xFFFFFFFFu, sum, offset, 32);
+    }
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = (char) roundf(v0 * d_inv);
+    q.y = (char) roundf(v1 * d_inv);
+    q.z = (char) roundf(v2 * d_inv);
+    q.w = (char) roundf(v3 * d_inv);
+    const float d = 1.0f / d_inv;
+    // the q8_1 activations are planar (the column-major blocks, block_q8_1_mmq::qs transposed): the block
+    // (k_block, row) sits at y[k_block * n_rows + row], the same index quantize_mmq_q8_1 writes.
+    block_q8_1_mmq& blk = ((block_q8_1_mmq*) vy)[(int64_t) (i0 / QK8_1_MMQ) * n_rows + r];
+    const int iqs = i0 % QK8_1_MMQ;
+    ((char4*) blk.qs)[iqs / 4] = q;
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            blk.d2s6[2 + iqs / 16] = sum;
+            if (iqs % 64 == 0) blk.d2s6[iqs / 64] = d;
+        }
+    } else if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) blk.ds4[iqs / 32] = make_half2(d, sum);
+        else blk.d4[iqs / 32] = d;
+    }
+}
+
+// The launcher mirrors quantize_mmq_q8_1_cuda's grid (dim3(n_rows, block_num_y, 1), CUDA_QUANTIZE_BLOCK_SIZE_MMQ
+// threads, 4 values a thread) and its layout switch, so the output block is byte-identical to the two-step route.
+void i8_rows_to_q8_1(const int8_t* codes, const float* scales, const int32_t* ids, void* y, int cols, int n_rows,
+                     int type, cudaStream_t s) {
+    if (n_rows <= 0 || cols <= 0) return;
+    const int64_t n_pad = ((int64_t) cols + 511) & ~511;   // the MMQ's K-tile runs to pad512(cols)
+    const int64_t block_num_y = (n_pad + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(n_rows, (unsigned) block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    switch (mmq_get_q8_1_ds_layout((ggml_type) type)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            k_i8_rows_to_q8_1<MMQ_Q8_1_DS_LAYOUT_D4><<<num_blocks, block_size, 0, s>>>(codes, scales, ids, y, cols, n_rows);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            k_i8_rows_to_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4><<<num_blocks, block_size, 0, s>>>(codes, scales, ids, y, cols, n_rows);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            k_i8_rows_to_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6><<<num_blocks, block_size, 0, s>>>(codes, scales, ids, y, cols, n_rows);
+            break;
+        default:
+            std::fprintf(stderr, "prefill mmq i8->q8_1: the type's q8_1 layout is unknown\n");
+            std::exit(1);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "prefill mmq i8->q8_1: the launch failed: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+}  // namespace strata::prefill::fused::i8q
+
 namespace strata::prefill::mmq {
 namespace {
 // The Gyro trellis types (ids 144-146) are outside the type table of an upstream ggml (indexed by the id): their block

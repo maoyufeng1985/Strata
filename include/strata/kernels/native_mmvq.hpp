@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -105,6 +106,11 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 /// packed copy instead; every output is bitwise equal to the GGUF-layout kernels.
 bool native_q8_0_packed_enabled();
 bool native_q8_0_packed_eligible(int n_in, int n_out);
+/// STRATA_GDN_PACKED_GEMV (opt-in, CUDA only): the packed-Q8_0 planes of a native Q8_0 dense matrix, as
+/// q8_packed_registry in native_mmvq.cu lays them (the int8 codes followed by the fp16 scales); false where
+/// this build has no packed path, the matrix is not Q8_0, or it was never registered packed - the caller keeps
+/// its own GEMV.  The planes are the same bytes native_q8_0_mmvq's packed kernel reads.
+bool q8_packed_planes_of(const void* gguf_weight, int n_in, int n_out, const int8_t** qs, const void** d);
 void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out);
 void native_q8_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out);
 void native_q8_0_packed_unregister(const void* gguf_weights);
@@ -128,6 +134,14 @@ void native_q8_0_sm60_release(const void* weights);
 bool native_q6_k_packed_enabled();
 bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what);
 void native_q6_k_unpack(const void* weights);
+
+/// STRATA_HEAD_PACKED=1 (opt-in): a packed copy of a Q5_K matrix (the output head) - the same bytes as ql / qh /
+/// scales / dm planes - that native_q5_k_mmvq calls on `weights` read instead (bitwise equal outputs). The copy is
+/// owned here: native_q5_k_pack builds it from the device matrix (false: not eligible or failed; nothing changes),
+/// native_q5_k_unpack frees it.
+bool native_q5_k_packed_enabled();
+bool native_q5_k_pack(const void* weights, int n_in, int n_out, const char* what);
+void native_q5_k_unpack(const void* weights);
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream);

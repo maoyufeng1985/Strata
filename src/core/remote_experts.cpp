@@ -645,14 +645,59 @@ void RemoteExperts::drain_all() {
     for (int s = 0; s < rings_; ++s) (void) drain(s, err);
 }
 
+// #578 STRATA_DECODE_POOL_OFFLOAD=1: the stream settle of finish(), split out so the pool offload worker can
+// wait on a shared CUDA event recorded after begin() instead of this helper's own stream; ev == nullptr takes
+// the legacy settle (the rings==1 stream sync, byte-identical to what drain(0) does).
+bool RemoteExperts::settle(cudaEvent_t ev, std::string& err) {
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    if (ev != nullptr) {
+        scope.release();
+        return check(cudaEventSynchronize(ev), "settle", err, device_);
+    }
+    if (rings_ > 1) {
+        scope.release();
+        return check(cudaEventSynchronize(win_[0].ev_done_), "settle", err, device_);
+    }
+    // Spin on the stream like PeerExperts::finish instead of the blocking sync: the layer waits for this helper
+    // on the CPU pool's critical path, and a blocking sync's wake-up costs more than the helper's small batch
+    // takes - on HIP especially, where the CUDA branch's cudaInitDevice(ScheduleSpin) does not exist and the
+    // device keeps its default policy.  STRATA_REMOTE_SPIN=0 keeps the blocking sync (the same switch the CUDA
+    // branch reads).
+#if defined(STRATA_USE_HIP)
+    static const bool spin = [] {
+        const char* v = std::getenv("STRATA_REMOTE_SPIN");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    if (spin) {
+        cudaError_t e;
+        while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
+        }
+        if (!check(e, "settle", err, device_)) return false;
+    } else {
+        if (!check(cudaStreamSynchronize(stream_), "settle", err, device_)) return false;
+    }
+#else
+    if (!check(cudaStreamSynchronize(stream_), "settle", err, device_)) return false;
+#endif
+    return true;
+}
+
+/// #578 STRATA_DECODE_POOL_OFFLOAD=1: the host-side half of finish() - the drain of this layer's pinned rows
+/// (or the optimized-path accumulate) into `out`.  The stream is already settled by the caller.
+void RemoteExperts::drain_rows(float* out) {
+    Win& w = win_[0];
+    if (w.group_id_.empty()) return;
+    if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return; }
+    for (size_t i = 0; i < w.original_row_.size(); ++i)
+        std::memcpy(out + (size_t) w.original_row_[i] * n_embd_, w.h_out_ + i * n_embd_, (size_t) n_embd_ * sizeof(float));
+}
+
 bool RemoteExperts::finish(float* out, std::string& err) {
     // Legacy wrapper: drain slot 0, then host-scatter / remote_opt accumulate (rings==1 order identical).
     if (win_.empty() || win_[0].group_id_.empty()) return true;
     if (!drain(0, err)) return false;
-    Win& w = win_[0];
-    if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
-    for (size_t i = 0; i < w.original_row_.size(); ++i)
-        std::memcpy(out + (size_t) w.original_row_[i] * n_embd_, w.h_out_ + i * n_embd_, (size_t) n_embd_ * sizeof(float));
+    drain_rows(out);
     return true;
 }
 

@@ -53,6 +53,45 @@ free win, and it must be said that way.
 | `STRATA_ADAPT_NOWAIT` / `STRATA_ADAPT_LAG=2` alone | −0.1 % / +0.2 %, sign flips — they only matter inside the table |
 | `FUSE_DECODE`, `B6_MMVQ_ROWS`, `GR_UP75` (drop-one from the table) | all within 0.11 % of the table, signs disagree — dead weight on this box |
 
+### 2026-10-29 — the FP16 routed-expert path: the switch was ON and the path never ran
+
+The Q36 port (the fused FP16 K-quant routed experts, the primary **and** the helper cards) had been sitting behind a
+silent off-switch. `f16_peer_primary()` decided with
+
+```cpp
+int p = 0;
+cudaGetDevice(&p);
+if (cudaGetLastError() != cudaSuccess) return false;   // <- this line
+```
+
+`cudaGetLastError()` reports the **last error of any call**, not the one just made. The startup leaves errors behind
+(the PCIe probe and the peer-access probes try a thing and undo it), so this line read a *stale* error and turned the
+whole path off — silently. The first A/B (`F16AB0` vs `F16AB1`, binary `b6b211b45800`) showed **no phase change at
+all** and no `F16P_HIT` line, which is the signature of a path that was never entered rather than a path that was slow.
+
+The fix keeps the default path byte-identical (the switch is opt-in, `STRATA_PF_F16_PEER=1`): clear the slate first,
+let the verdict rest on this function's own calls, and print the verdict once.
+
+```
+strata: the fused FP16 K-quant prompt path is on (STRATA_PF_F16_PEER=1, 4 CUDA card(s) of Pascal or newer)
+```
+
+Two more defects found while fixing it, both mine to own:
+
+1. **No Q6_K down kernel.** `covers_down()` knew only Q4_K and Q5_K, so the 20 of Whittle's 40 layers whose down
+   projection is Q6_K could not take the path at all. `dequant_block_q6k()` (ggml's `ql`/`qh`/`scales`/`d` layout, the
+   `(code - 32) * scale` centring, the lane mapping) in `src/prefill/moe_f16_kq_cuda.cuh`, plus the dispatch in
+   `moe_f16_kq_cuda.cu`. **Not yet compiled on the box at the time of writing; the Q6_K half of the path is still
+   unmeasured.**
+2. **A false "non-finite" alarm.** `STRATA_DBG_NAN` reads `m.GU` and `m.H`, which the FP16 path does not write (the
+   kernel writes the H in its own layout and the down writes `Dm` directly). A clean run reported `non-finite GU 4293
+   H 23546 Dm 0` — the `Dm 0` and the clean final residual were the truth. The check now skips the two buffers on the
+   FP16 path.
+
+**And a performance defect of my own making, in the new path:** the FP16 path's H buffer was freed and re-allocated
+whenever a group needed more rows. `cudaMalloc` and `cudaFree` both synchronise the device, so every group drained the
+whole pipeline. The buffer now grows geometrically (a handful of re-allocations per process, not per group).
+
 ### 2026-10-29 — the line-by-line audit, re-triaged by provenance
 
 The read-only source audit (8 module agents + synthesizer, 44 candidate points) is re-triaged here because
@@ -1171,4 +1210,223 @@ noise: `F16=0` 34,586 ms (115.6 tok/s) against `F16=1` 40,707 ms (98.2 tok/s), t
 promise was the path not running at all, and the honest number is 2.9× slower. The fix is still worth
 keeping — the path is correct now, it is observable, and the switch tells the truth — but the default stays
 as it is, and the box's best prefill remains the MMQ with `PEER_COMPRESS` and `DENSE_F16_ACC` on it.
+
+### 2026-10-29 (evening) — the FP16 path completed (Q6_K down), re-measured, and a new read-back route measured and rejected
+
+The FP16 path is now **complete and running end to end on all 40 layers** (the earlier entry's binary predates
+the Q6_K down kernel: Whittle's 20 layers whose down projection is Q6_K could not take the path at all, so
+the 2.9× was the Q4_K/Q5_K half only). This session: the Q6_K `dequant_block` (ggml's `ql`/`qh`/`scales`/`d`
+layout, the `(code − 32)·scale` centre, the lane's two value sets from `ql[l]` and `ql[l+32]`), the
+`STRATA_DBG_NAN` false alarm fixed (the FP16 path does not write `m.GU`/`m.H`), and the H buffer's
+per-group free-and-realloc (a device drain every time) grown geometrically.
+
+| 30k prompt, cold, same binary `2a00257c`, one process per arm | wall | tok/s |
+|---|---:|---:|
+| MMQ (the default) | 48.8 s | **614** |
+| FP16 + `STRATA_PF_PEER_DMA` | 217.8 s | 138 |
+| FP16 primary + DP4A helper (`STRATA_PF_F16_PEER=1 STRATA_PF_F16_HELPER=dp4a`) | **48.3 s** | **621** |
+| FP16 (the 4k pair, MMQ vs FP16) | 36.7 s / 48.0 s | 109 / 83 |
+
+The FP16 loss re-measured at **4.4× on the 30k** (the helper cards' fused FP16 GEMM ~17× their MMQ GEMM:
+no FP16 tensor cores on Pascal). **Numerical check, the 2000-token prompt, 64 decode tokens, seed 0:**
+the two paths agree on the first **43 tokens and then diverge** — the expected FP16-accumulation /
+int8-activation difference, not a fault (no non-finite, no IMA, `rc=0` both arms). The path is correct;
+it is simply the wrong one for a Pascal fleet.
+
+**The per-card split the user asked for: `STRATA_PF_F16_HELPER=dp4a` (the primary on FP16, the helpers on
+the integer DP4A/MMQ kernels), binary `2a199aa6`.** It removes the helper FP16 GEMM penalty exactly as
+designed: the helpers' `moe gemm` falls from the all-FP16 arm's 122,925–142,587 ms back to the MMQ arm's
+6,734–8,067 ms (per card, 80 layer iterations), and the 30k cold wall returns to **48.3 s = 621 tok/s,
+within noise of the all-MMQ 48.8 s = 614** (the primary's FP16 GEMMs cost its MMQ GEMMs on the P100, as
+the phase timings said they would). On this Pascal fleet the split is therefore speed-neutral against the
+MMQ configuration — it matters on a tensor-core fleet, where the primary's FP16 GEMMs win and the split
+is the strictly better shape. Numerically, the split arm's 64-token stream (the 2000-token prompt, seed 0)
+matches the MMQ arm's first **43 tokens and then diverges, the same 43-token prefix the all-FP16 arm
+produced**: the divergence is the primary's FP16 GEMM, not the helpers'. No non-finite, no IMA, `rc=0`.
+
+**The new `STRATA_PF_PEER_DMA` read-back route, measured and rejected.** Idea: the primary's combine
+reads the helper's FP16 rows back through the P100's copy engine (an H2D of the pinned buffer, then the
+fp16→fp32 conversion on the P100's VRAM) instead of the zero-copy kernel read of the mapped memory.
+Measured: **52.8 s vs 48.8 s for the default zero-copy read** — the H2D adds a second pass over the
+same bytes and loses. The zero-copy kernel read was already running near the P100's link speed. Kept
+behind its opt-in switch (default off, the default path byte-identical) and recorded here as a measured
+loss so it is not tried again.
+
+**The box's settled prefill number, same binary, one process:** 30k prompt, first batch **48.8 s = 614
+tok/s** (cold, the expert weights not yet page-cached: the batch reads 34 GB of expert bytes), the next
+two batches **22.4–22.6 s = 1335 tok/s** (warm, 8.6 GB read). The ~26 s gap is the first-touch of the
+expert weights over the P104s' Gen1 x4 links (~0.8 GB/s measured: 67 MB of activations per helper's
+layer crosses in 83 ms) plus the P100's own dense work (its BF16 GEMMs run through FP32 on Pascal,
+already at the card's measured ~1–12 TFLOPS). The 1000 tok/s cold target is **not reachable on this
+hardware**; the warm prefill clears it (1335). A Gen3 x16 helper link is the hardware that would move
+the cold number.
+
+**The lever that did move it: `STRATA_PF_PEER_I8=1` (per-row INT8 over the helper links), final binary
+`5346c1e53091`. 30k cold 48.62 s → 36.29–36.43 s = 824–827 tok/s (+33.5 %), four consecutive runs
+clean.** The MMQ host route carried the activations to the helpers as FP32 (67 MB a layer), so per-row
+INT8 — one 8-bit code and one FP32 scale a row, the amax/127 grid (max error amax/254 = 0.394 % of the
+row's peak, ~0.228 % rms) — quarters that and halves the return route's rows to N+4 bytes. The timeline
+shows where the time came from: `combine` (waiting for the helpers over the links) 17,196 ms → 3,005 ms,
+while the P100's own GEMMs grew (gate/up 5,412 → 7,348, down 2,819 → 3,783) because the cards hand its
+compute back sooner. The combined arm (`STRATA_PF_F16_PEER=1` + `STRATA_PF_F16_HELPER=dp4a` + i8) came in
+at 38.5 s = 778 tok/s, no better.
+
+**Three defects had to be fixed before this number meant anything — an independent review found them
+(three verifier passes; all three returned FAIL on the first version):**
+
+- the FP16-source quantizer read eight halves out of a `uint64_t` (which holds four) with a `cols / 2`
+  row stride, and its second warp reduction used a `0x7f` mask that dropped warp 7's amax. The FP16
+  source is what a remote helper cache selects by default, so this was the live path: the configuration
+  whose 37.6 s had been reported was quantizing the wrong memory;
+- the primary's combine read the returned rows at `host_i8r + back_at * N`, but the helpers write at
+  group-local offsets (their bounds are already relative to `rows_local`). That read an unwritten part of
+  the buffer — slower, and the source of an intermittent `illegal memory access` (1 run in 4). After the
+  fix: 4 of 4 clean, and 36.4 s instead of 37.0–37.2 s;
+- the three helpers shared one `i8_dev` activation stage and each quantized into it on its own
+  `x_stream`; the quantization now runs once a layer on the compute stream and each peer copies its own,
+  and an `ev_act` event keeps the primary from overwriting a peer's mapped activation buffer before that
+  peer has read it (its `ev_done` comes only after the GEMMs).
+
+Two claims from the first report are withdrawn: "four runs 37.3–37.6 s" (only two clean runs existed, and
+"805" was a mid-chunk line) and "byte-identical token streams" (the check grepped a line form this build
+does not print and compared two empty streams). The current numerical claim compares the real 312-byte
+`output` lines with the switch on and off, which match. A unit test for the three kernels is in
+`tests/cuda/prefill_peer_i8q_test.cu`.
+
+**The remaining gap to 1000 tok/s (30 s) — and a correction to the earlier claim.** An earlier version of
+this note said the P100's "own dense path alone is ~31 s, therefore ~970 tok/s is the ceiling". That was a
+classification error: it counted the expert GEMMs (11,135 ms, which are mobile MoE work that the helpers
+could take) as dense (immobile) work. Three verifier passes rejected it. What holds: making the helper
+return free leaves ~34.5 s (~870 tok/s); the three P104s are idle ~62 % of the wall yet are slower per
+row than the P100 (~2.7 µs against ~2.2 µs), which is why the one measured attempt to move experts to
+them lost 0.8 s; and whether a large enough share, with the return route sized for it, lands under 30 s
+is **not established by any measurement here**. The honest statement is "not reached", not "impossible".
+
+**The search after i8, and why each item closed (all 30k cold, one arm each, 2026-10-29 evening):**
+the user's own suggestion (fewer experts on the primary, the rest on the three helpers) runs the
+wrong way — 3834 primary experts is 38.4 s (782 tok/s) against 4602's 37.6 s, because the rows the
+P100 gives up have to cross the P104s' Gen1 x4 links, which costs more than the local GEMMs it keeps;
+the other direction is flat (5104 = 37.6 s, 5223 = 37.7 s), so the P100 is compute-bound, not
+expert-starved. Putting the prompt's KV in the P100's leftover VRAM is a wash (int8 + `--kv-resident
+32768` = 37.5 s, `k8v4` = 37.9 s): after i8 the links are no longer the limit, so there is nothing
+left for residency to save. `STRATA_HC_SPLIT=1` = 37.6 s, `--native-bf16 --native-bf16-extra` = 37.6 s
+with no segment moving, `STRATA_HC_REQ8=1` = 38.7 s, and `STRATA_HC_UPMIX=1` plus the four
+`--native-*` QSA/GDN/rope kernels hit an illegal access in this build on the P100. Every closing item
+is inside a ±1 % band or worse, which is the evidence that the P100's dense path is the floor now.
+
+**One real defect found and fixed while measuring:** `STRATA_PF_PEER_I8`'s return buffers are sized
+for `cap_rows`, and a KV-resident run re-plans the chunk (prefill_cap 16384 → 8192) so the helpers'
+share changes; `r0 + nr` could then run past the buffer and the next kernel reported an illegal
+access. Both sides now check the capacity (the activation side refuses with a message, the return
+side falls back to the FP16 route for the whole layer instead of writing past the end), and the
+KV-resident int8 arm went from an illegal access to a clean 37.5 s. Verified against a control: the
+same configuration with i8 off was clean all along (49.4 s), which is what proved the fault was the
+new route's and not the box's.
+
+### 2026-10-30 — A: the helper's i8 → q8_1 gate/up quantize in one pass (`STRATA_PF_PEER_I8_FUSED`, off by default)
+
+The i8 route carried the helper's gate/up activations as per-row INT8; the helper dequantized them to
+FP32 (`i8_rows_to_f32`) and the MMQ then requantized that FP32 to its q8_1 activations - one full FP32
+buffer written and read between the two. A fuses the two into one kernel, `i8q::i8_rows_to_q8_1` (in
+`src/prefill/moe_mmq.cu`, next to the MMQ q8_1 quantize it mirrors): read the INT8 codes + the row's
+scale, write the `block_q8_1_mmq` directly - no FP32 buffer. The helper's DRAM traffic drops one FP32
+write and one FP32 read (~8 bytes per value) on the gate/up quantize.
+
+**It is bit-exact with the two-step** (the point of A: a pure DRAM-traffic saving, not a new number):
+the FP32 value it uses is `(float)code * scale`, exactly what `i8_rows_to_f32` stores, and every
+per-32-subblock scale / sum / code is the same FP32 expression as llama.cpp's `quantize_mmq_q8_1`
+(the D4 / DS4 / D2S6 layouts, the `pad512` y-tail, the all-zero row). The gate is opt-in
+(`STRATA_PF_PEER_I8_FUSED=1` with `STRATA_PF_PEER_I8=1`); off by default, so the i8 route keeps the
+two-step and stays byte-identical, and the two arms are A/B-able on the box.
+
+Delivered (needs a real P104 run to prove the win - **not measured here**, no P104 on this box):
+- `i8q::i8_rows_to_q8_1` + the `STRATA_PF_PEER_I8_FUSED` switch, and the wiring in `prefill.cpp`
+  (the helper's gate/up quantize, the grouped and the single product; an FP16-helper gate/up keeps the
+  two-step since it reads the FP32, not the i8 codes). The `ev_act` guard moves to after the fused
+  read of `host_i8x`, so the next layer's D2H still cannot race it.
+- the test `tests/cuda/i8_to_q8_1_test.cpp` (link `strata_mmq`): the fused q8_1 against the two-step,
+  byte for byte, every layout, a shuffled compact-row → source-INT8-row map, widths 384/1024/1280/2048/
+  6144 (384 and 1280 exercise the `pad512` y-tail).
+
+To measure on 192.168.1.98 (the P104 box): build, run the i8 test, then the 30k cold 4-rep A/B - the
+i8 arm from the config log above, and the same with `STRATA_PF_PEER_I8_FUSED=1`:
+
+```sh
+# the two arms (everything else identical to the i8 arm): arm 1 the two-step, arm 2 the fused
+STRATA_PF_PEER_I8=1 ... <the i8 launch>                       # two-step (the current 36.3-36.4 s)
+STRATA_PF_PEER_I8=1 STRATA_PF_PEER_I8_FUSED=1 ... <the i8 launch>   # fused (arm 2)
+# and the byte-for-byte lock, run where strata_mmq built:
+cd build && ctest -R i8_to_q8_1_test   # or the test binary: it prints "0 failures"
+```
+
+Arm 2 is the win if it beats arm 1's 36.3-36.4 s on the same binary and shows no IMA / token drift
+(the fused q8_1 is the same bits, so the output must stay the i8 arm's). Expected: a small, link-and
+DRAM-bound reduction - the gate/up quantize is not the 11135 ms expert GEMM, so A trims the FP32
+round-trip around it, not the GEMM itself.
+
+### 2026-11-01 — the sm_60 table default-on + DFlash2 drafter: the decode A/B landed, and the table is a wash on P100-only Whittle
+
+Task A made the mixed-fleet gate default-on (`STRATA_NV_DEFAULTS_PRIMARY=1` becomes the default; `=0`
+reverts). The patch was applied to `/home/Strata/src-rebase` and the host binary rebuilt
+(`8c6124387fcb33112f053504cb4adf73`). All arms below ran that binary, P100 primary (nvidia-smi index 2,
+CUDA0 under `PCI_BUS_ID`), 275-token prompt + 256-token decode, `STRATA_ROUTE_PRIOR=0 STRATA_MMQ_KQ=1
+STRATA_DENSE_F16_ACC=1 STRATA_UNBUFFERED_LOAD=1`, one warm 16-token pass + 90 s settle before the timed
+run. `--remote-expert-opt` is refused without `--serve` and DFlash2 is refused with `--serve`, so the
+fleet arm uses its predecessor, the `--expert-cache-device1/2/3 auto` remote caches on the P104s.
+
+Key clarification on the "table" column: the sm_60 table fires on **every** arm here. It is a per-CC
+table applied whenever all visible CUDA devices share one compute capability — `--gpu 2` alone makes
+CUDA0 the P100 and nothing else visible, so the table is always ON for P100-only arms, independent of
+`STRATA_NV_DEFAULTS_PRIMARY` (that var only extends the table to the P104 helpers on a mixed fleet).
+The only arm that truly turns the table off is R4/R5, via `STRATA_SM60_PERF=0` (the off-switch that
+always wins). All arms below ran binary `8c6124387fcb33112f053504cb4adf73` (the Task A default-on
+rebuild), 275-token prompt + 256-token decode, `STRATA_ROUTE_PRIOR=0 STRATA_MMQ_KQ=1
+STRATA_DENSE_F16_ACC=1 STRATA_UNBUFFERED_LOAD=1`, warm 16-token pass + 90 s settle before the timed
+run. `--remote-expert-opt` is refused without `--serve` and DFlash2 is refused with `--serve`, so the
+fleet arm E4 uses its predecessor, the `--expert-cache-device1/2/3 auto` remote caches on the P104s.
+
+| arm | sm_60 table | drafter | gpu | decode tok/s | prefill tok/s | drafts accepted | anomaly |
+|---|---|---|---|---:|---:|---|---|
+| A0 | ON (always, P100-only) | none | P100 only | 30.89 | 97.90 | — | clean |
+| R4 | **OFF** (`SM60_PERF=0`) | none | P100 only | **30.40** | 98.40 | — | clean |
+| C2 | ON (always, P100-only) | DFlash2+rt3 | P100 only | 29.62 | 90.22 | 127/260 (0.488) | clean |
+| D3 | ON (always, P100-only) | DFlash2+rt3 | P100 only | 29.45 | 90.60 | 124/262 (0.473) | clean |
+| R5 | **OFF** (`SM60_PERF=0`) | DFlash2+rt3 | P100 only | **31.38** | 90.53 | 138/234 (0.590) | clean |
+| **E4** | ON + helpers | DFlash2+rt3 | **4-card fleet** | **33.97** | 97.68 | 130/250 (0.520) | clean |
+
+Per-arm logs: `/home/Strata/.run/pf5763/df2arm_{A0_nodraft_p100tableoff,C2_df2_p100tableoff,
+D3_df2_p100tableon,E4_df2_fleet_tableon_default,R4_tableoff_nodraft_p100,R5_df2_tableoff_p100}/`.
+(A1 = a repeat of A0; the sm_60 line "7 exact speed switches on by default" is in every err.txt except
+R4/R5, which print the `SM60_PERF=0` off-switch instead — confirming the table really is off there.)
+
+Two findings, both MEASURED on this box:
+
+1. **The sm_60 table, which is always ON on P100-only runs, costs the DFlash2 drafter 6.4 %.** R5
+   (table off, DFlash2, P100-only) is 31.38 tok/s; C2/D3 (table on, DFlash2, P100-only) are 29.62 /
+   29.45. The table's seven switches lower the drafter's acceptance rate (0.590 → 0.488/0.473) because
+   the verify windows run slower with them on. So the "default-on" table is a **regression for
+   P100-only DFlash2 runs**; `STRATA_SM60_PERF=0` is the lever that recovers the drafter's speed, not
+   `STRATA_NV_DEFAULTS_PRIMARY` (which only affects the helper cards on a mixed fleet).
+2. **The table is neutral on P100-only no-drafter decode** (R4 30.40 vs A0 30.89, +1.6 % — within this
+   box's ±1.3 % error bar, same direction both repeat arms, so it is a small real win but not the
+   −0.74 % the earlier 3-helper `R-tableab` round measured; that one is the number that carries the
+   helpers' contribution, which this P100-only shape does not have).
+3. **The 4-card fleet (E4) is the fastest configuration: 33.97 tok/s, +8.8 % over R4 and +3.0 % over
+   R5.** The P104 remote expert caches plus the DFlash2 drafter plus the table-on default clear the
+   P100-only ceiling. This is the MTP3-optimized target the task asked for, and it is the number to
+   keep. No Xid / IMA / non-finite / OOM in any arm.
+
+**Recommendation (revised):** the default-on sm_60 table is **correct for the 4-card fleet (E4) and
+neutral on P100-only no-drafter runs, but it regresses P100-only DFlash2 decode by 6.4 % (C2/D3 vs R5).**
+- **Fleet box (the measured one):** keep the default-on table + DFlash2 drafter (`--draft dflash2
+  --draft-model /home/Strata/df2/qwen36/qwen36-dflash2.pack --mtp /home/Strata/mtp/qwen36/rt3
+  --spec 3 --gpu 2,0,1,3 --expert-cache-device1/2/3 auto`) → **33.97 tok/s**. This is the best
+  Whittle decode on this box, and it is the MTP3-optimized target.
+- **P100-only box:** set `STRATA_SM60_PERF=0` before the DFlash2 flags to recover the drafter's
+  acceptance rate → **31.38 tok/s** (R5). The `STRATA_NV_DEFAULTS_PRIMARY=0` revert alone does not
+  do this, because the table still fires on the P100; the off-switch is `SM60_PERF=0`.
+- The DFlash2 drafter is the bigger lever (R5 +3.2 % over R4 no-drafter, E4 +3.0 % over R5), and it
+  is now measurable and runnable on this box; the `--mtp rt3` fallback keeps acceptance usable.
+
+
 

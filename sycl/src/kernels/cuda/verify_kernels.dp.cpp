@@ -2670,4 +2670,11 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     });
 }
 
+// STRATA_GDN_PACKED_GEMV (opt-in, CUDA only): no packed-Q8_0 GEMV on SYCL; the window's own GEMVs stand.
+bool gdn_packed_gemv(const void* const* qs, const void* const* d, const float* const* y, const int* n_out,
+                     int n_g, const void* xq, int n_in, void* stream) {
+    (void) qs; (void) d; (void) y; (void) n_out; (void) n_g; (void) xq; (void) n_in; (void) stream;
+    return false;
+}
+
 }  // namespace strata::kernels

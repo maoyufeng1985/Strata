@@ -2628,6 +2628,14 @@ std::unordered_map<const void*, Q8Packed>& q8_packed_registry() {
     return registry;
 }
 
+// STRATA_GDN_PACKED_GEMV (opt-in, CUDA only): no packed-Q8_0 plane on SYCL (the window's own GEMV stands), so the
+// caller keeps its kernels.  The SYCL build's registry is never populated.
+bool q8_packed_planes_of(const void*, int, int, const int8_t** qs, const void** d) {
+    *qs = nullptr;
+    *d = nullptr;
+    return false;
+}
+
 template <int NCOLS>
 void q8_packed_launch(const Q8Packed &w, const Q81Block *x, float *y,
                       dpct::queue_ptr s) {

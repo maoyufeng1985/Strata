@@ -4839,6 +4839,87 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
     d.experts += k;
 }
 
+// #578 STRATA_DECODE_POOL_OFFLOAD=1 (opt-in, default OFF): the helper stream settle and pinned-row drain that
+// finish() ran inline on the dispatch thread move to a process worker.  The dispatch records one shared event
+// on every helper stream after begin(), posts the job, and keeps going; the worker settles at the event and
+// drains.  wait_done() at the next begin() prevents the drain reading vectors that begin() has cleared.
+namespace {
+bool offload_active() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DECODE_POOL_OFFLOAD");
+                                return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+struct pool_offload_worker {
+    pool_offload_worker() {
+        std::atexit([] { if (g) { g->stop(); delete g; g = nullptr; } });
+        thread = std::thread([this] {
+            for (;;) {
+                cudaEvent_t ev;
+                RemoteExperts* rem[3];
+                int n;
+                float* out;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return pending || stop_; });
+                    if (stop_ && !pending) break;
+                    ev = ev_;
+                    for (int i = 0; i < 3; ++i) rem[i] = remotes_[i];
+                    n = count_;
+                    out = out_;
+                    running.store(true, std::memory_order_release);
+                    pending = false;
+                }
+                for (int r = 0; r < n; ++r) { std::string e; if (!rem[r]->settle(ev, e)) std::fprintf(stderr, "strata: pool offload: %s\n", e.c_str()); }
+                for (int r = 0; r < n; ++r) rem[r]->drain_rows(out);
+                running.store(false, std::memory_order_release);
+            }
+        });
+    }
+    void post(cudaEvent_t ev, RemoteExperts* const remotes[3], int n, float* out) {
+        std::lock_guard<std::mutex> lk(mu);
+        ev_ = ev;
+        for (int i = 0; i < n; ++i) remotes_[i] = remotes[i];
+        count_ = n;
+        out_ = out;
+        pending = true;
+        cv.notify_one();
+    }
+    void wait_done() {
+        while (running.load(std::memory_order_acquire));
+    }
+    void stop() {
+        { std::lock_guard<std::mutex> lk(mu); stop_ = true; }
+        cv.notify_all();
+        if (thread.joinable()) thread.join();
+    }
+    std::thread thread;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<bool> running{false};
+    cudaEvent_t ev_ = nullptr;
+    RemoteExperts* remotes_[3] = {};
+    int count_ = 0;
+    float* out_ = nullptr;
+    bool pending = false, stop_ = false;
+    static pool_offload_worker* g;
+};
+pool_offload_worker* pool_offload_worker::g = nullptr;
+pool_offload_worker& pool_offload_get() {
+    if (!pool_offload_worker::g) pool_offload_worker::g = new pool_offload_worker();
+    return *pool_offload_worker::g;
+}
+cudaEvent_t pool_offload_ev() {
+    static cudaEvent_t ev = nullptr;
+    if (!ev && cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess)
+        std::atexit([] { if (ev) { cudaEventDestroy(ev); ev = nullptr; } });
+    return ev;
+}
+}  // namespace
+
+void expert_pool_offload_wait_done() {
+    if (offload_active()) pool_offload_get().wait_done();
+}
+
 namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
 // are fixed arrays of this many entries: a window's rows (kWindowMaxT) of the model's 10 routed experts must fit, and a
@@ -5067,6 +5148,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     if (d.remote_count > 0) {
+        // #578 pool offload: wait for the previous layer's drain (it reads original_row_ / group_id_, which
+        // begin() clears) before staging the next window
+        if (offload_active()) pool_offload_get().wait_done();
         // STRATA_REMOTE_HELPER_PARALLEL=1: the helpers' begin() calls run on worker threads so the three cards
         // stage and launch at once (each begin does a pinned memcpy plus a few launches on its own stream; serially
         // the host pays them one after another - 1.9 ms/round of staging on the measured box).  This mirrors the
@@ -5187,6 +5271,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
             }
         }
+        // #578 pool offload: record the shared event on every helper stream so the worker settles them all
+        if (offload_active() && pool_offload_ev() != nullptr)
+            for (int r = 0; r < d.remote_count; ++r)
+                (void) cudaEventRecord(pool_offload_ev(), d.remote[r]->stream());
     }
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN's
@@ -5401,7 +5489,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const char* v = std::getenv("STRATA_REMOTE_FINISH_PAR");
             return v != nullptr && v[0] == '1' && v[1] == '\0';
         }();
-        if (fin_par && d.remote_count > 1) {
+        if (offload_active() && pool_offload_ev() != nullptr) {
+            // #578 pool offload: the settle+drain runs on the worker; the dispatch posts and moves on
+            pool_offload_get().post(pool_offload_ev(), d.remote, d.remote_count, out);
+        } else if (fin_par && d.remote_count > 1) {
             for (int r = 0; r < d.remote_count; ++r) d.remote[r]->drain_all();
             static thread_local std::string remote_error;
             for (int r = 0; r < d.remote_count; ++r)

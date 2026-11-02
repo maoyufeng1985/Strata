@@ -102,6 +102,17 @@ void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long lo
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
+// STRATA_GDN_PACKED_GEMV=1 (opt-in, a one-token group): the GDN layers' Q8_0 dense GEMVs of one window group
+// as ONE launch.  Every entry i is a Q8_0 matrix on its packed STRATA_Q8_PACKED planes - qs[i] its int8 codes
+// (n_out[i] x n_in) and d[i] its fp16 scales (n_out[i] x n_in / 32), the q8sm60 layout, the same bytes as the
+// GGUF blocks; y[i] + [0, n_out[i]) takes the GEMV rows over the group's shared activation xq - the q8_1 blocks
+// of native_quantize_q8_1(x, xq, n_in, 1) - staged to shared memory once and read by every row of every GEMV.
+// n_out[0] is the widest matrix (the row-group bound every other matrix's rows are bounded by).  Every output is
+// bitwise the packed-Q8_0 GEMV's for that matrix, so the call replaces the group's individual
+// GEMV launches.  n_in a multiple of 32.  CUDA only; elsewhere a no-op returning false (the caller keeps its
+// kernels).
+bool gdn_packed_gemv(const void* const* qs, const void* const* d, const float* const* y, const int* n_out,
+                     int n_g, const void* xq, int n_in, void* stream);
 /// an empty one-thread kernel (a graph node that does nothing: STRATA_DUMMY_NODES measures what a node costs in a window)
 void gpu_noop(void* stream);
 /// dst[r][0, w) = src[r][0, w) for `rows` rows of source stride `src_w` floats (the query half of each q/gate head

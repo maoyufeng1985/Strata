@@ -62,5 +62,16 @@ bool native_mmvq_il_supported(int, int, int) { return false; }
 bool native_q8_0_packed_eligible(int, int) { return false; }
 bool native_q8_0_packed_enabled() { return false; }
 bool native_q6_k_packed_enabled() { return false; }
+// STRATA_GDN_PACKED_GEMV: no packed-Q8_0 plane on Metal (the decode window's own GEMV stands); the caller keeps
+// its kernels.
+bool q8_packed_planes_of(const void*, int, int, const int8_t** qs, const void** d) {
+    *qs = nullptr;
+    *d = nullptr;
+    return false;
+}
+bool gdn_packed_gemv(const void* const*, const void* const*, const float* const*, const int*, int, const void*,
+                     int, void*) {
+    return false;   // no packed GEMV on Metal; the caller keeps its kernels
+}
 
 }  // namespace strata::kernels

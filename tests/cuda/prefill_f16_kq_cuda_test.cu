@@ -33,6 +33,7 @@
 // ggml-quants.h (ggml-base): the scalar reference (the block's type is not needed: the bytes are cast).
 extern "C" void dequantize_row_q4_K(const void* x, float* y, int64_t k);
 extern "C" void dequantize_row_q5_K(const void* x, float* y, int64_t k);
+extern "C" void dequantize_row_q6_K(const void* x, float* y, int64_t k);
 
 namespace {
 
@@ -82,6 +83,24 @@ __global__ void dump_blocks_q5(const uint8_t* __restrict__ blob, size_t d_row, i
     const int c64 = t >> 3, j4 = (t & 7) * 4;
     __half2 wq[4];
     f16kqc::dequant_block<f16kqc::T_Q5_K>(blk, c64, j4, wq);
+    const float2 a = __half22float2(wq[0]), b = __half22float2(wq[1]);
+    const float2 c = __half22float2(wq[2]), d = __half22float2(wq[3]);
+    const int base = 64 * c64 + j4;
+    float* o = out + (size_t) idx * 256;
+    o[base] = a.x; o[base + 1] = a.y; o[base + 2] = b.x; o[base + 3] = b.y;
+    o[base + 32] = c.x; o[base + 32 + 1] = c.y; o[base + 32 + 2] = d.x; o[base + 32 + 3] = d.y;
+}
+
+// The kernel's dequantization of one Q6_K block (the Whittle model's down weights).  Q6_K's block is 210
+// bytes, so the blocks of a row are only 2-byte aligned - the loads have to be safe on that.
+__global__ void dump_blocks_q6(const uint8_t* __restrict__ blob, size_t d_row, int nsuper, float* __restrict__ out) {
+    const int idx = blockIdx.x;
+    const int row = idx / nsuper, s = idx % nsuper;
+    const uint8_t* blk = blob + (size_t) row * d_row + (size_t) s * 210;
+    const int t = threadIdx.x;
+    const int c64 = t >> 3, j4 = (t & 7) * 4;
+    __half2 wq[4];
+    f16kqc::dequant_block<f16kqc::T_Q6_K>(blk, c64, j4, wq);
     const float2 a = __half22float2(wq[0]), b = __half22float2(wq[1]);
     const float2 c = __half22float2(wq[2]), d = __half22float2(wq[3]);
     const int base = 64 * c64 + j4;
@@ -412,6 +431,107 @@ int main() {
             std::printf("prefill_f16_kq_cuda_test: the down is off by %.3e of the scale (the bound is 0.02)\n",
                         worst_rel);
             return 1;
+        }
+        // ---- the same down with Q6_K weights (the Whittle model's down): the same H, the same rows ----
+        {
+            const size_t d_row6 = (size_t) (n_in / 256) * 210;
+            std::vector<uint8_t> dblob6((size_t) n_out * d_row6);
+            const auto* dtraits6 = ggml_get_type_traits(GGML_TYPE_Q6_K);
+            if (dtraits6 == nullptr || dtraits6->from_float_ref == nullptr) {
+                std::printf("prefill_f16_kq_cuda_test: ggml has no Q6_K quantizer\n");
+                return 77;
+            }
+            for (int r = 0; r < n_out; ++r) {
+                for (int k = 0; k < n_in; ++k) row[k] = rnd();
+                dtraits6->from_float_ref(row.data(), dblob6.data() + (size_t) r * d_row6, n_in);
+            }
+            // the weights, value by value, against ggml
+            {
+                Dev d_b(dblob6.size()), d_o((size_t) n_out * nsuper * 256 * 4);
+                ck(cudaMemcpy(d_b.p, dblob6.data(), dblob6.size(), cudaMemcpyHostToDevice), "copy");
+                dump_blocks_q6<<<n_out * nsuper, 32>>>((const uint8_t*) d_b.p, d_row6, nsuper, (float*) d_o.p);
+                ck(cudaDeviceSynchronize(), "launch");
+                ck(cudaGetLastError(), "kernel");
+                std::vector<float> got((size_t) n_out * nsuper * 256);
+                ck(cudaMemcpy(got.data(), d_o.p, got.size() * 4, cudaMemcpyDeviceToHost), "copy back");
+                double worst_step = 0.0, worst_abs = 0.0;
+                long bad = 0;
+                std::vector<float> ref(256);
+                for (int r = 0; r < n_out; ++r) {
+                    for (int s = 0; s < nsuper; ++s) {
+                        const uint8_t* blk = dblob6.data() + (size_t) r * d_row6 + (size_t) s * 210;
+                        dequantize_row_q6_K((const void*) blk, ref.data(), 256);
+                        // the weight's own step: d * |scale| (the codes are centred, the scale is an int8)
+                        const float d = __half2float(__ushort_as_half(*(const uint16_t*) blk));
+                        float step = 0.f;
+                        for (int g = 0; g < 16; ++g) step = fmaxf(step, d * fabsf((float) (int8_t) blk[192 + g]));
+                        for (int i = 0; i < 256; ++i) {
+                            const double diff = fabs((double) got[((size_t) r * nsuper + s) * 256 + i] - ref[i]);
+                            if (diff > 0.0) bad++;
+                            worst_abs = fmax(worst_abs, diff);
+                            worst_step = fmax(worst_step, diff / (step + 1e-30));
+                        }
+                    }
+                }
+                std::printf("Q6_K down weights: %d values, %ld differ from ggml, max |diff| %.3e, max diff %.4f steps\n",
+                            n_out * nsuper * 256, bad, worst_abs, worst_step);
+                if (worst_step > 0.05) {
+                    std::printf("prefill_f16_kq_cuda_test: the Q6_K down's dequantization is off by %.4f steps\n",
+                                worst_step);
+                    return 1;
+                }
+            }
+            // the products: the same H rows through the Q6_K down
+            Dev d_hq6(hq.size()), d_dm6((size_t) nrows * n_out * 4);
+            ck(cudaMemcpy(d_hq6.p, hq.data(), hq.size(), cudaMemcpyHostToDevice), "copy");
+            NativeGeom dg6;
+            dg6.gu_type = GGML_TYPE_Q4_K;
+            dg6.d_type = GGML_TYPE_Q6_K;
+            dg6.d_row = d_row6;
+            dg6.down_off = 0;
+            dg6.n_embd = n_out;
+            dg6.n_ff = n_in;
+            Dev d_dblob6(dblob6.size());
+            ck(cudaMemcpy(d_dblob6.p, dblob6.data(), dblob6.size(), cudaMemcpyHostToDevice), "copy");
+            b.blob[0] = (const uint8_t*) d_dblob6.p;
+            strata::prefill::fused::f16kq::down(b, dg6, (const int32_t*) d_ts.p, (const int2*) d_tiles.p,
+                                                (const int32_t*) d_off.p, nrows, 1, 1, (const uint8_t*) d_hq6.p,
+                                                (float*) d_dm6.p, 0);
+            ck(cudaDeviceSynchronize(), "launch");
+            ck(cudaGetLastError(), "kernel");
+            std::vector<float> dm6((size_t) nrows * n_out);
+            ck(cudaMemcpy(dm6.data(), d_dm6.p, dm6.size() * 4, cudaMemcpyDeviceToHost), "copy back");
+            double worst_rel6 = 0.0, worst_abs6 = 0.0, scale6 = 0.0;
+            long bad6 = 0;
+            std::vector<float> w6(n_in), ref6(256);
+            for (int r = 0; r < nrows; ++r) {
+                std::vector<double> acc(n_out, 0.0);
+                for (int j = 0; j < n_out; ++j) {
+                    const uint8_t* rw = dblob6.data() + (size_t) j * d_row6;
+                    for (int s = 0; s < nsuper; ++s) {
+                        dequantize_row_q6_K((const void*) (rw + (size_t) s * 210), ref6.data(), 256);
+                        for (int k = 0; k < 256; ++k) w6[(size_t) s * 256 + k] = ref6[k];
+                    }
+                    double sum = 0.0;
+                    for (int k = 0; k < n_in; ++k) sum += (double) w6[k] * (double) hq_val[(size_t) r * n_in + k];
+                    acc[j] = sum;
+                    scale6 = fmax(scale6, fabs(sum));
+                }
+                for (int j = 0; j < n_out; ++j) {
+                    const double got = dm6[(size_t) r * n_out + j];
+                    const double diff = fabs(got - acc[j]);
+                    worst_abs6 = fmax(worst_abs6, diff);
+                    if (diff > 0.02 * scale6) bad6++;
+                }
+            }
+            worst_rel6 = worst_abs6 / (scale6 + 1e-30);
+            std::printf("Q6_K down: max |diff| %.3e (%.3e of the row's scale), %ld of %d over 2%% of the scale\n",
+                        worst_abs6, worst_rel6, bad6, nrows * n_out);
+            if (worst_rel6 > 0.02) {
+                std::printf("prefill_f16_kq_cuda_test: the Q6_K down is off by %.3e of the scale (the bound is 0.02)\n",
+                            worst_rel6);
+                return 1;
+            }
         }
     }
     return 0;

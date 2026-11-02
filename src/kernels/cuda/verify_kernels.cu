@@ -13,6 +13,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/gfx_arch.hpp"   // #3264: the gfx12 test of the multi-block head ops
 #include "strata/kernels/pdl.hpp"
+#include "strata/kernels/native_mmvq.hpp"   // native_q8_0_packed_* (the packed planes the GEMV reads)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1720,6 +1721,7 @@ namespace {
 __global__ void noop_kernel() {}
 }  // namespace
 void gpu_noop(void* stream) { noop_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(); }
+
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
     if (pdl_scope()) launch_pdl(gpu_stamp_kernel<true>, dim3(1), dim3(1), 0, (cudaStream_t) stream, buf, i);
     else gpu_stamp_kernel<false><<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
@@ -1840,5 +1842,73 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
 #endif
 }
 #endif
+
+// STRATA_GDN_PACKED_GEMV=1 (opt-in): the GDN layers' two Q8_0 GEMVs (qkv, gate) of one layer as one fused launch
+// over the shared activation.  Sits after the PDL section so `check` and the file-scope helpers are in scope.
+namespace {
+struct gdn_pg_q81 { half2 ds; int8_t qs[32]; };   // a q8_1 block, as native_quantize_q8_1 lays it out
+__global__ void gdn_packed_gemv_kernel(const int8_t* const* __restrict__ qs, const half* const* __restrict__ dp,
+                                       float* const* __restrict__ yp, int const* __restrict__ nout, int n_g,
+                                       const gdn_pg_q81* __restrict__ xq, int n_in, int grid) {
+    const int nb = n_in / 32;
+    const int nch = n_in / 16;
+    extern __shared__ int4 smem[];
+    int8_t* sx = reinterpret_cast<int8_t*>(smem);
+    float* sd = reinterpret_cast<float*>(sx + n_in);
+    const int rowgrp = threadIdx.x >> 4;
+    for (int i = blockIdx.x * 16 + rowgrp; i < nb; i += grid * 16) {
+        const gdn_pg_q81& xb = xq[i];
+        int* dst = reinterpret_cast<int*>(sx + i * 32);
+        const int* src = reinterpret_cast<const int*>(xb.qs);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) dst[j] = src[j];
+        sd[i] = __low2float(xb.ds);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 15;
+    const int rowsg = (nout[0] + 15) / 16;
+    const int nunits = n_g * rowsg;
+    for (int u = blockIdx.x * 16 + rowgrp; u < nunits; u += grid * 16) {
+        const int g = u / rowsg;
+        const int rg = u - g * rowsg;
+        const int n_out = nout[g];
+        const int row = rg * 16 + lane;
+        if (row >= n_out) continue;
+        const int8_t* w = qs[g] + (size_t) row * n_in;
+        const half* ds = dp[g] + (size_t) row * nb;
+        float acc = 0.0f;
+#pragma unroll
+        for (int c = lane; c < nch; c += 16) {
+            const int4 wv = __ldg(reinterpret_cast<const int4*>(w + c * 16));
+            const int4 xv = *reinterpret_cast<const int4*>(sx + c * 16);
+            int s = STRATA_DP4A(wv.x, xv.x, 0);
+            s = STRATA_DP4A(wv.y, xv.y, s);
+            s = STRATA_DP4A(wv.z, xv.z, s);
+            s = STRATA_DP4A(wv.w, xv.w, s);
+            acc += __half2float(__ldg(ds + (c >> 1))) * sd[c >> 1] * float(s);
+        }
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffu, acc, o, 16);
+        if (lane == 0) yp[g][row] = acc;
+    }
+}
+}  // namespace
+
+bool gdn_packed_gemv(const void* const* qs, const void* const* d, const float* const* y, const int* n_out,
+                     int n_g, const void* xq, int n_in, void* stream) {
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    if (n_g <= 0 || n_in <= 0 || n_in % 32 != 0 || !qs || !d || !y || !n_out || !xq || !s) return false;
+    auto* qsl = reinterpret_cast<const int8_t* const*>(qs);
+    auto* dl = reinterpret_cast<const half* const*>(d);
+    auto* yl = const_cast<float* const*>(y);
+    const std::size_t smem = (size_t) n_in + (size_t) (n_in / 32) * sizeof(float);   // the one shared activation
+    if (smem > 48 * 1024) return false;   // a workgroup's static + dynamic limit
+    const int units = n_g * ((n_out[0] + 15) / 16);   // (matrix, row-group-of-16) work units
+    const int grid = units < 640 ? units : 640;       // the q8_sm60 launch's grid cap
+    gdn_packed_gemv_kernel<<<unsigned(grid), 256, smem, s>>>(qsl, dl, yl, n_out, n_g, (const gdn_pg_q81*) xq, n_in,
+                                                              grid);
+    check("gdn_packed_gemv");
+    return true;
+}
 
 }  // namespace strata::kernels

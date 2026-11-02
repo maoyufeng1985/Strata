@@ -297,6 +297,19 @@ Without the helpers (the P100 alone, `--gpu 2`): 32.5 tok/s with a 700-token pro
 generated, 38.0 tok/s with the three helpers. A long generation is faster than a short one: the
 graph capture, the profile fill and the PCIe warm-up are fixed costs.
 
+### Decode warm vs cold (2026-11-01, remote-opt ON, 275-token prompt + 256 decode)
+
+The **cold** decode number (expert pages not yet in the page cache) is **42.9 tok/s**
+(23.34 ms/window, the `T4` window). After the first request loads the expert arena into the page
+cache, subsequent requests are **warm** and the decode is roughly **94–95 tok/s**
+(~2700 ms for 256 tokens, the `total − prefill` of the serve line, exe `ed8d3f1e`, 2026-11-01).
+The 2× speedup is entirely the page-cache effect: the expert blobs are read from the OS cache
+rather than from the 0.8 GB/s Gen1-x4 helper links. No code lever moves the warm number
+(`STRATA_DECODE_POOL_OFFLOAD` fires but the dispatch thread is not the bottleneck;
+`STRATA_GDN_PACKED_GEMV` has no call site for a Q5_K head; `STRATA_HEAD_PACKED` requires
+`n_in % 256 == 0` which Whittle's head does not satisfy). The warm ceiling for this box is
+~95 tok/s, set by the P100's GEMV bandwidth.
+
 Prefill scales with the prompt (275 tokens 215 tok/s, 699 tokens 340, 1799 tokens 467) and does not
 benefit from the other three cards at all: 340.5 vs 340.1 tok/s on 699 tokens, 470.9 vs 472.3 on 1799.
 The PCIe link is 6.1 GB/s on this box, which is not enough to pay for shipping the prompt's expert
@@ -334,6 +347,52 @@ Two things to know:
 The numbers, the output check and the review are in
 [the plan](../plans/2026-10-28-whittle-remote-prefill-peers.md).
 
+### What the helper parallelism is worth on a 30k prompt (measured 2026-10-31)
+
+The 276-token arms above are a short prompt. On a 30,000-token prompt the flag's own share is
+measured separately, with the i8 bytes in place and the peer route as the only variable - the same
+binary (`6c9fa66d`), the same box, the same prompt, the two arms interleaved:
+
+| arm | 30k cold | warm chunk (13699 tokens) | first chunk (16384) |
+|---|---|---|---|
+| `STRATA_PREFILL_REMOTE_PEERS=1` + `_N=3` | **36.606 s = 821.8 tok/s** | 17.251 / 17.279 / 17.349 s | 19.292 s |
+| the flag off | 41.007 s = 732.6 tok/s (two arms: 41.066 / 40.949) | 19.386-19.556 s | 21.571 s |
+| **the parallelism is worth** | **4.40 s (-10.7 %)** | ~2.2 s (-11.2 %) | 2.28 s (-10.6 %) |
+
+Where it goes, from the two arms' own `strata prefill timing` lines (the cold 30k chunk):
+
+| segment | the peer route off | the peer route on |
+|---|---:|---:|
+| `gemm gate/up` + `gemm down` (the P100's own expert GEMMs) | 16189 ms (39.4 %) | 10313 ms (28.2 %) |
+| `combine` + `combine read` (waiting for the helpers' rows) | 240 ms (0.6 %) | 2849 ms (7.8 %) |
+| host staging (the expert blobs) | 17510 ms | 6206 ms |
+| `hc read` / `qsa attn` / `gdn` / `qsa select` (the P100's dense work) | 5124 / 4590 / 4357 / 1960 ms | 5068 / 4588 / 4389 / 1960 ms |
+
+So the three helpers take over **5876 ms of the P100's expert GEMM (36 % of it)** and the return
+route's wait gives **2849 ms** of that back: the wall moves 4401 ms. Three bounds keep the rest
+apart:
+
+- **A free helper return** (the 2849 ms `combine` removed) would leave 33.76 s = 889 tok/s.
+- **More of the expert rows on the helpers** is a loss, not a gain: a P104's per-row cost is ~2.7 us
+  against the P100's ~2.2 us, so three helpers are ~2.44x the P100's aggregate throughput - the full
+  share would need ~222 ms a layer against the P100's 187 ms a layer, and the one measured attempt
+  to move the experts wholesale lost 0.8 s.
+- **The helpers' idle 62 % of the wall is not schedulable headroom**: the rows arrive layer by layer
+  (layer l+1's bytes do not exist until layer l's combine, which waits on every helper's
+  `ev_done`), so a helper can be at most one layer ahead.
+
+The P100's own dense work (hc read + qsa attn + gdn + select, ~16 s of the 36.6 s) is out of the
+helpers' reach by construction: that is what keeps the 30k wall P100-bound.
+
+Two of the four ON arms of this A/B were killed by the box's Xid-31 PDE fault (the reader P104, the
+race [the SHARED section](#shared-d2h-strata_pf_peer_i8_shared1-crash-gated-measured-neutral-the-flag-stays-off)
+records); the third ON arm and both OFF arms ran clean. The raw output and the day-to-day control
+(the ON arm reproduces the frozen baseline's 36.478 s, and the P100 bench reads 4.985 ms against the
+baseline day's 4.981 ms) are in
+[the evidence file](../.omo/evidence/peer-parallel-ab-20261031.md).
+
+Measured on the P104 Gen1-x4 box, 192.168.1.98, 2026-10-31.
+
 ## Two things about the numbers
 
 **The profile decides most of the speed.** `--expert-cache auto` fills its slots in the profile's
@@ -370,6 +429,9 @@ only sizes the captured graphs and the buffers. `--suffix-draft 0` is the fastes
 | `STRATA_HC_UPMIX=1`, `STRATA_HCD_EXACT=1` | Prompt path only |
 | `STRATA_GDN_CHUNKED=1` / `2` | Within noise (+1.3% / +1.0%) |
 | Four cards for prefill | No change |
+| A retrained MTP drafter head (`tools/whittle_mtp_train.py`, `--target-head` = Whittle's real Q6_K `output.weight` dequant, fc_hid + `post_attention_norm` trained on the `STRATA_TAP_FINAL_R` final-residual corpus, re-packed with `tools/mtp_rt_qwen36.py`) | **0 of 765 drafts accepted at `--spec 4`** (21.2 tok/s, vs the no-drafter 45.6): even a Whittle-specific head is a net loss here. The Qwen3.6-borrowed head (`mtp/qwen36/rt3`) does accept ~6-7 %, so the box is fine - the retrained head is the problem. Root cause (source-confirmed): the engine's drafter head input is the **whole** draft decoder layer's output (fc both-branch sum → attention over the prompt-prefilled KV → the real 256-expert router + shared expert → the final hyper-connection mixer, `src/core/mtp.cpp:960-1238`), not the fc-hidden branch. The trainer aligns only `fc_hid @ rmsnorm(pool) * gamma` to the target head, so it omits the attention/MoE/mixer transforms and freezes the embedding branch at the Qwen3.6 init; the trained fc_hid then stops matching the rest of the layer. Until a head is trained end-to-end on the layer's actual output (the dump carries no token-embedding branch and no per-layer K/V), the borrowed init head is the better of the two, and both lose to no-drafter on this fleet. |
+| The three decode code levers (`STRATA_DECODE_POOL_OFFLOAD`, `STRATA_GDN_PACKED_GEMV`, `STRATA_HEAD_PACKED`), individual and combined, on the rebase build | All within noise of the no-drafter baseline on the 4-card fleet (s2-s5: no_lever 44.0-44.2; gdn_packed 43.9-44.3; head_packed 43.7-44.2 t/s; pool_offload and the all-three arm **crash** with `quantize_q8_1_rows: invalid resource handle` + a pool-offload worker settling after the CUDA context is destroyed). None beats no-drafter; the pool-offload lever is unusable on this build. |
+| An existing Whittle MTP or DFlash drafter head from Hugging Face or GitHub | **None exists.** Searched 2026-11-02 via the HF API mirror and the GitHub API: all 20 `logic65` Whittle repos (the upstream) and every one of the 37 "whittle" models on HF carry no MTP / DFlash / drafter tensors - recursive file-tree keyword search (mtp, nextn, dflash, drafter, eh_proj, speculative) returns zero hits, and `search=whittle mtp` / `whittle drafter` return zero models. GitHub repo search: `whittle mtp` = 0, `whittle dflash` = 0, `whittle drafter` = 1 unrelated (a macOS voice-writing app). The upstream 45B `config.json` declares `architectures: [Qwen4ExpForCausalLM]` with no `mtp_num_hidden_layers` and no `nextn.*` block, so the model family itself ships no MTP. The only MTP implementation found anywhere (`guoqingbao/xinfer#300`) covers Qwen3.5 / Qwen3-Next only, ships no weights, and is not a Whittle drafter. |
 
 ## Where the time goes
 
@@ -414,7 +476,10 @@ hyper-connection reads are eight small products a layer.
   do not fit twice. A leftover engine also drives the load average past 50, which makes every prefill
   number afterwards meaningless.
 - No MTP, so no speculative decoding. The suffix drafter is on by default for other models; here it
-  costs nothing to turn off and a little to leave on.
+  costs nothing to turn off and a little to leave on. The model family ships no MTP block (`config.json`
+  has no `mtp_num_hidden_layers`, no `nextn.*`), and there is no Whittle MTP or DFlash drafter head on
+  Hugging Face or GitHub (searched 2026-11-02, the "What did not help" table). The only drafter route is
+  a retrained head, which loses to no-drafter on this fleet.
 - `--remote-expert-opt` was measured on three helper cards but only documented for two, and it
   changes the order of the floating-point summation, so the generated text is not byte-identical to
   a run without it. It was coherent on every run here.

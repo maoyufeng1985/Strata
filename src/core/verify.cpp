@@ -67,6 +67,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"       // STRATA_GDN_PACKED_GEMV: the packed-Q8_0 GEMV's plane pointers
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/kernels/dflash2.hpp"
 #endif
@@ -738,6 +739,8 @@ Verifier::~Verifier() {
 #endif
     if (tap_scratch_) cudaFree(tap_scratch_);
     if (h_tap_) cudaFreeHost(h_tap_);
+    if (final_r_file_) std::fclose(final_r_file_);
+    if (h_final_r_) cudaFreeHost(h_final_r_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     for (float* b : slot_bias_dev_) if (b) cudaFree(b);
     if (slot_hist_d_) cudaFree(slot_hist_d_);
@@ -856,6 +859,20 @@ void Verifier::tap_write(int T, const int32_t* tokens, int64_t pos0) {
         std::fwrite(h_tap_ + (size_t) t * per, sizeof(float), per, tap_file_);
     }
     std::fflush(tap_file_);
+}
+
+// STRATA_TAP_FINAL_R: one record per row of the window: int32 position, int32 input token, then hc x n_embd floats
+// (the target's final residual - what final_R() returns and the MTP drafter reads). The copy of R_ into the mapped
+// buffer happens in the last layer's gr_write block (see record_window), so this only flushes + writes to disk.
+void Verifier::final_r_write(int T, const int32_t* tokens, int64_t pos0) {
+    if (final_r_file_ == nullptr) return;
+    const size_t per = (size_t) g_->hc * (size_t) g_->n_embd;
+    for (int t = 0; t < T; ++t) {
+        const int32_t hdr[2] = {(int32_t) (pos0 + t), tokens[t]};
+        std::fwrite(hdr, sizeof hdr, 1, final_r_file_);
+        std::fwrite(h_final_r_ + (size_t) t * per, sizeof(float), per, final_r_file_);
+    }
+    std::fflush(final_r_file_);
 }
 
 bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
@@ -1020,6 +1037,33 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             std::fprintf(stderr, "strata: STRATA_TAP_FILE %s: %zu taps of %lld floats per row\n", tap_path, nt, (long long) N);
         }
         tap_on_ = true;
+    }
+    // STRATA_TAP_FINAL_R (off by default): the MTP retrain dump. It writes the target's *final* residual row
+    // (g_->hc * g_->n_embd floats, the value final_R() returns and the MTP drafter reads) AFTER the last layer's
+    // gr_write, one record per window row. Gated like the tap path (single-stage, full layer range); it does not
+    // reuse tap_on_/the per-layer tap buffers - it copies the residual itself, which the per-layer taps never touch.
+    if (const char* fr_path = std::getenv("STRATA_TAP_FINAL_R"); fr_path != nullptr && fr_path[0] != '\0') {
+        if (lb_ != 0 || le_ != g.n_layers) {
+            std::fprintf(stderr, "strata: STRATA_TAP_FINAL_R is set but this is not a single-stage full-range verifier; ignoring\n");
+        } else {
+            const size_t row = (size_t) g_->hc * (size_t) N;   // per-row floats (the final residual)
+            // The target's residual R_ is copied device -> mapped host buffer after the last layer's gr_write
+            // (see record_window); the per-row fwrite to disk happens at the end of run().
+            if (!mapped((size_t) T * row * 4, (void**) &h_final_r_, (void**) &m_final_r_)) {
+                err = "verify: the final-R dump buffer could not be allocated";
+                return false;
+            }
+            final_r_file_ = std::fopen(fr_path, "wb");
+            if (final_r_file_ == nullptr) {
+                err = std::string("verify: cannot write STRATA_TAP_FINAL_R ") + fr_path;
+                return false;
+            }
+            const int32_t hdr[3] = {0x46455246 /* 'FRfE' */, (int32_t) N, (int32_t) g_->hc};
+            std::fwrite(hdr, sizeof hdr, 1, final_r_file_);
+            final_r_on_ = true;
+            std::fprintf(stderr, "strata: STRATA_TAP_FINAL_R %s: %lld x %d x %lld floats per row\n", fr_path,
+                         (long long) T, g_->hc, (long long) N);
+        }
     }
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
         if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
@@ -1361,6 +1405,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int side_mixer_mode = g_side_mixer();
     const bool side_mixer = side_mixer_mode >= 1;
     const bool side_proj = side_mixer_mode >= 2 && !batch_rec_;   // fork b063c13: the GDN gate projection, the QSA queries
+    // STRATA_GDN_PACKED_GEMV=1 (opt-in): the GDN layers' two Q8_0 GEMVs (qkv, gate) of one layer as one fused launch
+    // over the packed planes; the packed-Q8_0 GEMV's bytes, the individual launches' numerics. Off by default.
+    static const bool gdn_packed_gemv_on = [] {
+        const char* v = std::getenv("STRATA_GDN_PACKED_GEMV");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     auto branch = [&](cudaEvent_t e, cudaStream_t from, cudaStream_t to, const char* what) {
         if (to == side_) note_prio_fork(from);   // STRATA_GRAPH_PRIO: where the high-priority branch leaves cs
         if (cudaEventRecord(e, from) == cudaSuccess && cudaStreamWaitEvent(to, e, 0) == cudaSuccess) return true;
@@ -1677,6 +1727,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
                 if (!q8_attn) quant_in(xm, (int) N);
+                bool gdn_packed_done = false;
+                if (gdn_packed_gemv_on && n == 1 && !batch_rec_ && !side_proj && !br && !sidem && !prof_on_ &&
+                    wqkv->native_type == 8 && wg->native_type == 8) {   // STRATA_GDN_PACKED_GEMV=1: qkv and gate,
+                    // the two Q8_0 GEMVs that share this layer's activation xq_, as one fused packed-Q8_0 launch
+                    // over the STRATA_Q8_PACKED planes - the GEMV's own bytes, the individual launches' numerics.
+                    // Where a plane is not registered packed (the matrix is not Q8_0, or the packed copy is off),
+                    // or the shape does not fit, the layer keeps its two GEMV launches as they were.
+                    const int8_t* qs0, *qs1;
+                    const void* d0, *d1;
+                    if (q8_packed_planes_of(wqkv->native_data, (int) N, (int) C, &qs0, &d0) &&
+                        q8_packed_planes_of(wg->native_data, (int) N, (int) ZV, &qs1, &d1)) {
+                        const int8_t* qsl[2] = {qs0, qs1};
+                        const void* dl[2] = {d0, d1};
+                        float* y0 = qkv + (size_t) tb * C;
+                        float* y1 = (float*) (z_ + (size_t) tb * ZV);
+                        const float* yl[2] = {y0, y1};
+                        const int no[2] = {(int) C, (int) ZV};
+                        if (gdn_packed_gemv((const void* const*) qsl, dl, yl, no, 2, xq_, (int) N, cs))
+                            gdn_packed_done = true;
+                    }
+                }
                 if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
                     // the branch reads F4's interleaved copy too (written on cs before the fork; bitwise native_mmvq's
                     // output), and qkv is recorded before the branch's launch, so its grid is dispatched first and the
@@ -1705,7 +1776,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
                 strata::dispatch::notef("gdn layer: side_gates=%ld side_proj=%ld df_branch=%ld", (long) sidem, (long) side_proj, (long) br);
                 strata::dispatch::notef("gdn layer: conv+ab fused=%ld batch_rows=%ld", (long) fuse_ab, (long) batch_rec_);
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                if (!side_proj && !gdn_packed_done) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1738,7 +1809,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj && !gdn_packed_done) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -2503,6 +2574,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
                 else for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                 if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
+            }
+            // STRATA_TAP_FINAL_R: after the last layer's gr_write, R_ is the target's final residual - the value
+            // final_R(t) returns and the MTP drafter reads. The device rows are copied into the mapped host buffer;
+            // the per-row fwrite to disk happens at the end of run() once the stream is synced.
+            if (final_r_on_ && !batch_rec_) {
+                cudaMemcpyAsync(m_final_r_ + (size_t) tb * HC * N, Rt(tb), (size_t) n * HC * N * 4, cudaMemcpyDeviceToHost, cs);
             }
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
@@ -3486,7 +3563,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
-        if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
+        if (remote_opt_) {
+            strata::core::expert_pool_offload_wait_done();   // #578 pool offload: the previous layer's drain into h_w_
+            remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);   // begin() memsets the rows the drain may still write
+        }
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
@@ -3645,6 +3725,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     if (tap_file_ != nullptr && !batch_rec_) tap_write(T, tokens, pos0);
+    if (final_r_file_ != nullptr && !batch_rec_) final_r_write(T, tokens, pos0);
     note_nonfinite(T, nullptr);
     // STRATA_LOGITS_DUMP=<path> (debug tap, off by default): the window's logits as the sampler saw them, written
     // AFTER the window (the stream is synchronised above and the graph capture is over, so a plain copy is legal -
@@ -4753,7 +4834,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         progress_at("verify batch: the CPU experts of layer", l);
         // The recorded graph consumes the helper mask and weighted sum just as
         // the solo graph does. Reset both and supply this layer's routing weights.
-        if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
+        if (remote_opt_) {
+            strata::core::expert_pool_offload_wait_done();   // #578 pool offload: the previous layer's drain
+            remote_opt_->begin(h_w_, 0, S);
+        }
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -4773,6 +4857,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    if (remote_opt_) strata::core::expert_pool_offload_wait_done();   // #578 pool offload: the last layer's drain
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
     cudaStreamSynchronize(copy_);
@@ -4968,7 +5053,10 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot(0);
-        if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
+        if (remote_opt_) {
+            strata::core::expert_pool_offload_wait_done();   // #578 pool offload: the previous layer's drain
+            remote_opt_->begin(h_w_, 0, S);
+        }
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + k);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
@@ -4989,6 +5077,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
         ring_now();
         b_k_.fetch_add(1, std::memory_order_release);
     }
+    if (remote_opt_) strata::core::expert_pool_offload_wait_done();   // #578 pool offload: the last layer's drain
     return 1;
 }
 

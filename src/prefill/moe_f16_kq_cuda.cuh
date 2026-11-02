@@ -43,7 +43,7 @@
 namespace strata::prefill::fused::f16kqc {
 
 /// ggml's type ids (checked against ggml.h in moe_f16_kq_cuda.cu).
-constexpr int T_Q4_K = 12, T_Q5_K = 13;
+constexpr int T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14;
 
 constexpr int AB = 80;          ///< activation bytes per 64 values: 64 codes, {d0,d1,sum0,sum1}
 constexpr int QK = 256;         ///< a K-quant superblock
@@ -51,9 +51,11 @@ constexpr int RWB = 16;         ///< routed rows per block
 constexpr int WIB = 32;         ///< output indices per block (WIB gate rows + WIB up rows)
 constexpr int WARPS = 16;       ///< warps per block, 4 weight rows each
 constexpr int THREADS = 32 * WARPS;
-constexpr int Q4_BLK = 144, Q5_BLK = 176;
+constexpr int Q4_BLK = 144, Q5_BLK = 176, Q6_BLK = 210;
 
-__host__ __device__ __forceinline__ int blk_bytes(int qt) { return qt == T_Q4_K ? Q4_BLK : Q5_BLK; }
+__host__ __device__ __forceinline__ int blk_bytes(int qt) {
+    return qt == T_Q4_K ? Q4_BLK : (qt == T_Q5_K ? Q5_BLK : Q6_BLK);
+}
 /// where the codes start in a block (Q4_K: right after the scales; Q5_K: after the 32 qh bytes)
 __host__ __device__ __forceinline__ int code_off(int qt) { return qt == T_Q4_K ? 16 : 48; }
 
@@ -122,6 +124,66 @@ __device__ __forceinline__ void load_block(const uint8_t* a, int j4, uint32_t& c
     d1 = *(const float*) (a + 68);
 }
 
+/// The lane's 8 values of one superblock of one Q6_K weight row, dequantized.
+///
+/// Q6_K's block (ggml): ql[128] (the low nibbles), qh[64] (the two high bits), scales[16] (int8),
+/// d (fp16) - 210 bytes.  ggml's layout inside a 128-value half: the value l (0..31) is ql[l]'s low
+/// nibble with qh[l]'s bits 0-1, the value l+32 is ql[l+32]'s low nibble with qh[l]'s bits 2-3, the
+/// value l+64 is ql[l]'s high nibble with qh[l]'s bits 4-5 and the value l+96 is ql[l+32]'s high nibble
+/// with qh[l]'s bits 6-7; the scale of the values l is scales[l/16], of l+32 scales[l/16 + 2] and so on.
+///
+/// The lane's group c64 and its byte j4: the FIRST set of four values (the group's first 32) comes from
+/// the ql bytes ql_half + j4 (the low nibbles of the groups 0 and 2, the high nibbles of the groups 1
+/// and 3) and the SECOND set from the ql bytes ql_half + 32 + j4 (a different byte range: the values
+/// 32..63 of a half live in ql[l+32], not in ql[l]).  The qh byte at qh_half + j4 carries the two high
+/// bits of all four sets (the first set in its low bit pair, the second in the high one); the scale is
+/// the int8 at scales[(c64 / 2) * 8 + (c64 & 1) * 4 + j4 / 16], the second set two further.
+///
+/// The codes are centred (they are 0..63 and the value is (code - 32) * scale), so the bias is -32 * scale.
+__device__ __forceinline__ void dequant_block_q6k(const uint8_t* __restrict__ wp, int c64, int j4, __half2 wq[4]) {
+    const int ql_half = (c64 >= 2) ? 64 : 0;     // the 128-value half the group is in
+    const int qh_half = (c64 >= 2) ? 32 : 0;     // its qh bytes
+    const bool high = (c64 & 1) != 0;            // the high nibbles of the ql bytes
+    // Q6_K's block is 210 bytes, so the blocks of a row are only 2-byte aligned: the four bytes are read
+    // as two 16-bit loads (a 32-bit load would be misaligned on every odd block of the row).
+    const uint16_t w0 = *(const uint16_t*) (wp + ql_half + j4);
+    const uint16_t w1 = *(const uint16_t*) (wp + ql_half + j4 + 2);
+    const uint16_t x0 = *(const uint16_t*) (wp + ql_half + 32 + j4);
+    const uint16_t x1 = *(const uint16_t*) (wp + ql_half + 32 + j4 + 2);
+    const uint32_t raw = (uint32_t) w0 | ((uint32_t) w1 << 16);    // the first set's ql bytes
+    const uint32_t raw2 = (uint32_t) x0 | ((uint32_t) x1 << 16);   // the second set's ql bytes
+    const uint16_t q0 = *(const uint16_t*) (wp + 128 + qh_half + j4);
+    const uint16_t q1 = *(const uint16_t*) (wp + 128 + qh_half + j4 + 2);
+    const uint32_t qhb = (uint32_t) q0 | ((uint32_t) q1 << 16);
+    const int b0 = (c64 & 1) * 4;                // the first set's bit pair in the qh byte (0 or 4)
+    const int b1 = b0 + 2;                       // the second set's
+    uint32_t cl = 0, ch = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t byte0 = (raw >> (8 * k)) & 0xFFu;
+        const uint32_t byte1 = (raw2 >> (8 * k)) & 0xFFu;
+        const uint32_t n0 = high ? (byte0 >> 4) : (byte0 & 0x0Fu);
+        const uint32_t n1 = high ? (byte1 >> 4) : (byte1 & 0x0Fu);
+        const uint32_t q = (qhb >> (8 * k)) & 0xFFu;
+        cl |= (n0 | (((q >> b0) & 3u) << 4)) << (8 * k);
+        ch |= (n1 | (((q >> b1) & 3u) << 4)) << (8 * k);
+    }
+    const __half d = __ushort_as_half((unsigned short) (*(const uint16_t*) (wp + 208)));
+    const float df = __half2float(d);
+    const int si = (c64 / 2) * 8 + (c64 & 1) * 4 + j4 / 16;
+    const float s0 = (float) (int8_t) wp[192 + si];
+    const float s1 = (float) (int8_t) wp[192 + si + 2];
+    const __half2 ds0 = __floats2half2_rn(df * s0, df * s0);
+    const __half2 ds1 = __floats2half2_rn(df * s1, df * s1);
+    const __half2 bs0 = __floats2half2_rn(-32.0f * df * s0, -32.0f * df * s0);
+    const __half2 bs1 = __floats2half2_rn(-32.0f * df * s1, -32.0f * df * s1);
+    const __half2 c1024 = __floats2half2_rn(1024.0f, 1024.0f);
+    wq[0] = __hfma2(__hsub2(pack2(cl, cl >> 8, 0xFF), c1024), ds0, bs0);
+    wq[1] = __hfma2(__hsub2(pack2(cl >> 16, cl >> 24, 0xFF), c1024), ds0, bs0);
+    wq[2] = __hfma2(__hsub2(pack2(ch, ch >> 8, 0xFF), c1024), ds1, bs1);
+    wq[3] = __hfma2(__hsub2(pack2(ch >> 16, ch >> 24, 0xFF), c1024), ds1, bs1);
+}
+
 /// The lane's 8 values of one superblock of one weight row, dequantized.
 ///
 /// `wp` the block's start, `c64` the 64-value group (0..3), `j4` the lane's first byte
@@ -129,6 +191,7 @@ __device__ __forceinline__ void load_block(const uint8_t* a, int j4, uint32_t& c
 /// + 0..3), wq[2..3] the high nibbles (the values 64*c64 + 32 + j4 + 0..3).
 template <int QT>
 __device__ __forceinline__ void dequant_block(const uint8_t* __restrict__ wp, int c64, int j4, __half2 wq[4]) {
+    if (QT == T_Q6_K) { dequant_block_q6k(wp, c64, j4, wq); return; }
     const int cmask = (QT == T_Q4_K) ? 0x0F : 0x1F;
     const int p = 2 * c64;                 // the fifth bit's place in qh[l] (Q5_K)
     const uint4 h = ldg128(wp);

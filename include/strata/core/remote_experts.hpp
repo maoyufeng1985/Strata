@@ -85,6 +85,13 @@ public:
     bool drain(int slot, std::string& err);
     /// Drain every in-flight slot. Call at forward end and before any ExpertCache mutation.
     void drain_all();
+    /// #578 STRATA_DECODE_POOL_OFFLOAD=1: finish()'s stream settle, split out so a worker thread can settle on
+    /// a shared CUDA event (ev != nullptr, recorded on this stream after begin()) instead of the stream;
+    /// the default path (ev == nullptr) is the rings==1 settle drain(0) does.
+    bool settle(cudaEvent_t ev, std::string& err);
+    /// #578 STRATA_DECODE_POOL_OFFLOAD=1: the host-side half of finish() - the drain of this layer's pinned
+    /// rows (or the optimized-path accumulate) into `out`.  The stream is already settled by the caller.
+    void drain_rows(float* out);
     cudaEvent_t ev_done(int slot) const;
     cudaStream_t stream() const { return stream_; }
     int rings() const { return rings_; }
