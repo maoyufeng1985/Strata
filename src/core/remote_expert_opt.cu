@@ -62,6 +62,33 @@ __global__ void copy_cpu_rows(float4* dst, const volatile float4* src, const int
 }
 } // namespace
 
+// STRATA_REMOTE_FLAG_WAIT: the completion word.  One thread, one store.  The fence BEFORE it is the load-bearing
+// one: it orders the result rows the stream wrote before this launch against the word, so a host that sees the word
+// sees the rows.  Launch is <<<1, 1>>>: the store and the fence run in the same single thread.
+__global__ void store_flag(unsigned int* flag, unsigned int value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
+}
+
+bool helper_flag_store(void* stream, unsigned int* d_flag, unsigned int value, std::string& err) {
+    if (d_flag == nullptr) { err = "the completion flag has no device alias"; return false; }
+    store_flag<<<1, 1, 0, (cudaStream_t) stream>>>(d_flag, value);
+    return check(cudaGetLastError(), err);
+}
+
+bool helper_sum_reduce(void* stream, const float* parts, const void* metadata, float* d_sum,
+                       float* h_out, int64_t n_embd, int64_t k, int64_t cap, int tokens,
+                       bool write_mapped, std::string& err) {
+    auto* s = (cudaStream_t) stream;
+    reduce_experts<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) tokens), 256, 0, s>>>(
+        parts, (const int32_t*) metadata, (const float*) metadata + cap, d_sum,
+        (int) n_embd, (int) k);
+    if (write_mapped) return check(cudaGetLastError(), err);
+    return check(cudaMemcpyAsync(h_out, d_sum, (size_t) tokens * (size_t) n_embd * sizeof(float),
+                                 cudaMemcpyDeviceToHost, s), err);
+}
+
 void RemoteExpertOpt::attach(RemoteExperts& remote) {
     // attach() runs before open(); RING is parsed in open(). open() refuses remote_opt_ when
     // rings>1, and init() double-checks after open.

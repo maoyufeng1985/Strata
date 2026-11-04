@@ -10,6 +10,18 @@ namespace strata::core {
 class RemoteExperts;
 class ExpertSource;
 
+/// STRATA_Q36_HELPER_SUM: weighted per-token reduce on a helper (same arithmetic as RemoteExpertOpt::reduce).
+/// `metadata` is row[cap] int32s then weight[cap] floats on the device; `write_mapped` writes the sum
+/// straight into the mapped host buffer at `h_out` (no D2H).
+bool helper_sum_reduce(void* stream, const float* parts, const void* metadata, float* d_sum,
+                       float* h_out, int64_t n_embd, int64_t k, int64_t cap, int tokens,
+                       bool write_mapped, std::string& err);
+
+/// STRATA_REMOTE_FLAG_WAIT: publish a completion word into mapped pinned HOST memory at the end of a helper's
+/// stream, so the primary can poll a host address instead of synchronising a CUDA event that lives on the
+/// helper's device.  `d_flag` is the device alias of a cudaHostAlloc'd, mapped 4-byte word.
+bool helper_flag_store(void* stream, unsigned int* d_flag, unsigned int value, std::string& err);
+
 // Remote Expert Decode Optimization v1 on existing helper caches. One instance per serial engine.
 class RemoteExpertOpt {
 public:

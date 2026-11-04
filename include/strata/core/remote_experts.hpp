@@ -47,9 +47,14 @@ public:
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
     /// or null on the one-token path. Entries already served on CUDA0 are excluded.
     /// Legacy single-window path: always fills slot 0 (Flash-Next callers unchanged).
+    /// `sum_wts`: when non-null (and remote_opt is not attached), the helper reduces its owned
+    /// expert rows into one weighted sum per token before the D2H — finish() then writes
+    /// `n_tok` contiguous rows instead of scattering by original entry.  q36 uses this under
+    /// STRATA_Q36_HELPER_SUM=1 so row_split helpers can return T rows each (PEER_SUM-shaped)
+    /// without RemoteExpertOpt's shared accumulate, which cannot run under MARSHAL.
     bool begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                int64_t k, const int32_t* kind, const int32_t* primary_res,
-               std::string& err);
+               std::string& err, const float* sum_wts = nullptr);
     /// STRATA_Q36_HELPER_RING: launch into a free ring slot. Returns slot >= 0, -1 if the
     /// window is empty (nothing this helper owns), or -2 on error (`err` set).
     int begin_win(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
@@ -102,6 +107,10 @@ public:
     const int32_t* src_row(int slot) const;
     int64_t compact_n(int slot) const;
     int64_t window_n(int slot) const;
+    /// STRATA_Q36_HELPER_SUM=1: the last begin() reduced to per-token sums.  finish()/drain_rows then
+    /// write `sum_toks()` contiguous rows (one per token) instead of scattering by original entry.
+    bool sum_mode(int slot = 0) const;
+    int64_t sum_toks(int slot = 0) const;
     int64_t resident() const { return cache_.resident(); }
     int64_t computed() const { return computed_; }
     int64_t launched_layers() const { return launched_layers_; }
@@ -138,6 +147,7 @@ private:
         float* z_x_ = nullptr;
         float* z_out_ = nullptr;
         float* d_out_ = nullptr;
+        float* d_sum_ = nullptr;       ///< STRATA_Q36_HELPER_SUM: per-token reduce dest (non-zero-copy)
         uint8_t* d_q8_ = nullptr;
         float* d_scales_ = nullptr;
         void* d_scratch_ = nullptr;
@@ -149,9 +159,15 @@ private:
         unsigned long long* d_ptr_ = nullptr;
         int32_t* d_src_row_ = nullptr;   ///< helper-side copy; engine uploads host src_row_ to primary
         cudaEvent_t ev_done_ = nullptr; ///< created only when rings_ > 1
+        unsigned int* h_flag_ = nullptr; ///< STRATA_REMOTE_FLAG_WAIT: the completion word, pinned and mapped
+        unsigned int* d_flag_ = nullptr; ///< its device alias on the helper (null: the event path is used)
+        unsigned int flag_seq_ = 0;      ///< the value this slot's last launch publishes
+        bool flag_ok_ = false;           ///< that launch's store was enqueued, so drain may poll it
         bool busy_ = false;
+        bool sum_ = false;             ///< last begin reduced to per-token sums
         int32_t groups_ = 0;
         int64_t n_ = 0;                 ///< last window's n_tok * k
+        int64_t sum_toks_ = 0;          ///< n_tok when sum_; else 0
         std::vector<uint8_t> owned_;
         std::vector<int32_t> group_of_, group_id_;
         std::vector<int32_t> start_, dst_, tok_, original_row_;
@@ -161,11 +177,14 @@ private:
 
     /// Fill `slot` (draining it first if busy). Shared by begin (slot 0) and begin_win.
     int begin_slot(int slot, int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
-                   int64_t k, const int32_t* kind, const int32_t* primary_res, std::string& err);
+                   int64_t k, const int32_t* kind, const int32_t* primary_res, std::string& err,
+                   const float* sum_wts = nullptr);
     bool alloc_win(Win& w, size_t meta_bytes, size_t scratch, std::string& err);
     void free_win(Win& w);
+    size_t sum_meta_bytes() const { return (size_t) cap_ * sizeof(int32_t) + (size_t) cap_ * sizeof(float); }
 
     RemoteExpertOpt* remote_opt_ = nullptr;
+    bool helper_sum_ = false; ///< STRATA_Q36_HELPER_SUM=1 at open (rings==1, no remote_opt)
     int device_ = -1;
     int rings_ = 1;            ///< 1 = legacy (RING unset/0); >=2 = HELPER_RING depth
     int rr_ = 0;               ///< ping-pong index for begin_win

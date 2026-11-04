@@ -129,12 +129,28 @@ public:
     /// 0.81 GB/s against the primary's 6.03 (192.168.1.98, 2026-10-25), and the window is the biggest thing the
     /// prompt sends up.  With it set, `h_staged` is REQUIRED (the caller has to have quantized the window: the
     /// helper cannot quantize a window that never arrived in fp32).
+    ///
+    /// `host_rows` / `host_max_rows`: the CALLER'S OWN counts of this helper's owned entries and of its widest
+    /// expert - the two numbers the launch's grid is sized on.  When they are given (>= 0), prepare_end() does NOT
+    /// wait for the device's copy of them: the wait sat behind the helper's whole layer (its upload, its compute
+    /// and its down leg - 18.4 ms measured on 192.168.1.98) because the plan's event is FIFO behind that work on
+    /// the helper's one stream, and the caller's counts let the launch be sized without it.  The plan's kernels
+    /// are still enqueued before the launch's, on the same stream, so the device's own numbers are what the
+    /// launch runs on; the caller's are only the grid's bound.  The two are still compared - at the next
+    /// prepare_begin(), where the plan's event has long completed - and a disagreement ends the run.
+    /// -1 (the default) keeps the old behaviour: prepare_end() waits for the device's numbers.
+    /// `stage_ev` (STRATA_Q36_STAGE_ASYNC): the caller staged the window with ASYNC copies and recorded this event
+    /// on the PRIMARY's stream instead of waiting for them.  When given, the helper's stream waits on it before the
+    /// first upload that reads the staged bytes, so the host never blocks on the staging D2H.  nullptr (the default)
+    /// is the old path: the caller had already synchronised, so there is nothing to wait for.
     bool prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok, std::string& err,
                        const void* h_staged = nullptr, const int32_t* ids_staged = nullptr, bool q8_window = false,
-                       const float* wts_staged = nullptr);
+                       const float* wts_staged = nullptr, int64_t host_rows = -1, int64_t host_max_rows = -1,
+                       cudaEvent_t stage_ev = nullptr);
     /// The second half: wait for the helper's stream and read the owned-row count and the widest expert back.
     /// Must follow a successful prepare_begin() for the same layer on the same helper.
     bool prepare_end(std::string& err);
+
 
     /// Compute this helper's owned entries of the window prepare() staged, on the helper, and write their rows
     /// into the PRIMARY's `eparts` starting at `eparts_row_base` (the run order documented above).
@@ -143,7 +159,11 @@ public:
     /// STRATA_Q36_PEER_SUM=1: what is sent is not the run of rows but the PER-TOKEN WEIGHTED SUMS - one row per
     /// token of the window - so `eparts_row_base` names nothing (the sums have no rows in the primary's `eparts`)
     /// and the caller reads transport_rows() to learn how many rows arrived.
-    bool launch(int64_t layer, float* eparts_primary, int64_t eparts_row_base, std::string& err);
+    ///
+    /// STRATA_Q36_PREFILL_SPLIT=2: `slot` (0 or 1) selects which per-half pinned up-leg buffer the result is staged
+    /// into, so a second half's launch() cannot overwrite the first half's pinned image before the first half's
+    /// wait() uploads it.  Flag-off: the engine passes 0 (the default).
+    bool launch(int64_t layer, float* eparts_primary, int64_t eparts_row_base, std::string& err, int slot = 0);
 
     /// Record the helper's completion and make the PRIMARY stream `st_primary` wait for it, so a kernel the caller
     /// issues on `st_primary` afterwards reads this helper's rows.  Nothing is copied to the host.
@@ -153,7 +173,10 @@ public:
     /// a value plus one fp32 scale per 128 values) under STRATA_Q36_PEER_I8=1.  When it is not null the rows travel
     /// packed and land there; the caller unpacks them back into `eparts` on the same stream.  When it is null the
     /// rows travel as fp32, straight into `eparts`, and nothing about the route changes.
-    bool wait(cudaStream_t st_primary, void* packed_stage, std::string& err);
+    ///
+    /// STRATA_Q36_PREFILL_SPLIT=2: the completion event slot (0 or 1).  The engine alternates the slot per half,
+    /// so the two halves' completions never collide on one event.  Flag-off: 0 always.
+    bool wait(cudaStream_t st_primary, void* packed_stage, std::string& err, int slot = 0);
 
     /// Owned entries the last launch() computed (0 before any), and launches so far (the evidence line's numbers).
     int64_t rows() const;

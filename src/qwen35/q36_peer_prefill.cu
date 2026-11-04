@@ -105,6 +105,20 @@ static bool peer_sum() {
     return on;
 }
 
+/// STRATA_Q36_PREFILL_SPLIT=2: the engine's half-chunk row split.  When it is on, the row plan's D2H read is
+/// reordered ahead of the window's upload, so the host's wait for the plan's numbers (the two D2H reads) no
+/// longer waits on the 4.72 MB window transfer - the window runs while the primary's GPU works.  The host's
+/// plan-wait drops from ~4.8 ms to ~0.3 ms per half (MEASURED 2026-11-03, 192.168.1.98).  OFF by default: with
+/// the variable unset the original order (window upload, then plan kernels, then D2H reads) is preserved.
+static int prefill_split_halves() {
+    static const int v = [] {
+        const char* s = std::getenv("STRATA_Q36_PREFILL_SPLIT");
+        if (!s || s[0] != '2' || s[1] != '\0') return 0;
+        return 2;
+    }();
+    return v;
+}
+
 /// The bytes one row takes in the int8 transport: the values (one byte each) and the scales (one fp32 per 128
 /// values).  The same number on both sides of the link - the primary unpacks with it.
 static size_t i8_row_bytes(int64_t n_cols) {
@@ -372,6 +386,18 @@ struct PeerPrefill36::Impl {
     const strata::core::RemoteExperts* helper = nullptr;
     cudaStream_t stream = nullptr;
     cudaEvent_t ev = nullptr;
+    // STRATA_Q36_PREFILL_SPLIT=2: a SECOND completion event, for the second half's launch.  The engine's
+    // two-phase layer loop dispatches half 0 and half 1 in the same layer, and each half's launch() records
+    // into its own event (slot 0 = half 0, slot 1 = half 1).  wait() consumes the event for the half it was
+    // last called with, so the two halves' completions do not collide.  Flag-off: slot 0 is the event, slot 1
+    // is never recorded or waited on.
+    cudaEvent_t ev2 = nullptr;
+    // STRATA_Q36_PREFILL_SPLIT=2: the plan-complete event.  Recorded in prepare_begin() right after the two D2H
+    // reads of the plan's numbers, so prepare_end() can wait on this event instead of the whole stream - the
+    // window's upload (the big transfer) runs on the helper's stream after this record, and the primary's GPU
+    // can work while it is in flight.  Flag-off: never recorded, never waited on; prepare_end() falls back to
+    // cudaStreamSynchronize.
+    cudaEvent_t plan_ev = nullptr;
     std::unique_ptr<MMQ::Context> mctx;   // per executor, created on the helper
 
     // WHICH ROUTE THE WINDOW CROSSES BY - decided once in open() and fixed for the life of the executor.  true: the
@@ -387,19 +413,26 @@ struct PeerPrefill36::Impl {
     const float* h_x_use = nullptr;
     const uint8_t* h_x8_use = nullptr;   // the same window already in q8_1 (the caller's staging)
     const int32_t* h_ids_use = nullptr;
-    float* h_out = nullptr;      // [cap][n_embd] this helper's run, on its way back
+    // STRATA_Q36_PREFILL_SPLIT=2: the pinned UP-LEG buffers are per-half arrays.  With the split the engine calls
+    // launch(h0) then launch(h1) BEFORE either wait(): on the helper's single stream h1's D2H into the pinned
+    // buffer is enqueued after h0's, so a single slot has h1 overwrite h0's pinned image before wait(h0) uploads
+    // it to the primary.  One slot per half makes h0's image survive until its own wait.  Device-side buffers
+    // (d_out/d_out16/d_out_i8/d_sums) are NOT doubled: they are only ever read and written on the helper stream,
+    // whose order already separates h0's D2H from h1's next write.  Flag-off: only slot 0 is touched.
+    float* h_out[2] = {nullptr, nullptr};       // [slot][cap][n_embd] this helper's run, on its way back
     // STRATA_Q36_PEER_F16=1: the same run as fp16.  d_out16 is the packed image on the helper, h_out16 the pinned
     // staging the D2H writes.  Both exist only when the flag is on, so a default run allocates exactly what it did.
     __half* d_out16 = nullptr;   // [cap][n_embd] the packed run, on the helper
-    __half* h_out16 = nullptr;   // [cap][n_embd] the packed run, on its way back
+    __half* h_out16[2] = {nullptr, nullptr};   // [slot][cap][n_embd] the packed run, on its way back
     unsigned int* d_f16max = nullptr;   // [1] the largest magnitude the packing kernel saw
     unsigned int* h_f16max = nullptr;   // [1] its pinned copy, read back once per layer
     unsigned int* d_f16rel = nullptr;   // [1] the largest RELATIVE error of the fp16 round trip
     unsigned int* h_f16rel = nullptr;   // [1] its pinned copy
     // STRATA_Q36_PEER_I8=1: the same run as int8 (one scale per 128 values).  d_out_i8 is the packed image on the
     // helper, h_out_i8 the pinned staging the D2H writes, and the two counters are what the packing measured.
+    // STRATA_Q36_PREFILL_SPLIT=2: h_out_i8 is per-half (see h_out's comment) - the pinned staging, not the device image.
     uint8_t* d_out_i8 = nullptr;   // [cap][i8 row bytes] the packed run, on the helper
-    uint8_t* h_out_i8 = nullptr;   // [cap][i8 row bytes] the packed run, on its way back
+    uint8_t* h_out_i8[2] = {nullptr, nullptr};   // [slot][cap][i8 row bytes] the packed run, on its way back
     unsigned int* d_i8max = nullptr;   // [1] the largest magnitude the int8 packing saw
     unsigned int* h_i8max = nullptr;   // [1] its pinned copy, read back once per layer
     unsigned int* d_i8err = nullptr;   // [1] the largest error, as a fraction of the block's own magnitude
@@ -413,17 +446,23 @@ struct PeerPrefill36::Impl {
     float* d_wgt = nullptr;    // [cap]          the same weights, in the plan's row order
     // The weights the primary staged for this layer (the shared staging, the same one every helper reads).
     const float* h_w_use = nullptr;
-    // What a host-route launch() left in h_out, and where it belongs.  It is remembered rather than uploaded at once
-    // because wait() is the only method the caller hands the PRIMARY's stream to, and the upload has to be ordered
-    // against the primary's own work there.
-    float* pending_eparts = nullptr;
-    int64_t pending_base = 0, pending_n = 0;
-    // STRATA_Q36_PEER_F16=1 / STRATA_Q36_PEER_I8=1: whether the rows waiting to go back are the packed ones, and in
-    // which format.  The down leg's shape is decided in launch() (which route the rows took) and read back here.
-    bool pending_f16 = false;
-    bool pending_i8 = false;
-    // STRATA_Q36_PEER_SUM=1: the rows the last launch() SENT (the per-token sums' count when the sums are on, the
-    // run's row count otherwise).  The primary unpacks that many rows, so it needs the number.
+    // What a host-route launch() left in h_out[slot], and where it belongs.  It is remembered rather than uploaded at
+    // once because wait() is the only method the caller hands the PRIMARY's stream to, and the upload has to be ordered
+    // against the primary's own work there.  STRATA_Q36_PREFILL_SPLIT=2: per-half, so launch(h1) cannot overwrite the
+    // pending metadata wait(h0) still reads.  Flag-off: slot 0 only.
+    struct Pending {
+        float* eparts = nullptr;
+        int64_t base = 0, n = 0;
+        bool f16 = false, i8 = false;
+        int64_t transport_rows = 0;
+    };
+    Pending pend[2];
+    // Which slot the LAST launch() filled.  launch() sets it from the half index the engine passed; wait() selects
+    // the same slot's pending + event.  Flag-off: always 0.
+    int launch_slot = 0;
+    // STRATA_Q36_PEER_SUM=1: the rows the wait() just surfaced (the per-token sums' count when sums are on, the run's
+    // row count otherwise).  The engine reads it right after wait() in the same half, so a single cached value is
+    // enough even though the per-half count lives in pend[slot].transport_rows.
     int64_t transport_rows = 0;
 
     // everything below is allocated on `device`
@@ -489,6 +528,16 @@ struct PeerPrefill36::Impl {
     // would buy nothing.  Pinned, the read rides the helper's stream like every other copy and prepare_begin()
     // returns without waiting.
     int32_t* h_plan = nullptr;   // [2] pinned: the owned-row count and the widest expert
+    // STRATA_Q36_PREFILL_SPLIT=2: THE CALLER'S OWN COUNTS of this helper's owned entries and of its widest
+    // expert.  When they are given (>= 0), prepare_end() does not wait for the device's copy of them: that wait
+    // sat behind the helper's WHOLE layer - its upload, its compute and its down leg, 18.4 ms measured on
+    // 192.168.1.98 - because the plan's event is FIFO behind that work on the helper's one stream.  The plan's
+    // kernels stay enqueued before the launch's, on the same stream, so the device's numbers are still what the
+    // launch runs on; the caller's are only the grid's bound.  The two are compared at the next prepare_begin(),
+    // where the plan's event has long completed, and a disagreement ends the run.
+    // The CALLER's counts of the PREVIOUS call.  The witness at the top of prepare_begin() compares these, and only
+    // then are they replaced - so they must not be shifted again at the end of the function.
+    int64_t host_rows = -1, host_max_rows = -1;
     // The window's token count, kept for prepare_end()'s bound check (the row count cannot exceed n_tok * k).
     int64_t prep_n_tok = 0;
 
@@ -710,6 +759,20 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
         close();
         return false;
     }
+    // STRATA_Q36_PREFILL_SPLIT=2: the second completion event (half 1).  Allocated unconditionally - a closed
+    // executor's `ev2` stays null and no code path reads it (close() destroys it).  The cost is one cudaEvent
+    // per executor, allocated at open() and freed at close().
+    if (!ck(cudaEventCreateWithFlags(&m.ev2, cudaEventDisableTiming), "helper event 2", err)) {
+        close();
+        return false;
+    }
+    // STRATA_Q36_PREFILL_SPLIT=2: the plan-complete event, recorded in prepare_begin() after the two D2H reads
+    // of the plan's numbers, so prepare_end() waits on it and not on the whole stream.  Flag-off: never
+    // recorded; prepare_end() falls back to cudaStreamSynchronize.
+    if (!ck(cudaEventCreateWithFlags(&m.plan_ev, cudaEventDisableTiming), "plan event", err)) {
+        close();
+        return false;
+    }
     // MMQ's context holds a per-device pool, so it is created (and destroyed) on the helper, one per executor.
     m.mctx.reset(new MMQ::Context());
 
@@ -790,22 +853,34 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
     // host-wide, but the copies that read and write it name the primary.
     if (!m.p2p) {
         On onp(m.primary);
+        // STRATA_Q36_PREFILL_SPLIT=2: the pinned UP-LEG staging is per-half.  The split enqueues launch(h0) then
+        // launch(h1) before either wait(), and on the helper's single stream h1's D2H lands in the pinned buffer
+        // after h0's but before wait(h0) uploads it - one slot would have h1 overwrite h0's pinned image.  Two
+        // slots make h0's image survive until its own wait.  Flag-off: ONE slot is allocated (the old behaviour),
+        // slot 1 stays null and the engine never names it.
+        const int n_slots = prefill_split_halves() == 2 ? 2 : 1;
         const bool hok =
             ck(cudaHostAlloc((void**) &m.h_x, nf * (size_t) n_embd * sizeof(float), cudaHostAllocDefault),
                "pinned activations", err) &&
             ck(cudaHostAlloc((void**) &m.h_ids, nf * sizeof(int32_t), cudaHostAllocDefault), "pinned routing", err) &&
-            ck(cudaHostAlloc((void**) &m.h_out, nf * (size_t) n_embd * sizeof(float), cudaHostAllocDefault),
+            ck(cudaHostAlloc((void**) &m.h_out[0], nf * (size_t) n_embd * sizeof(float), cudaHostAllocDefault),
                "pinned result rows", err);
         if (!hok) {   // a null staging buffer would turn every copy below into a silent no-op: refuse the helper
             close();
             return false;
         }
+        for (int s = 1; s < n_slots; ++s)
+            if (!ck(cudaHostAlloc((void**) &m.h_out[s], nf * (size_t) n_embd * sizeof(float), cudaHostAllocDefault),
+                    "pinned result rows (half)", err)) {
+                close();
+                return false;
+            }
         // STRATA_Q36_PEER_F16=1: the pinned staging for the packed up leg, and the slot the packing kernel's
         // measurement comes back through.  Only when the flag is on, so a default run's host allocations are the
         // three above and nothing else.
         if (peer_f16() && !peer_i8()) {
             const bool fok =
-                ck(cudaHostAlloc((void**) &m.h_out16, nf * (size_t) n_embd * sizeof(__half), cudaHostAllocDefault),
+                ck(cudaHostAlloc((void**) &m.h_out16[0], nf * (size_t) n_embd * sizeof(__half), cudaHostAllocDefault),
                    "pinned packed result rows", err) &&
                 ck(cudaHostAlloc((void**) &m.h_f16max, sizeof(unsigned int), cudaHostAllocDefault),
                    "pinned packed magnitude", err) &&
@@ -815,6 +890,12 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
                 close();
                 return false;
             }
+            for (int s = 1; s < n_slots; ++s)
+                if (!ck(cudaHostAlloc((void**) &m.h_out16[s], nf * (size_t) n_embd * sizeof(__half),
+                                      cudaHostAllocDefault), "pinned packed result rows (half)", err)) {
+                    close();
+                    return false;
+                }
         }
         // STRATA_Q36_PEER_I8=1: the pinned staging for the int8 down leg, and the slots the packing kernel's
         // measurements come back through.  Only when the flag is on, so a default run's host allocations are the
@@ -822,7 +903,7 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
         if (peer_i8()) {
             const size_t rb = i8_row_bytes(n_embd);
             const bool iok =
-                ck(cudaHostAlloc((void**) &m.h_out_i8, nf * rb, cudaHostAllocDefault),
+                ck(cudaHostAlloc((void**) &m.h_out_i8[0], nf * rb, cudaHostAllocDefault),
                    "pinned packed int8 result rows", err) &&
                 ck(cudaHostAlloc((void**) &m.h_i8max, sizeof(unsigned int), cudaHostAllocDefault),
                    "pinned packed int8 magnitude", err) &&
@@ -832,6 +913,12 @@ bool PeerPrefill36::open(const strata::core::RemoteExperts& helper, int64_t n_la
                 close();
                 return false;
             }
+            for (int s = 1; s < n_slots; ++s)
+                if (!ck(cudaHostAlloc((void**) &m.h_out_i8[s], nf * rb, cudaHostAllocDefault),
+                        "pinned packed int8 result rows (half)", err)) {
+                    close();
+                    return false;
+                }
         }
     }
     // The row plan's two numbers, PINNED, on both routes: they are the target of a device-to-host copy that has to
@@ -879,6 +966,10 @@ void PeerPrefill36::close() {
         for (void* p : frees)
             if (p != nullptr) cudaFree(p);
         if (m.ev != nullptr) cudaEventDestroy(m.ev);
+        if (m.ev2 != nullptr) cudaEventDestroy(m.ev2);
+        m.ev2 = nullptr;
+        if (m.plan_ev != nullptr) cudaEventDestroy(m.plan_ev);
+        m.plan_ev = nullptr;
         if (m.stream != nullptr) cudaStreamDestroy(m.stream);
         cudaGetLastError();
     }
@@ -886,19 +977,21 @@ void PeerPrefill36::close() {
     // after the PRIMARY has settled (wait() issued its H2D on a stream this class only ever sees as an argument, so
     // the one handle it can drain is the device's).  Both routes clear the pointers, so a close() of a link box leaves
     // nothing to confuse the next open().
-    if (m.primary >= 0 && (m.h_x != nullptr || m.h_ids != nullptr || m.h_out != nullptr || m.h_plan != nullptr ||
-                           m.h_out16 != nullptr || m.h_f16max != nullptr || m.h_out_i8 != nullptr ||
+    if (m.primary >= 0 && (m.h_x != nullptr || m.h_ids != nullptr || m.h_out[0] != nullptr || m.h_plan != nullptr ||
+                           m.h_out16[0] != nullptr || m.h_f16max != nullptr || m.h_out_i8[0] != nullptr ||
                            m.h_i8max != nullptr)) {
         On onp(m.primary);
         cudaDeviceSynchronize();
         if (m.h_x != nullptr) cudaFreeHost(m.h_x);
         if (m.h_ids != nullptr) cudaFreeHost(m.h_ids);
-        if (m.h_out != nullptr) cudaFreeHost(m.h_out);
+        for (int s = 0; s < 2; ++s) {
+            if (m.h_out[s] != nullptr) cudaFreeHost(m.h_out[s]);
+            if (m.h_out16[s] != nullptr) cudaFreeHost(m.h_out16[s]);
+            if (m.h_out_i8[s] != nullptr) cudaFreeHost(m.h_out_i8[s]);
+        }
         if (m.h_plan != nullptr) cudaFreeHost(m.h_plan);
-        if (m.h_out16 != nullptr) cudaFreeHost(m.h_out16);
         if (m.h_f16max != nullptr) cudaFreeHost(m.h_f16max);
         if (m.h_f16rel != nullptr) cudaFreeHost(m.h_f16rel);
-        if (m.h_out_i8 != nullptr) cudaFreeHost(m.h_out_i8);
         if (m.h_i8max != nullptr) cudaFreeHost(m.h_i8max);
         if (m.h_i8err != nullptr) cudaFreeHost(m.h_i8err);
         cudaGetLastError();
@@ -908,21 +1001,22 @@ void PeerPrefill36::close() {
     m.p2p = true;
     m.h_x = nullptr;
     m.h_ids = nullptr;
-    m.h_out = nullptr;
+    m.h_out[0] = m.h_out[1] = nullptr;
     m.h_plan = nullptr;
-    m.h_out16 = nullptr;
+    m.h_out16[0] = m.h_out16[1] = nullptr;
     m.h_f16max = nullptr;
     m.h_f16rel = nullptr;
-    m.h_out_i8 = nullptr;
+    m.h_out_i8[0] = m.h_out_i8[1] = nullptr;
     m.h_i8max = nullptr;
     m.h_i8err = nullptr;
-    m.pending_eparts = nullptr;
-    m.pending_base = 0;
-    m.pending_n = 0;
-    m.pending_f16 = false;
-    m.pending_i8 = false;
+    m.pend[0] = {};
+    m.pend[1] = {};
+    m.transport_rows = 0;
+    m.launch_slot = 0;
     m.stream = nullptr;
     m.ev = nullptr;
+    m.ev2 = nullptr;
+    m.plan_ev = nullptr;
     m.d_x = m.d_gu = m.d_h = m.d_out = m.d_ys = nullptr;
     m.d_xq = m.d_hq = nullptr;
     m.d_ids = m.d_ident = m.d_src = m.d_map = m.d_rank = nullptr;
@@ -955,7 +1049,8 @@ bool PeerPrefill36::host_route() const { return !impl_->p2p; }
 
 bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const int32_t* ids_primary, int64_t n_tok,
                                    std::string& err, const void* h_staged, const int32_t* ids_staged,
-                                   bool q8_window, const float* wts_staged) {
+                                   bool q8_window, const float* wts_staged, int64_t host_rows, int64_t host_max_rows,
+                                   cudaEvent_t stage_ev) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: prepare() on a closed executor"; return false; }
     if (h_primary == nullptr || ids_primary == nullptr) { err = "q36 peer prefill: null activations or routing"; return false; }
@@ -966,6 +1061,25 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
               std::to_string(m.cap) + " open() allocated";
         return false;
     }
+    // THE PREVIOUS CALL'S WITNESS.  When the caller sizes the launch from its own counts, the device's copy of
+    // them is not collected until later - so the two answers are compared HERE, where the previous call's plan
+    // event has long completed (it is recorded right after the plan's read-back, before that call's upload and
+    // compute, so it does not wait for the helper's arithmetic).  The read is of the pinned pair the device's
+    // read-back filled, and this call's own read-back is enqueued further down, so nothing overwrites it first.
+    if (m.host_rows >= 0 && m.plan_ev != nullptr) {
+        if (!ck(cudaEventSynchronize(m.plan_ev), "the previous row plan", err)) return false;
+        const int32_t dev_rows = m.h_plan[0], dev_max = m.h_plan[1];
+        if (dev_rows != (int32_t) m.host_rows || dev_max != (int32_t) m.host_max_rows) {
+            err = "q36 peer prefill: layer " + std::to_string((long long) m.prep_layer) +
+                  ": the helper planned " + std::to_string((long long) dev_rows) +
+                  " rows and a widest expert of " + std::to_string((long long) dev_max) +
+                  " rows, the caller counted " + std::to_string((long long) m.host_rows) +
+                  " rows and " + std::to_string((long long) m.host_max_rows);
+            return false;
+        }
+    }
+    m.host_rows = host_rows;
+    m.host_max_rows = host_max_rows;
     m.prepared = false;
     const int n_ent = (int) (n_tok * m.k);
     const int64_t ne = m.n_expert;
@@ -1111,14 +1225,36 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
     }
 
     On on(m.device);
+    // STRATA_Q36_STAGE_ASYNC: THE HOST DID NOT WAIT FOR THE STAGING.  The caller enqueued the window's D2H with
+    // cudaMemcpyAsync and recorded `stage_ev` on the primary's stream instead of synchronising (that sync measured
+    // 2.30 ms a layer with the GPU idle behind it - most of the plan's remaining cost).  Ordering moves to this
+    // helper's stream: every upload below reads the staged bytes, so they wait on that one event.  Cross-device
+    // event waits are legal, and the pinned slots cannot be reused early - moe_end waits for this half's helpers
+    // before the next plan for the same slot (peer_prefill_wait_impl).
+    if (!m.p2p && stage_ev != nullptr) {
+        if (!ck(cudaStreamWaitEvent(m.stream, stage_ev, 0), "wait for the staged window", err)) return false;
+    }
     // ---- the window onto the helper: the primary's activations and routing.  On the link route the two peer copies
     // are the whole story; on the host route the pinned staging above was just filled, and only the upload is left.
+    //
+    // STRATA_Q36_PREFILL_SPLIT=2: REORDERED.  The ids' upload (64 KB for a 512-token window) and the four plan
+    // kernels run BEFORE the big window's upload, so the two D2H reads of the plan's numbers land on the helper's
+    // stream without waiting for the 4.72 MB window transfer.  prepare_end() then waits on an EVENT recorded
+    // right after the D2H reads, not on the whole stream - the window's upload runs while the primary's GPU
+    // works (the split's whole point).  Flag-off: the original order is preserved.
+    const bool split_on = prefill_split_halves() == 2;
+
+    // The ids' upload: needed by the plan kernels.  In the split-on order this runs before the window's upload.
     if (m.p2p) {
-        if (!ck(cudaMemcpyPeerAsync(m.d_x, m.device, h_primary, m.primary,
-                                    (size_t) n_tok * (size_t) m.n_embd * sizeof(float), m.stream), "stage activations",
-                    err) ||
-            !ck(cudaMemcpyPeerAsync(m.d_ids, m.device, ids_primary, m.primary, (size_t) n_ent * sizeof(int32_t),
+        if (!ck(cudaMemcpyPeerAsync(m.d_ids, m.device, ids_primary, m.primary, (size_t) n_ent * sizeof(int32_t),
                                     m.stream), "stage routing", err))
+            return false;
+        // STRATA_Q36_PREFILL_SPLIT=2: the window's activation upload (the big one) is deferred after the plan
+        // kernels and the D2H reads, so the host's wait for the plan's numbers does not wait on the 4.72 MB
+        // transfer.  Flag-off: issued here, as it was.
+        if (!split_on && !ck(cudaMemcpyPeerAsync(m.d_x, m.device, h_primary, m.primary,
+                                                (size_t) n_tok * (size_t) m.n_embd * sizeof(float), m.stream),
+                             "stage activations", err))
             return false;
     } else if (m.n_pos != 0) {
         // Skipped for a layer this helper holds nothing of: n_owned can only be 0 there, so launch() returns before any
@@ -1128,16 +1264,21 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
         if (m.h_x8_use != nullptr) {
             // THE q8_1 WINDOW: a quarter of the bytes (the helpers' links measured 0.81 GB/s, the primary's
             // 6.03 - 192.168.1.98, 2026-10-25), and the helper gathers its rows instead of quantizing them.
-            if (!ck(cudaMemcpyAsync(m.d_x8, m.h_x8_use, (size_t) n_tok * MMQ::q8_row_bytes(m.n_embd),
-                                    cudaMemcpyHostToDevice, m.stream), "upload q8 activations", err) ||
-                !ck(cudaMemcpyAsync(m.d_ids, m.h_ids_use, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
+            // STRATA_Q36_PREFILL_SPLIT=2: the q8_1 upload is deferred after the plan's kernels and D2H reads.
+            if (!split_on && !ck(cudaMemcpyAsync(m.d_x8, m.h_x8_use, (size_t) n_tok * MMQ::q8_row_bytes(m.n_embd),
+                                                cudaMemcpyHostToDevice, m.stream), "upload q8 activations", err))
+                return false;
+            if (!ck(cudaMemcpyAsync(m.d_ids, m.h_ids_use, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
                     "upload routing", err))
                 return false;
-        } else if (!ck(cudaMemcpyAsync(m.d_x, m.h_x_use, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
-                                cudaMemcpyHostToDevice, m.stream), "upload activations", err) ||
-            !ck(cudaMemcpyAsync(m.d_ids, m.h_ids_use, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
-                "upload routing", err))
-            return false;
+        } else {
+            if (!split_on && !ck(cudaMemcpyAsync(m.d_x, m.h_x_use, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
+                                            cudaMemcpyHostToDevice, m.stream), "upload activations", err))
+                return false;
+            if (!ck(cudaMemcpyAsync(m.d_ids, m.h_ids_use, (size_t) n_ent * sizeof(int32_t), cudaMemcpyHostToDevice, m.stream),
+                    "upload routing", err))
+                return false;
+        }
         // STRATA_Q36_PEER_SUM=1: the routing weights, one per entry (16 KB for a 512-token window).  The helper
         // needs them to form the per-token weighted sums.
         if (peer_sum() && !ck(cudaMemcpyAsync(m.d_wts, m.h_w_use, (size_t) n_ent * sizeof(float),
@@ -1182,6 +1323,41 @@ bool PeerPrefill36::prepare_begin(int64_t layer, const float* h_primary, const i
         !ck(cudaMemcpyAsync(&m.h_plan[1], m.d_maxr, sizeof(int32_t), cudaMemcpyDeviceToHost, m.stream),
             "read widest expert", err))
         return false;
+
+    // STRATA_Q36_PREFILL_SPLIT=2: record the plan-complete event RIGHT AFTER the D2H reads and BEFORE the window's
+    // upload.  prepare_end() waits on THIS event, so its wall is the four plan kernels plus 8 bytes of read-back
+    // (~0.3 ms) instead of the multi-MB transfer.  The upload below then runs on the helper's stream while the
+    // primary's GPU works - which is the split's entire overlap.  The record MUST stay above the upload: below it,
+    // the event carries the transfer and the host's wait grows to the link's time for the whole window (measured
+    // 6 ms per helper, 18 ms a layer on 192.168.1.98).
+    if (split_on || m.host_rows >= 0) {
+        if (!ck(cudaEventRecord(m.plan_ev, m.stream), "record plan-complete", err))
+            return false;
+    }
+
+    // STRATA_Q36_PREFILL_SPLIT=2: the window's big upload is deferred to here, AFTER the plan's D2H reads, so the
+    // host's wait for the plan's numbers (prepare_end) does not wait on the 4.72 MB transfer.  The upload runs
+    // on the helper's stream while the primary's GPU works (the split's overlap).  Flag-off: the upload already
+    // ran at the top of this function (before the plan kernels), so this is a no-op.
+    if (split_on) {
+        if (m.p2p) {
+            if (!ck(cudaMemcpyPeerAsync(m.d_x, m.device, h_primary, m.primary,
+                                        (size_t) n_tok * (size_t) m.n_embd * sizeof(float), m.stream),
+                     "stage activations", err))
+                return false;
+        } else if (m.n_pos != 0) {
+            if (m.h_x8_use != nullptr) {
+                if (!ck(cudaMemcpyAsync(m.d_x8, m.h_x8_use, (size_t) n_tok * MMQ::q8_row_bytes(m.n_embd),
+                                        cudaMemcpyHostToDevice, m.stream), "upload q8 activations", err))
+                    return false;
+            } else {
+                if (!ck(cudaMemcpyAsync(m.d_x, m.h_x_use, (size_t) n_tok * (size_t) m.n_embd * sizeof(float),
+                                        cudaMemcpyHostToDevice, m.stream), "upload activations", err))
+                    return false;
+            }
+        }
+    }
+
     // STRATA_Q36_PROMPT_TIMING=1: the row-plan sync moved to prepare_end(); the two D2H reads above are the ones it
     // waits for.  The d2h timer above still counts the staging copies.
     return true;
@@ -1192,12 +1368,47 @@ bool PeerPrefill36::prepare_end(std::string& err) {
     // THE ONE HOST-BLOCKING POINT ON THE HOST ROUTE: wait for this helper's stream, which now carries the window
     // copy, the row plan and the two reads.  The host needed the row count and the widest expert to size the
     // launches, and that is all this wait is for.
-    // STRATA_Q36_PROMPT_TIMING=1: the row-plan sync.  It overlaps the primary's MMQ launch on the linked route, but
-    // it is the one host-blocking point on the whole host route, so the probe counts it and the remainder the forward
-    // total leaves over it is the primary's time.
+    //
+    // STRATA_Q36_PREFILL_SPLIT=2: when the split is on, prepare_begin() already recorded `plan_ev` right after
+    // the two D2H reads of the plan's numbers (before the window's big upload was enqueued).  Waiting on that
+    // event - not on the whole stream - means the host's wait is the plan's kernels (~0.3 ms) and the window's
+    // upload runs on the helper's stream while the primary's GPU works.  Flag-off: the event was not recorded
+    // (plan_ev is null or was not recorded this call), so fall back to the stream sync as before.
+    const bool split_on = prefill_split_halves() == 2 && m.plan_ev != nullptr;
     const auto t_sync = prompt_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (!ck(cudaStreamSynchronize(m.stream), "row plan", err))
-        return false;
+    // STRATA_Q36_PREFILL_SPLIT=2: THE CALLER'S COUNTS.  The caller already counted this helper's owned entries and
+    // its widest expert - the two numbers the launch's grid is sized on - from the routing and the ownership
+    // table, which are the same data the device's plan reads.  Waiting for the device's copy of them put the
+    // helper's whole layer on the primary's critical path: the plan's event is FIFO behind that layer's upload,
+    // compute and down leg on the helper's one stream (18.4 ms a layer, measured 2026-11-03), so the host waited
+    // for exactly the work it was trying to hide.  With the caller's counts the wait is gone and the launch is
+    // sized from the caller's numbers; the plan's kernels are still enqueued before the launch's, on the same
+    // stream, so what the launch RUNS on is the device's own plan.  The two are compared at the next
+    // prepare_begin(), and a disagreement ends the run there.
+    if (m.host_rows >= 0) {
+        if (m.host_rows > (int64_t) (m.prep_n_tok * m.k) || m.host_max_rows < 0 || m.host_max_rows > m.host_rows) {
+            err = "q36 peer prefill: the caller's count of the owned entries is impossible";
+            return false;
+        }
+        m.n_owned = (int32_t) m.host_rows;
+        m.max_rows = (int32_t) m.host_max_rows;
+        m.prepared = true;
+        if (prompt_timing()) {
+            m.prep_sync_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sync).count();
+            ++m.prep_calls;
+        }
+        return true;
+    }
+    if (split_on) {
+        // WAIT ON THE PLAN EVENT, NOT THE WHOLE STREAM.  The window's upload is queued after the event record,
+        // so the host's wait for the plan's numbers does not wait on the 4.72 MB transfer.  The window's
+        // completion is waited on later, in wait(), by the primary stream's cudaStreamWaitEvent on `ev`/`ev2`.
+        if (!ck(cudaEventSynchronize(m.plan_ev), "plan event", err))
+            return false;
+    } else {
+        if (!ck(cudaStreamSynchronize(m.stream), "row plan", err))
+            return false;
+    }
     if (prompt_timing())
         m.prep_sync_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sync).count();
     const int32_t h_owned = m.h_plan[0], h_max = m.h_plan[1];
@@ -1220,7 +1431,8 @@ bool PeerPrefill36::prepare(int64_t layer, const float* h_primary, const int32_t
     return prepare_end(err);
 }
 
-bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_row_base, std::string& err) {
+bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_row_base, std::string& err,
+                           int slot) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: launch() on a closed executor"; return false; }
     if (!m.prepared || layer != m.prep_layer) {
@@ -1228,9 +1440,21 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
         return false;
     }
     if (eparts_primary == nullptr && m.n_owned > 0) { err = "q36 peer prefill: null eparts"; return false; }
+    if (slot != 0 && slot != 1) slot = 0;
+    m.launch_slot = slot;
+    // Clear this half's pending first: a prior launch on the same slot must not leave a stale host upload for wait().
+    auto& p = m.pend[slot];
+    p = {};
     ++m.launches;
     m.rows = m.n_owned;
-    if (m.n_owned == 0) return true;   // no entry of this window is this helper's: nothing to compute, nothing to send
+    if (m.n_owned == 0) {
+        // No entry of this window is this helper's: nothing to compute, nothing to send.  The completion event is
+        // still recorded - wait() only issues the primary's cudaStreamWaitEvent, and waiting on an event from an
+        // EARLIER layer would stall this layer's combine behind work that has nothing to do with it.
+        const cudaEvent_t ev_rec = slot == 1 ? m.ev2 : m.ev;
+        if (ev_rec != nullptr && !ck(cudaEventRecord(ev_rec, m.stream), "record helper completion", err)) return false;
+        return true;
+    }
 
     On on(m.device);
     const auto& L = m.layouts[(size_t) layer];
@@ -1336,6 +1560,9 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
         if (!ck(cudaMemcpyPeerAsync(eparts_primary + eparts_row_base * m.n_embd, m.primary, pack_src, m.device,
                                     (size_t) pack_rows * (size_t) m.n_embd * sizeof(float), m.stream), "copy the run", err))
             return false;
+        // P2P writes straight into eparts; still surface the count so transport_rows() after wait() is right.
+        p.transport_rows = pack_rows;
+        m.transport_rows = pack_rows;
     } else if (peer_i8()) {
         // STRATA_Q36_PEER_I8=1: the int8 down leg.  The rows are packed to one byte a value (a scale per 128 values)
         // on the helper, and the copy that follows moves about half of what fp16 moves - on a link that measured
@@ -1350,7 +1577,7 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
         k_pack_i8<<<dim3(1, (unsigned) ((pack_rows + 7) / 8)), dim3(32, 8), 0, m.stream>>>(
             pack_src, m.d_out_i8, (int) pack_rows, (int) m.n_embd, m.d_i8max, m.d_i8err);
         if (!ck(cudaGetLastError(), "pack the run as int8", err)) return false;
-        if (!ck(cudaMemcpyAsync(m.h_out_i8, m.d_out_i8, (size_t) pack_rows * rb, cudaMemcpyDeviceToHost, m.stream),
+        if (!ck(cudaMemcpyAsync(m.h_out_i8[slot], m.d_out_i8, (size_t) pack_rows * rb, cudaMemcpyDeviceToHost, m.stream),
                 "copy the int8 run to host staging", err))
             return false;
         // The measurements come back with the same copy: 4 bytes next to the rows, read on the helper's stream.
@@ -1359,11 +1586,12 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
             !ck(cudaMemcpyAsync(m.h_i8err, m.d_i8err, sizeof(unsigned int), cudaMemcpyDeviceToHost, m.stream),
                 "read the packed int8 error", err))
             return false;
-        m.pending_eparts = eparts_primary;
-        m.pending_base = eparts_row_base;
-        m.pending_n = pack_rows;   // the sums' rows when the sums are on, the run's rows otherwise
-        m.pending_i8 = true;
-        m.transport_rows = pack_rows;
+        p.eparts = eparts_primary;
+        p.base = eparts_row_base;
+        p.n = pack_rows;   // the sums' rows when the sums are on, the run's rows otherwise
+        p.i8 = true;
+        p.f16 = false;
+        p.transport_rows = pack_rows;
     } else if (peer_f16()) {
         // STRATA_Q36_PEER_F16=1: the packed up leg.  The rows are packed to half on the helper (which also MEASURES
         // the largest magnitude it saw, so the question "can fp16 carry these values" is answered by a number and
@@ -1376,7 +1604,7 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
                                                                             pack_rows * m.n_embd, m.d_f16max,
                                                                             m.d_f16rel);
         if (!ck(cudaGetLastError(), "pack the run", err)) return false;
-        if (!ck(cudaMemcpyAsync(m.h_out16, m.d_out16, (size_t) pack_rows * (size_t) m.n_embd * sizeof(__half),
+        if (!ck(cudaMemcpyAsync(m.h_out16[slot], m.d_out16, (size_t) pack_rows * (size_t) m.n_embd * sizeof(__half),
                                 cudaMemcpyDeviceToHost, m.stream), "copy the packed run to host staging", err))
             return false;
         // The measurement comes back with the same copy: 4 bytes next to the rows, read on the helper's stream.
@@ -1385,45 +1613,68 @@ bool PeerPrefill36::launch(int64_t layer, float* eparts_primary, int64_t eparts_
             !ck(cudaMemcpyAsync(m.h_f16rel, m.d_f16rel, sizeof(unsigned int), cudaMemcpyDeviceToHost, m.stream),
                 "read the packed relative error", err))
             return false;
-        m.pending_eparts = eparts_primary;
-        m.pending_base = eparts_row_base;
-        m.pending_n = pack_rows;   // the sums' rows when the sums are on, the run's rows otherwise
-        m.pending_f16 = true;
-        m.transport_rows = pack_rows;
+        p.eparts = eparts_primary;
+        p.base = eparts_row_base;
+        p.n = pack_rows;   // the sums' rows when the sums are on, the run's rows otherwise
+        p.f16 = true;
+        p.i8 = false;
+        p.transport_rows = pack_rows;
     } else {
-        if (!ck(cudaMemcpyAsync(m.h_out, m.d_out, (size_t) n * (size_t) m.n_embd * sizeof(float),
+        if (!ck(cudaMemcpyAsync(m.h_out[slot], m.d_out, (size_t) n * (size_t) m.n_embd * sizeof(float),
                                 cudaMemcpyDeviceToHost, m.stream), "copy the run to host staging", err))
             return false;
-        m.pending_eparts = eparts_primary;
-        m.pending_base = eparts_row_base;
-        m.pending_n = n;
-        // The rows on their way back are floats: pending_f16 is false already (it starts false and the packed route
-        // is the only one that sets it, and the flag cannot change under a running process).
+        p.eparts = eparts_primary;
+        p.base = eparts_row_base;
+        p.n = n;
+        p.f16 = false;
+        p.i8 = false;
+        p.transport_rows = n;
+        // The rows on their way back are floats: p.f16/p.i8 cleared above.
+    }
+    // STRATA_Q36_PREFILL_SPLIT=2: record THIS half's completion RIGHT HERE, at the end of its own launch.  Before,
+    // wait() recorded it - but under the split wait(h0) runs AFTER launch(h1) was enqueued, so a record there would
+    // land behind h1's work and combine(h0) would wait for BOTH halves.  Recording at the end of launch(h0) makes
+    // the event name h0's work only, which is the whole point of the overlap.  Flag-off: launch() is followed
+    // immediately by wait(), so this is the same event at the same point in the stream.
+    {
+        const cudaEvent_t ev_rec = slot == 1 ? m.ev2 : m.ev;
+        if (ev_rec != nullptr && !ck(cudaEventRecord(ev_rec, m.stream), "record helper completion", err)) return false;
     }
     return ck(cudaGetLastError(), "helper launches", err);
 }
 
-bool PeerPrefill36::wait(cudaStream_t st_primary, void* packed_stage, std::string& err) {
+bool PeerPrefill36::wait(cudaStream_t st_primary, void* packed_stage, std::string& err, int slot) {
     Impl& m = *impl_;
     if (m.device < 0 || m.stream == nullptr) { err = "q36 peer prefill: wait() on a closed executor"; return false; }
     if (st_primary == nullptr) { err = "q36 peer prefill: wait() without a primary stream"; return false; }
+    // STRATA_Q36_PREFILL_SPLIT=2: the slot the engine named this time - 0 for the first half of a layer, 1 for
+    // the second.  The two halves' completions must not collide on one event, so each half records and waits
+    // on its own.  Flag-off: the engine always passes 0 (the default), so this is the same as the old single
+    // event.
+    const cudaEvent_t ev_use = slot == 1 ? m.ev2 : m.ev;
+    if (ev_use == nullptr) { err = "q36 peer prefill: no completion event for slot " + std::to_string(slot); return false; }
     On on(m.device);
-    if (!ck(cudaEventRecord(m.ev, m.stream), "record helper completion", err) ||
-        !ck(cudaStreamWaitEvent(st_primary, m.ev, 0), "make the primary wait", err))
-        return false;
-    // THE HOST ROUTE'S UP LEG.  launch() already left this helper's rows in the pinned h_out; here they go to where
-    // the header's row contract says they belong, on the PRIMARY's stream.  What orders it, without a new
+    // The event was recorded at the end of this half's launch() (see launch()'s tail), so a record here would
+    // move it BEHIND the other half's work under the split.  Only the primary's wait is issued here.
+    if (!ck(cudaStreamWaitEvent(st_primary, ev_use, 0), "make the primary wait", err)) return false;
+    // THE HOST ROUTE'S UP LEG.  launch() already left this helper's rows in the pinned h_out[slot]; here they go to
+    // where the header's row contract says they belong, on the PRIMARY's stream.  What orders it, without a new
     // synchronisation: the primary's H2D above waits for `ev`, and `ev` is recorded on the helper's stream AFTER that
-    // stream's device-to-host into h_out, so h_out is complete before the H2D reads it.  What orders the NEXT layer's
-    // write into h_out (its launch(), on the same helper stream) after this read is the caller: it synchronises the
-    // primary's stream before every plan (the same sync prepare()'s blocking D2H already stands on), which retires
-    // this H2D on the device before the next launch() can be issued.  pending_n is cleared so a stray second wait()
-    // posts no copy.
-    if (!m.p2p && m.pending_n > 0) {
-        const int64_t n = m.pending_n;
-        m.pending_n = 0;
+    // stream's device-to-host into h_out[slot], so h_out[slot] is complete before the H2D reads it.  What orders the
+    // NEXT layer's write into h_out[slot] (its launch(), on the same helper stream) after this read is the caller: it
+    // synchronises the primary's stream before every plan (the route D2H's sync, which runs on every layer whatever
+    // STRATA_Q36_STAGE_ASYNC does to the staging sync), which retires this H2D on the device before the next launch()
+    // can be issued.  pend[slot].n is cleared so a
+    // stray second wait() posts no copy.  STRATA_Q36_PREFILL_SPLIT=2: the half's own slot, not the shared one.
+    auto& p = m.pend[slot];
+    // transport_rows() is read by the engine right after this wait(), in the same half's loop, so surface the
+    // half's own count here rather than a stale single value.  Flag-off: slot is always 0 and this is unchanged.
+    m.transport_rows = p.transport_rows;
+    if (!m.p2p && p.n > 0) {
+        const int64_t n = p.n;
+        p.n = 0;
         On onp(m.primary);   // `eparts` and the stream are the primary's: the copy runs on its device
-        if (m.pending_i8) {
+        if (p.i8) {
             // STRATA_Q36_PEER_I8=1: the int8 rows land in the PRIMARY's staging, NOT in eparts - the caller unpacks
             // them into eparts on the same stream, so `eparts` still holds floats when the combine reads it.  The
             // staging is the caller's: it knows where the rows belong (the row base this helper was given).
@@ -1432,10 +1683,10 @@ bool PeerPrefill36::wait(cudaStream_t st_primary, void* packed_stage, std::strin
                 err = "q36 peer prefill: the int8 down leg needs a staging buffer on the primary";
                 return false;
             }
-            if (!ck(cudaMemcpyAsync(packed_stage, m.h_out_i8, (size_t) n * rb, cudaMemcpyHostToDevice, st_primary),
+            if (!ck(cudaMemcpyAsync(packed_stage, m.h_out_i8[slot], (size_t) n * rb, cudaMemcpyHostToDevice, st_primary),
                     "copy the int8 run to the primary", err))
                 return false;
-        } else if (m.pending_f16) {
+        } else if (p.f16) {
             // STRATA_Q36_PEER_F16=1: the packed rows land in the PRIMARY's staging, NOT in eparts - the caller
             // unpacks them into eparts on the same stream, so `eparts` still holds floats when the combine reads it.
             // The staging is the caller's: it knows where the rows belong (the row base this helper was given).
@@ -1443,10 +1694,10 @@ bool PeerPrefill36::wait(cudaStream_t st_primary, void* packed_stage, std::strin
                 err = "q36 peer prefill: the packed up leg needs a staging buffer on the primary";
                 return false;
             }
-            if (!ck(cudaMemcpyAsync(packed_stage, m.h_out16, (size_t) n * (size_t) m.n_embd * sizeof(__half),
+            if (!ck(cudaMemcpyAsync(packed_stage, m.h_out16[slot], (size_t) n * (size_t) m.n_embd * sizeof(__half),
                                     cudaMemcpyHostToDevice, st_primary), "copy the packed run to the primary", err))
                 return false;
-        } else if (!ck(cudaMemcpyAsync(m.pending_eparts + m.pending_base * m.n_embd, m.h_out,
+        } else if (!ck(cudaMemcpyAsync(p.eparts + p.base * m.n_embd, m.h_out[slot],
                                        (size_t) n * (size_t) m.n_embd * sizeof(float), cudaMemcpyHostToDevice, st_primary),
                        "copy the run into eparts", err))
             return false;
@@ -1459,7 +1710,6 @@ int64_t PeerPrefill36::rows() const { return impl_->rows; }
 // window (the sums' rows); without them, the number of rows in the helper's run.
 int64_t PeerPrefill36::transport_rows() const { return impl_->transport_rows; }
 int64_t PeerPrefill36::launches() const { return impl_->launches; }
-
 // The widest expert of the last PREPARED layer's row plan - the number MMQ sizes its launch grid on (its
 // `ncols_max`).  It is set in prepare_end() from the DEVICE's own scan, so this is the device's answer, which the
 // engine cross-checks against the same number counted on the host.

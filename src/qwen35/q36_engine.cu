@@ -20,6 +20,7 @@
 #include "strata/core/family_layout.hpp"
 #include "strata/core/device.hpp"   // primary_device(): the peer probe and the executors speak to this CUDA ordinal
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/remote_expert_opt.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -43,6 +44,11 @@
 // --suffix-draft N (opt-in): suffix-lookup drafts beside the MTP drafts.  The header is host-only; with the flag
 // unset the object is never constructed and spec_step never asks it, so the default path is the loop it was.
 #include "q36_suffix.h"
+#if defined(STRATA_HAVE_DFLASH2)
+#include "strata/core/dflash2.hpp"
+#include "strata/core/draft_cap.hpp"
+#include "strata/kernels/dflash2.hpp"
+#endif
 #if defined(STRATA_Q36_CPU_POOL)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1352,6 +1358,22 @@ __global__ void k_peer_zero_wts(const float* __restrict__ src, float* __restrict
     dst[e] = owned[ids[e]] != 0 ? 0.0f : src[e];
 }
 
+/// STRATA_Q36_HELPER_SUM=1: same as k_peer_zero_wts, but the mask is PER ENTRY (d_helper_mask), not per expert.
+__global__ void k_zero_wts_mask(const float* __restrict__ src, float* __restrict__ dst,
+                                const uint8_t* __restrict__ mask, int n_ent) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_ent) return;
+    dst[e] = mask[e] != 0 ? 0.0f : src[e];
+}
+
+/// STRATA_Q36_HELPER_SUM=1: clear eparts rows the helpers own so 0 * NaN cannot poison the combine.
+__global__ void k_zero_rows_mask(float* __restrict__ rows, const uint8_t* __restrict__ mask, int N, int n_ent) {
+    const int e = blockIdx.x;
+    if (e >= n_ent || mask[e] == 0) return;
+    float* row = rows + (size_t) e * N;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) row[i] = 0.0f;
+}
+
 /// The GDN conv for T tokens in ONE launch (the prompt): one block per 128-channel head, thread = channel, the
 /// 3-entry history carried in registers across the tokens and written back at the end; SiLU, then the L2 norm of the
 /// q/k heads (block < qk_heads) per token - fused_gdn_conv_l2's arithmetic, token after token.  History [channel][3].
@@ -1512,8 +1534,12 @@ __global__ void __launch_bounds__(512) k_gdn_seq_cols(float* state, const float*
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) sv[r] = base[r * row_stride];
-    // the next token's inputs are loaded while this one is computed (the loads were the head of every iteration)
+    // the next TWO tokens' inputs are loaded while this one is computed.  One token ahead was not enough: a token's
+    // arithmetic is a few dozen FMA, while the global reads that feed it cost several hundred cycles, and the grid
+    // (HV * kGdnColGroups blocks) leaves too few blocks a card to hide that behind another block.  The values are
+    // the same ones, in the same order, so the products are bit-identical.
     float nsk = 0.0f, nsq = 0.0f, nvv = 0.0f, ngate = 0.0f, nbeta = 0.0f;
+    float fsk = 0.0f, fsq = 0.0f, fvv = 0.0f, fgate = 0.0f, fbeta = 0.0f;
     auto load = [&](int t) {
         const float* ht = h + (size_t) t * C;
         if (tid < S) { nsk = ht[h_k * S + qh * S + tid]; nsq = ht[qh * S + tid]; }
@@ -1521,12 +1547,21 @@ __global__ void __launch_bounds__(512) k_gdn_seq_cols(float* state, const float*
         ngate = gate[(size_t) t * h_v + head];
         nbeta = beta[(size_t) t * h_v + head];
     };
+    auto load2 = [&](int t) {
+        const float* ht = h + (size_t) t * C;
+        if (tid < S) { fsk = ht[h_k * S + qh * S + tid]; fsq = ht[qh * S + tid]; }
+        fvv = ht[2 * h_k * S + head * S + col];
+        fgate = gate[(size_t) t * h_v + head];
+        fbeta = beta[(size_t) t * h_v + head];
+    };
     if (T > 0) load(0);
+    if (T > 1) load2(1);
     for (int t = 0; t < T; ++t) {
         const int par = t & 1;
         if (tid < S) { sk[par][tid] = nsk; sq[par][tid] = nsq; }
         const float vcur = nvv, gcur = ngate, bcur = nbeta;
-        if (t + 1 < T) load(t + 1);
+        nsk = fsk; nsq = fsq; nvv = fvv; ngate = fgate; nbeta = fbeta;
+        if (t + 2 < T) load2(t + 2);
         __syncthreads();
         if (t > 0 && rg == 0) {   // token t - 1's output
             float oc = 0.0f;
@@ -1558,6 +1593,130 @@ __global__ void __launch_bounds__(512) k_gdn_seq_cols(float* state, const float*
 #pragma unroll
         for (int i = 0; i < RG; ++i) oc += red_o[i][cl];
         o_raw[(size_t) (T - 1) * h_v * S + head * S + col] = oc * rsqrtf((float) S);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * row_stride] = sv[r];
+}
+
+/// STRATA_Q36_GDN_CHUNKED=1: the same recurrence, in chunks.  MEASURED 2026-11-04: prefill is 12% SLOWER with it
+/// (1543 against 1753 tok/s) and the GDN kernel itself is 74% slower (GDNPROF 6.862 against 3.934 ms at T = 1024),
+/// so it is a reference implementation, not a speed-up.  WHY it loses, for whoever picks this up: the arithmetic is
+/// not the problem - the fp64 check below says it is the same recurrence, and splitting the profiler shows the whole
+/// regression in the recurrence itself (6.709 against 3.802 ms; the norm is 0.131 either way) - and it is not
+/// occupancy either: rebuilding with __launch_bounds__(512, 2) (64 registers, two blocks an SM) measured 6.821, no
+/// better.  It is work-limited.  This design's parallel width (one block per (head, column group) walking 64 chunks
+/// in order) is no wider than the sequential kernel's, and it does MORE MACs - the L x L Gram products - with the
+/// Gram itself running on 120 of a block's 512 threads.  What would win is the two-phase structure: every chunk's
+/// independent work in one pass over (head, chunk) blocks, then a 16-step sequential fix-up, which is also what the
+/// upstream chunked delta-rule kernels do.  That is possible because the delta is affine in the incoming state:
+/// d = U - W S0 with U = (I+M)^-1 diag(b) V and W = (I+M)^-1 diag(b) diag(D) K, so the chunk transition
+/// S_end = A_c S0 + b_c with A_c = D_n I - K^T diag(P_n) W and b_c = K^T diag(P_n) U contains no S0.
+///
+/// The recurrence itself: the sequential kernel cannot start token t before token t - 1's state is updated, so a
+/// prompt chunk is 1024 dependent steps.  Inside a chunk of L tokens the dependence is a unit lower-triangular
+/// system over the chunk's own deltas, solved once per (head, chunk) for all 128 columns; everything else in the
+/// chunk is a dense product.  The decay makes the chunk start's state enter as D_t = prod_{u<=t} g_u and the token
+/// pairs as P(t,s) = prod_{u=s+1..t} g_u.  The arithmetic is the same recurrence in another order - checked against
+/// the sequential form in fp64 for several chunk lengths and ragged tails (tools/q36_gdn_chunked_check.py, relative
+/// error 1e-15), and a second reviewer re-simulated the indexing to 6.5e-16 - but the summation order differs, so it
+/// is opt-in and the default path stays the sequential kernel.
+///
+/// block (16, 32): rg is the FAST index, so a column's 16 row groups are one half-warp and their reduction is a
+/// shuffle instead of a barrier.  Same 512 threads, same state ownership as k_gdn_seq_cols (8 rows a thread).
+constexpr int kGdnChunk = 16;
+__global__ void __launch_bounds__(512) k_gdn_chunked(float* state, const float* h, int C, const float* gate,
+                                                     const float* beta, float* o_raw, int h_k, int h_v, int T) {
+    constexpr int S = 128, NC = S / kGdnColGroups, RG = 16, RPG = S / RG, L = kGdnChunk;
+    __shared__ float sk[L][S], sq[L][S];
+    __shared__ float sP[L][L], sQK[L][L], sM[L][L];
+    __shared__ float sD[L], sg[L], sbe[L];
+    __shared__ float sdl[L][NC], so0[L][NC], soq[L][NC];
+    const int head = blockIdx.x, rg = threadIdx.x, cl = threadIdx.y, tid = cl * RG + rg;
+    const int col = blockIdx.y * NC + cl;
+    const int qh = head % h_k;
+    float sv[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) sv[r] = base[r * row_stride];
+    for (int t0 = 0; t0 < T; t0 += L) {
+        const int n = (T - t0 < L) ? T - t0 : L;
+        for (int idx = tid; idx < n * S; idx += 512) {
+            const int t = idx / S, i = idx % S;
+            const float* ht = h + (size_t) (t0 + t) * C;
+            sk[t][i] = ht[h_k * S + qh * S + i];
+            sq[t][i] = ht[qh * S + i];
+        }
+        if (tid < n) {
+            sg[tid] = __expf(gate[(size_t) (t0 + tid) * h_v + head]);
+            sbe[tid] = beta[(size_t) (t0 + tid) * h_v + head];
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float acc = 1.0f;
+            for (int t = 0; t < n; ++t) { acc *= sg[t]; sD[t] = acc; }
+            for (int t = 0; t < n; ++t) {
+                sP[t][t] = 1.0f;
+                float p = 1.0f;
+                for (int s = t - 1; s >= 0; --s) { p *= sg[s + 1]; sP[t][s] = p; }
+            }
+        }
+        __syncthreads();
+        // the state's own image of every token in the chunk: no other token's delta enters, so all n of them are a
+        // shuffle reduction each, with no barrier in the loop.  The mask names the 16 lanes of THIS column's half-warp
+        // (threads 2c and 2c+1 share a warp): a full-warp mask would be right only by accident of the width argument.
+        const unsigned half = (tid & 16) ? 0xffff0000u : 0x0000ffffu;
+        for (int t = 0; t < n; ++t) {
+            float kp = 0.0f, qp = 0.0f;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) {
+                kp = fmaf(sv[r], sk[t][rg * RPG + r], kp);
+                qp = fmaf(sv[r], sq[t][rg * RPG + r], qp);
+            }
+#pragma unroll
+            for (int off = 8; off >= 1; off >>= 1) {
+                kp += __shfl_down_sync(half, kp, off, 16);
+                qp += __shfl_down_sync(half, qp, off, 16);
+            }
+            if (rg == 0) { so0[t][cl] = kp; soq[t][cl] = qp; }
+        }
+        // the chunk's Gram entries: thread (cl, rg) is the pair (t = cl, s = rg)
+        if (cl < n && rg < cl) {
+            float a = 0.0f, b = 0.0f;
+            for (int i = 0; i < S; ++i) { a = fmaf(sk[cl][i], sk[rg][i], a); b = fmaf(sq[cl][i], sk[rg][i], b); }
+            sM[cl][rg] = sbe[cl] * sP[cl][rg] * a;
+            sQK[cl][rg] = b;
+        } else if (cl < n && rg == cl) {
+            float b = 0.0f;
+            for (int i = 0; i < S; ++i) b = fmaf(sq[cl][i], sk[cl][i], b);
+            sQK[cl][rg] = b;
+        }
+        __syncthreads();
+        // the solve.  Row rg's right-hand side lives in that row's own register, so the loop's only shared traffic
+        // is sdl[t][cl]: written by the thread rg == t, then read by every row below it after the barrier.
+        float rhs_r = (rg < n) ? sbe[rg] * (h[(size_t) (t0 + rg) * C + 2 * h_k * S + head * S + col] -
+                                            sD[rg] * so0[rg][cl])
+                               : 0.0f;
+        for (int t = 0; t < n; ++t) {
+            if (rg == t) sdl[t][cl] = rhs_r;
+            __syncthreads();
+            if (rg > t && rg < n) rhs_r -= sM[rg][t] * sdl[t][cl];
+        }
+        if (rg < n) {
+            float o = sD[rg] * soq[rg][cl];
+            for (int s = 0; s <= rg; ++s) o = fmaf(sP[rg][s] * sQK[rg][s], sdl[s][cl], o);
+            o_raw[((size_t) (t0 + rg) * h_v + head) * S + col] = o * rsqrtf((float) S);
+        }
+        const float dend = sD[n - 1];
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            float v = dend * sv[r];
+            const int row = rg * RPG + r;
+            for (int s = 0; s < n; ++s) v = fmaf(sk[s][row], sP[n - 1][s] * sdl[s][cl], v);
+            sv[r] = v;
+        }
+        __syncthreads();   // every buffer above is rewritten by the next chunk: sk, sq, sg, sbe, sP, sD, sQK, sM, sdl,
+                           // so0, soq
     }
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = sv[r];
@@ -2017,7 +2176,10 @@ struct Engine {
     uint8_t* peer_i8_stage = nullptr;
     // STRATA_Q36_PEER_SUM=1: the per-token weighted sums the helpers send back, one row per token per helper, and
     // the routing weights the helpers need to form them (the primary's copy, with the helper-owned slots zeroed,
-    // is what the combine reads).
+    // is what the combine reads).  With STRATA_Q36_PREFILL_SPLIT=2 the two halves' combines both read the same
+    // per-layer count: the helpers' dispatches for the two halves happen back-to-back on one call to peer_plan
+    // (one per half), so the accumulated count by the time either combine runs is the layer's, and the offset
+    // into the sums' buffer is `ro * N` (each half's sums go to its own rows of the helper's block).
     float* peer_sums = nullptr;      // [3][T][N] the helpers' per-token sums
     int peer_sums_n = 0;             // how many helpers' sums the combine adds (0 = none: the layer was not served)
     float* peer_wts = nullptr;       // [T][K] the weights the combine reads (the helper-owned slots are zero)
@@ -2025,8 +2187,14 @@ struct Engine {
     // THE SHARED WINDOW STAGING.  Every helper of a layer is given the same activations and the same routing, so
     // the primary copies them out of its memory ONCE into this pinned buffer and the helpers read that one copy.
     // Before, each helper copied the same 4 MiB out of the primary for itself, three times over.
-    uint8_t* peer_stage_q8 = nullptr; // [tmax][q8 row bytes] the window's activations, in q8_1, in host memory
-    int32_t* peer_stage_ids = nullptr; // [tmax * Kp]     the window's routing, in host memory
+    uint8_t* peer_stage_q8 = nullptr; // [2][tmax][q8 row bytes] the window's activations, in q8_1, in host memory.
+                                      // Two slots: STRATA_Q36_PREFILL_SPLIT=2 stages two halves of the window
+                                      // (each half's own upload runs on the helper's stream in parallel), so a
+                                      // single slot would let the second half's D2H overwrite the first half's
+                                      // bytes before that upload finished reading them - a real race.
+                                      // Flag-off: the first slot is the one that runs (the half index 0); the
+                                      // second is never touched.
+    int32_t* peer_stage_ids = nullptr; // [2][tmax * Kp]     the window's routing, in host memory (two slots, same as peer_stage_q8)
     uint8_t* d_peer_q8 = nullptr;     // [tmax][q8 row bytes] the same, on the device: the primary quantizes the
                                       // window once and the helpers read those bytes (a quarter of the fp32 ones)
     // STRATA_Q36_PROMPT_TIMING=1: the wall time of the ONE copy of the window out of the primary.  The helpers'
@@ -2439,6 +2607,132 @@ struct Engine {
     std::unique_ptr<strata::qwen35::Q36Suffix> suffix;
     long long sfx_win = 0, sfx_acc = 0;                                     // suffix windows taken, drafts accepted
     long long sfx_bad = 0;                                                  // rounds skipped: the history did not match pos
+#if defined(STRATA_HAVE_DFLASH2)
+    // --draft dflash2 --draft-model PACK (opt-in): residual taps into a DFlash2 block drafter.  With the flags unset
+    // nothing below is constructed or allocated, and the default path is the loop it was.
+    strata::core::Dflash2Drafter df2;
+    bool use_df2 = false;
+    int df2_d = 0;                          // drafts offered per round (1..kDrafts)
+    double df2_conf = 0.0;                  // --draft-conf: product-of-probs truncate; 0 = off
+    float* tap_dev_ = nullptr;              // [tap_cap_][nt][N], stable for graph capture
+    int tap_cap_ = 0;
+    int tap_nt_ = 0;
+    std::vector<int> tap_slot_;             // [n_layers] -> slot or -1
+    int64_t tap_first_ = 0;                 // prompt: first absolute position to capture
+    int64_t tap_row0_ = 0;                  // within this forward: first row written into tap_dev_
+    int64_t tap_rows_ = 0;                  // rows written this forward
+    bool tap_on_ = false;
+    bool df2_have_drafts_ = false;
+    int32_t df2_pending_[strata::core::Dflash2Drafter::kDrafts] = {};
+    float df2_probs_[strata::core::Dflash2Drafter::kDrafts] = {};
+    int df2_pending_n_ = 0;
+    long long df2_win = 0, df2_acc = 0;
+
+    bool df2_ensure_taps(int rows, std::string& err) {
+        if (!use_df2) return true;
+        const int nt = (int) df2.tap_layers().size();
+        const int N = (int) m->g.n_embd;
+        if (nt <= 0) { err = "dflash2: the pack has no tap layers"; return false; }
+        if (tap_dev_ && tap_cap_ >= rows && tap_nt_ == nt) return true;
+        // prepare() captured graphs on tap_dev_: a later realloc would leave them pointing at freed memory
+        if (tap_dev_ && tap_cap_ > 0) {
+            err = "dflash2: tap staging needs " + std::to_string(rows) + " rows but is bound at " +
+                  std::to_string(tap_cap_) + "; re-bind with a larger window";
+            return false;
+        }
+        if (tap_dev_) { cudaFree(tap_dev_); tap_dev_ = nullptr; tap_cap_ = 0; }
+        if (cudaMalloc((void**) &tap_dev_, (size_t) rows * (size_t) nt * (size_t) N * 4) != cudaSuccess) {
+            tap_dev_ = nullptr;
+            err = "dflash2: the tap staging does not fit in VRAM";
+            return false;
+        }
+        tap_cap_ = rows;
+        tap_nt_ = nt;
+        tap_slot_.assign((size_t) m->g.n_layers, -1);
+        for (size_t i = 0; i < df2.tap_layers().size(); ++i) {
+            const int L = df2.tap_layers()[i];
+            if (L < 0 || (size_t) L >= tap_slot_.size()) {
+                err = "dflash2: tap layer " + std::to_string(L) + " is outside the model";
+                return false;
+            }
+            tap_slot_[(size_t) L] = (int) i;
+        }
+        return true;
+    }
+    void df2_tap_layer(size_t li, int T) {
+        if (!tap_on_ || !tap_dev_ || li >= tap_slot_.size() || tap_slot_[li] < 0 || tap_rows_ <= 0) return;
+        (void) T;
+        const int N = (int) m->g.n_embd;
+        const int slot = tap_slot_[li];
+        // residual x is [T][N]; write rows [tap_row0_ ..) into tap_dev_ [rows][nt][N] at this slot
+        strata::kernels::df2_tap_rows(x + (size_t) tap_row0_ * (size_t) N,
+                                      tap_dev_ + (size_t) slot * (size_t) N,
+                                      (int64_t) tap_nt_ * N, N, /*hc=*/1, (int) tap_rows_, st);
+    }
+    bool df2_bind(std::string& err) {
+        if (df2.n_embd() != (int) m->g.n_embd) {
+            err = "dflash2: pack hidden " + std::to_string(df2.n_embd()) + " != model " +
+                  std::to_string((int) m->g.n_embd);
+            return false;
+        }
+        if (m->head.d == nullptr || m->head.n_out <= 0) {
+            err = "dflash2: the model head is missing";
+            return false;
+        }
+        auto embed = [this](const int32_t* tokens_dev, int n, float* out, cudaStream_t cs) {
+            K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tokens_dev, n, (int64_t) m->g.n_embd, out, cs);
+        };
+        std::vector<int32_t> vocab;   // empty: the whole head (draft ids are vocabulary ids)
+        if (!df2.bind_raw(std::move(embed), m->head.d, m->head.type, m->head.n_out, vocab, err)) return false;
+        // size the tap staging once for the whole process: the chunk-bound prompt context, the chunk-0 draft-seeding
+        // step, and the verify window.  The drafter's ring (2048 rows) is the hard cap on what it remembers, and the
+        // tap staging is sized to at least that; a request whose prompt is longer just drops the oldest rows from
+        // the drafter's view, which is the same behaviour the ring itself imposes on the context.
+        const int want = std::max({2048, tmax > 0 ? tmax : 0, kVerify});
+        if (!df2_ensure_taps(want, err)) return false;
+        if (!df2.prepare(tap_dev_, err)) return false;
+        return true;
+    }
+    void df2_arm_forward(int64_t p0, int T) {
+        if (!tap_on_ || !tap_dev_) { tap_row0_ = 0; tap_rows_ = 0; return; }
+        tap_row0_ = std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0));
+        tap_rows_ = T - tap_row0_;
+        if (tap_rows_ > tap_cap_) tap_rows_ = tap_cap_;
+    }
+    bool df2_feed_context(int64_t p0, std::string& err) {
+        if (!use_df2 || !tap_on_ || tap_rows_ <= 0) return true;
+        return df2.context(tap_dev_, tap_rows_, p0 + tap_row0_, err);
+    }
+    bool df2_draft_from_taps(int n_new, int64_t pos0, int32_t anchor, std::string& err) {
+        df2_have_drafts_ = false; df2_pending_n_ = 0;
+        if (n_new < 1) return true;
+        if (!df2.draft(tap_dev_, n_new, pos0, anchor, df2_pending_, df2_probs_, err)) return false;
+        df2_pending_n_ = df2_trim(strata::core::Dflash2Drafter::kDrafts);
+        df2_have_drafts_ = df2_pending_n_ > 0;
+        return true;
+    }
+    void df2_clear_request() {
+        if (!use_df2) return;
+        df2.reset();
+        df2_have_drafts_ = false;
+        df2_pending_n_ = 0;
+        tap_on_ = false;
+        tap_rows_ = 0;
+        tap_row0_ = 0;
+    }
+    int df2_trim(int n) const {
+        if (n <= 0) return 0;
+        n = std::min(n, df2_d > 0 ? df2_d : strata::core::Dflash2Drafter::kDrafts);
+        if (df2_conf <= 0.0) return n;
+        double chain = 1.0;
+        int keep = 0;
+        for (; keep < n; ++keep) {
+            chain *= (double) df2_probs_[keep];
+            if (chain < df2_conf) return keep;
+        }
+        return n;
+    }
+#endif
     int64_t rows_pmax = 0;                                                  // (eager) the highest cell of the rows
     // pictures (--vision): the request's rows replace the embeddings of its <|image_pad|> cells; M-RoPE
     bool vision = false;
@@ -2466,7 +2760,9 @@ struct Engine {
     };
     std::vector<Hy> hy;
     int hybrid_t = 32;
-    bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
+    // STRATA_Q36_PREFILL_SPLIT=2: the width of the chunk the split cut in half, so f32mm's split-K depth can be
+    // chosen as the whole chunk would have chosen it (see f32mm).  Zero on every path that does not split.
+    int mm_chunk_t = 0;    bool main_hybrid = false;   // some main layer is hybrid (else only the MTP block is: the decode graph stays)
     bool mtp_graph = true;      // the MTP draft step may be a graph (not when its layer is hybrid)
 
     // ---- the helper expert tier (--expert-cache-device1..3): routed experts on other CUDA devices, a P100
@@ -2609,7 +2905,43 @@ struct Engine {
     static bool peer_sum() {
         static const bool on = [] {
             const char* v = std::getenv("STRATA_Q36_PEER_SUM");
-            return v && v[0] == '1' && v[1] == ' ';
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    /// STRATA_Q36_HELPER_SUM=1: decode-side per-helper PEER_SUM.  Each helper reduces the entries it owns
+    /// into one weighted sum per token (T rows) before the D2H, so row_split under MARSHAL can return the same
+    /// shape PEER_SUM does for prompt without RemoteExpertOpt's shared accumulate.  The combine adds those sums
+    /// through peer_sums/peer_wts; helper-owned eparts rows and their weights are zeroed (k_zero_rows_mask /
+    /// k_zero_wts_mask).  Off by default; RemoteExperts::open refuses it with remote_opt or HELPER_RING.
+    static bool helper_sum() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_HELPER_SUM");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    /// STRATA_Q36_PREFILL_SPLIT=2: a prompt chunk's rows in two halves, interleaved per layer, so the
+    /// primary's mixer for the second half runs while the helpers compute the first half's experts.
+    /// This is the structural win: the helpers' 15.7 ms/layer of work (measured 2026-11-03, 192.168.1.98)
+    /// was running inside the primary's stall; the overlap hides it under the mixer's 19.6 ms.
+    /// Off by default: with the variable unset the default path is byte-identical to before.
+    static int prefill_split_halves() {
+        static const int v = [] {
+            const char* s = std::getenv("STRATA_Q36_PREFILL_SPLIT");
+            if (!s || s[0] != '2' || s[1] != '\0') return 0;
+            return 2;
+        }();
+        return v;
+    }
+    /// STRATA_Q36_SPLIT_PIPE=0: keep the in-layer half order (dispatch(h0), dispatch(h1), combine(h0),
+    /// combine(h1)) instead of the cross-layer pipeline, which runs layer l's combine(h1) after layer l+1's
+    /// dispatch(h0).  On by default so the split's own default ordering IS the faster one; the variable exists
+    /// so the two orders can be measured against each other on the same binary.  Ignored without the split.
+    static bool split_pipe() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_SPLIT_PIPE");
+            return !(v && v[0] == '0' && v[1] == '\0');
         }();
         return on;
     }
@@ -2709,7 +3041,8 @@ struct Engine {
     // paths complete every entry the mask leaves at 0.
     int32_t* h_helper_ids = nullptr;
     float* h_helper_x = nullptr;
-    float* helper_out = nullptr;   // [n_entries][N] the helpers' rows (sparse; finish() scatters by row)
+    float* h_helper_wts = nullptr;  // STRATA_Q36_HELPER_SUM: routing weights for begin()'s per-helper reduce
+    float* helper_out = nullptr;   // [n_entries][N] sparse rows; HELPER_SUM: [3][MAXT][N] per-helper T-row sums
     float* helper_stage = nullptr;   // STRATA_Q36_HELPER_ASYNC: [n_entries][N] the deferred upload's staging
     std::vector<uint8_t> helper_mask;
     uint8_t* d_helper_mask = nullptr;   // current layer mask for local grouping / CPU skip
@@ -2778,6 +3111,7 @@ struct Engine {
         const float* x = nullptr;
         const int32_t* ids = nullptr;
         float* out = nullptr;
+        const float* sum_wts = nullptr;  // STRATA_Q36_HELPER_SUM: begin()'s per-token weights
         std::atomic<bool> have{false};   // a job is waiting for the worker (the worker spins on this)
         std::atomic<bool> done{false};   // the job is finished (the result is under mu)
         bool ok = true;
@@ -2821,6 +3155,7 @@ struct Engine {
             const float* x = nullptr;
             const int32_t* ids = nullptr;
             float* out = nullptr;
+            const float* sum_wts = nullptr;
             // SPIN FIRST, THEN SLEEP.  The job takes tens of microseconds and a condition variable's wake-up
             // costs more than the wait itself: the wake-up sat BETWEEN the main thread's post and the worker's
             // begin, on the critical path (the helper's kernels are queued only after the worker wakes).
@@ -2835,13 +3170,14 @@ struct Engine {
                 }
                 std::lock_guard<std::mutex> lk(m.mu);
                 kind = m.kind; li = m.li; T = m.T; Kp = m.Kp; x = m.x; ids = m.ids; out = m.out;
+                sum_wts = m.sum_wts;
                 m.have.store(false, std::memory_order_release);
             }
             if (kind == 0) return;   // the stop
             std::string err;
             bool ok = true;
             if (kind == 1)
-                ok = helpers[(size_t) r].begin((int64_t) li, x, ids, T, Kp, nullptr, nullptr, err);
+                ok = helpers[(size_t) r].begin((int64_t) li, x, ids, T, Kp, nullptr, nullptr, err, sum_wts);
             else
                 ok = helpers[(size_t) r].finish(out, err);
             {
@@ -2892,9 +3228,14 @@ struct Engine {
                          mixer_ge_captured, mixer_ge_failed,
                          mixer_ge_host_n ? mixer_ge_host_ms * 1000.0 / (double) mixer_ge_host_n : 0.0, mixer_ge_host_n,
                          mixer_ge_eager_n ? mixer_ge_eager_ms * 1000.0 / (double) mixer_ge_eager_n : 0.0, mixer_ge_eager_n);
+#if defined(STRATA_HAVE_DFLASH2)
+        if (tap_dev_) { cudaFree(tap_dev_); tap_dev_ = nullptr; tap_cap_ = 0; }
+#endif
     }
     /// Hand a job to a worker.  The worker owns helper r (r is the helper's index in helpers[]).
-    void marshal_post(int r, int kind, size_t li, int T, int Kp, const float* x, const int32_t* ids, float* out) {
+    /// `sum_wts` is STRATA_Q36_HELPER_SUM's routing weights for begin (kind==1); finish leaves it null.
+    void marshal_post(int r, int kind, size_t li, int T, int Kp, const float* x, const int32_t* ids, float* out,
+                      const float* sum_wts = nullptr) {
         Marshal& m = marshal_[(size_t) r];
         {
             std::lock_guard<std::mutex> lk(m.mu);
@@ -2902,6 +3243,7 @@ struct Engine {
             // it cannot set done=true before this clears it.
             m.done.store(false, std::memory_order_relaxed);
             m.kind = kind; m.li = li; m.T = T; m.Kp = Kp; m.x = x; m.ids = ids; m.out = out;
+            m.sum_wts = sum_wts;
             m.have.store(true, std::memory_order_release);
         }
         m.cv.notify_one();
@@ -3048,6 +3390,16 @@ struct Engine {
     // P1b / P2 split the old P2-P1 into the primary's own MMQ launches and the wait for the helpers' rows.
     double pp_mixer_ms = 0, pp_router_route_ms = 0, pp_route_d2h_ms = 0, pp_ev_plan_ms = 0;
     double pp_primary_work_ms = 0, pp_helper_wait_ms = 0, pp_combine_ms = 0, pp_post_ms = 0;
+    // The post-combine gap of the span above is stream time, so it cannot say whether its large share is the GPU
+    // still working or the stream sitting idle while the host has not reached the next layer.  This is the same
+    // window from the host's side: the wall between recording one layer's P3 and reaching the next layer's P0.
+    // Close to pp_post_ms means a host gap; near zero means the GPU was the thing still running.  Only stamped on
+    // the NON-SPLIT path (see the note at the split path's P3): with the row split on, both halves share one 8-slot
+    // row, so neither number is a P3 -> next P0 window and post_host stays 0 rather than pretend otherwise.
+    double pp_post_host_ms = 0;
+    long long pp_post_host_n = 0;
+    Clock::time_point pp_t_post{};
+    bool pp_t_post_open = false;
     long long pp_span_n = 0;             // how many layers' worth of span we summed (layers * chunks)
     double pp_forward_ms = 0;            // the whole forward, forward-end - forward-start
     // engine-side host wall-clock totals: the helpers' own prepare() timings are read directly from the helpers
@@ -3096,6 +3448,7 @@ struct Engine {
         pp_mixer_ms = pp_router_route_ms = pp_route_d2h_ms = pp_ev_plan_ms = 0;
         pp_primary_work_ms = pp_helper_wait_ms = pp_combine_ms = pp_post_ms = 0;
         pp_span_n = 0; pp_forward_ms = 0;
+        pp_post_host_ms = 0; pp_post_host_n = 0; pp_t_post_open = false;
         pp_peer_plan_ms = pp_sync3022_ms = pp_wait_ms = 0;
         pp_peer_plan_n = pp_sync3022_n = pp_wait_n = 0;
         pp_plan_book_ms = pp_plan_prep_ms = pp_plan_wait_ms = 0;
@@ -3297,24 +3650,44 @@ struct Engine {
         const size_t rb = (size_t) N + (size_t) (N / 128) * sizeof(float);
         peer_i8_stage = dalloc_t<uint8_t>((size_t) tmax * (size_t) Kp * rb);
     }
-    // STRATA_Q36_PEER_SUM=1: the per-token sums the helpers send back (one row per token per helper), the weights
-    // the combine reads (the primary's own copy, with the helper-owned slots zeroed), and the PINNED staging for
-    // the weights on their way up to the helpers (one copy for all three, as the window and the routing are).
-    if (peer_sum()) {
-        peer_sums = dalloc((size_t) 3 * (size_t) tmax * (size_t) N);
+    // STRATA_Q36_PEER_SUM=1 / STRATA_Q36_HELPER_SUM=1: per-token sums the helpers send back (one row per token
+    // per helper) and the weights the combine reads (helper-owned slots zeroed).  PEER_SUM also needs pinned
+    // staging for the prompt host route; HELPER_SUM uses h_helper_wts (allocated with the helper staging).
+    if (peer_sum() || helper_sum()) {
+        // STRATA_Q36_PREFILL_SPLIT=2: the sums' buffer holds one slot PER HELPER PER HALF.  Flag-off a layer has
+        // three helpers, so three slots.  With the split, half 0's helpers take slots [0, n0) and half 1's take
+        // [n0, n0+n1) - up to SIX in total - and the slots are indexed by the RUNNING count, so three slots would
+        // be an out-of-bounds device write past the end of the buffer (silent corruption: the combine then read
+        // whatever the allocator had there).  Two slots per helper is the split's bound.
+        const size_t sum_slots = (size_t) (prefill_split_halves() == 2 ? 12 : 3);
+        peer_sums = dalloc(sum_slots * (size_t) tmax * (size_t) N);
         peer_wts = dalloc((size_t) tmax * (size_t) Kp);
-        CK(cudaHostAlloc((void**) &peer_stage_wts, (size_t) tmax * (size_t) Kp * sizeof(float),
-                         cudaHostAllocDefault));
+        if (peer_sum())
+            CK(cudaHostAlloc((void**) &peer_stage_wts, (size_t) tmax * (size_t) Kp * sizeof(float),
+                             cudaHostAllocDefault));
     }
         // The shared window staging, PINNED: the helpers' uploads read it with cudaMemcpyAsync, and a pageable
         // buffer would turn each of those into a synchronising copy.  The activations go in q8_1 - the format the
         // helpers' products read - because the helpers' links are slow (measured 0.81 GB/s against the primary's
         // 6.03 on 192.168.1.98, 2026-10-25) and the window is the biggest thing the prompt sends up.
+        // STRATA_Q36_PREFILL_SPLIT=2: two slots, one per half - the second half's D2H would overwrite the first
+        // half's bytes while the first half's upload was still reading them, and a single slot would be a race.
+        // Flag-off: only slot 0 is ever touched.
         {
             const size_t win = (size_t) tmax * (size_t) Kp;
             const size_t q8row = MMQ::q8_row_bytes((int64_t) N);
-            CK(cudaHostAlloc((void**) &peer_stage_q8, (size_t) tmax * q8row, cudaHostAllocDefault));
-            CK(cudaHostAlloc((void**) &peer_stage_ids, win * sizeof(int32_t), cudaHostAllocDefault));
+            const size_t q8slot = (size_t) tmax * q8row;
+            const size_t ids_slot = win * sizeof(int32_t);
+            const size_t wts_slot = peer_sum() ? (size_t) tmax * (size_t) Kp * sizeof(float) : 0;
+            if (prefill_split_halves() == 2) {
+                CK(cudaHostAlloc((void**) &peer_stage_q8, 2 * q8slot, cudaHostAllocDefault));
+                CK(cudaHostAlloc((void**) &peer_stage_ids, 2 * ids_slot, cudaHostAllocDefault));
+                if (wts_slot) CK(cudaHostAlloc((void**) &peer_stage_wts, 2 * wts_slot, cudaHostAllocDefault));
+            } else {
+                CK(cudaHostAlloc((void**) &peer_stage_q8, q8slot, cudaHostAllocDefault));
+                CK(cudaHostAlloc((void**) &peer_stage_ids, ids_slot, cudaHostAllocDefault));
+                if (wts_slot) CK(cudaHostAlloc((void**) &peer_stage_wts, wts_slot, cudaHostAllocDefault));
+            }
             // The device buffer holds what MMQ::quantize WRITES: the rows plus the buffer's trailing pad
             // (MMQ::q8_bytes), so it is sized by q8_bytes and not by rows x row_bytes.  Sizing it by the rows
             // alone left the last 128 blocks (18 KiB) of the quantization past the end of the allocation.
@@ -3358,7 +3731,16 @@ struct Engine {
             rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
             rmax = dalloc_t<int32_t>(1);
             ident = dalloc_t<int32_t>((size_t) ne);
-            rinv = dalloc_t<int32_t>((size_t) ne);
+            // STRATA_Q36_PREFILL_SPLIT=2: TWO slots, one per half.  rinv is the combine's row map on a layer the
+            // peers do NOT serve (prow = rinv there), and k_route_scatter overwrites it every dispatch.  Under the
+            // split the halves run dispatch(h0), dispatch(h1), then the two combines - so a single buffer would have
+            // combine(h0) read H1's inverse map for h0's rows: every entry would combine another entry's part, which
+            // is silent wrong logits rather than a crash.  Each half's map is written at its own slot, and both fit
+            // because a half's map is nh*Kp entries and the buffer is tmax*Kp.  Flag-off: slot 0 only, unchanged.
+            {
+                const size_t rinv_slots = prefill_split_halves() == 2 ? 2u : 1u;
+                rinv = dalloc_t<int32_t>(rinv_slots * (size_t) ne);
+            }
             CK(cudaDeviceSynchronize());   // ident's cudaMemset (legacy stream) before the iota on the non-blocking stream
             MMQ::iota(ident, ne, st);
             CK(cudaMalloc(&mq_x, MMQ::q8_bytes(ne, g.n_embd)));
@@ -3425,7 +3807,12 @@ struct Engine {
         ent_dst = dalloc_t<int32_t>(T * Kp);
         ent_tok = dalloc_t<int32_t>(T * Kp);
         tok = dalloc_t<int32_t>(T);
-        pos0 = dalloc_t<int32_t>(1);
+        // STRATA_Q36_PREFILL_SPLIT=2: TWO words, one per half.  Every kernel reads the position as `*dpos + t`, so a
+        // half's base has to be its OWN word: the split used to pass `pos0 + hi * nh` (POINTER arithmetic, +4 KiB)
+        // into a one-word allocation, so half 1 read whatever lay past it - almost always 0 - and wrote its K / V at
+        // cells 0 .. nh-1 with rotary positions 0 .. nh-1 instead of nh .. 2nh-1.  Nothing crashed; the prompt simply
+        // came out as a different (coherent-looking) answer.  Flag-off: slot 0 only, exactly the old one word.
+        pos0 = dalloc_t<int32_t>(prefill_split_halves() == 2 ? 2 : 1);
         pick = dalloc_t<int32_t>(kVerify);
         amv = dalloc((size_t) kArgBlocks * kVerify);
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
@@ -3599,7 +3986,14 @@ struct Engine {
             // thread for the 256-wide router, 1 for the narrow ones (alpha / beta 32, the gate 1)
             const int tm = n_out > 64 ? 4 : 1;
             const int gx = (n_out + 63) / 64, gy = (T + 16 * tm - 1) / (16 * tm);
-            const int want = std::max(1, std::min(kSplitK, 128 / std::max(1, gx * gy)));
+            // STRATA_Q36_PREFILL_SPLIT=2: `mm_chunk_t` is the width of the chunk the split cut in half.  The K-split
+            // depth is chosen from the GRID size, so a half-chunk call would otherwise pick a different `kz` - a
+            // different summation order over K - than the same rows had in a whole-chunk run.  That is a last-bit
+            // difference in the router's logits (the top-k can turn it into a different expert set) and in the GDN's
+            // alpha / beta (which the recurrence then carries across every later row).  Flag-off mm_chunk_t is 0, so
+            // gy_ref is gy and nothing changes.
+            const int gy_ref = mm_chunk_t > 0 ? (mm_chunk_t + 16 * tm - 1) / (16 * tm) : gy;
+            const int want = std::max(1, std::min(kSplitK, 128 / std::max(1, gx * gy_ref)));
             const int kz = (n_in / want + 15) / 16 * 16;
             const int splits = (n_in + kz - 1) / kz;
             float* dst = splits > 1 ? sk_part : out;
@@ -3736,37 +4130,44 @@ struct Engine {
                 }
         }
     }
-    void prep_in(int T, bool f16w) {
+    void prep_in(int T, bool f16w, int ro = 0) {
         // an F16 layer has no q8_1 image to reuse: it needs the FP16 one (prep writes it below)
-        if (!f16w && xq_ready && T <= kGemmT) {
+        if (!f16w && xq_ready && T <= kGemmT && ro == 0) {
             xq_ready = false;
             return;
         }
         xq_ready = false;
-        prep(h, (int) m->g.n_embd, T, xq, f16w);
+        prep(h + (size_t) ro * (size_t) m->g.n_embd, (int) m->g.n_embd, T, xq, f16w);
     }
-    void add_rms_post(const Layer& L, int T) {
+    void add_rms_post(const Layer& L, int T, int ro = 0) {
         const int N = (int) m->g.n_embd;
         xq_post = false;
+        float* xh = x + (size_t) ro * N;
+        // `y` is PER-CALL scratch, not chunk-addressed: mixer() writes this half's rows at y[0..T) (see its
+        // mm(L.ssm_out/wo, ..., y, T)), so the same call must read them there.  Offsetting y by ro*N made half 1
+        // read rows [nh, 2nh) that nothing had written - the whole second half's residual took whatever the
+        // previous layer left behind.  Flag-off: ro==0, the same base as before.
+        float* yh = y;
+        float* hh = h + (size_t) ro * N;
         if (fast_k && T <= kGemmT) {
             if (verify_k) {
                 if (!vx_) {
                     CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
                     CK(cudaMalloc((void**) &vh_, (size_t) 8 * 2048 * 4));
                 }
-                CK(cudaMemcpyAsync(vx_, x, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
-                k_add_rms<<<T, kThreads, 0, st>>>(vx_, y, L.post_norm, vh_, N, m->eps);
+                CK(cudaMemcpyAsync(vx_, xh, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
+                k_add_rms<<<T, kThreads, 0, st>>>(vx_, yh, L.post_norm, vh_, N, m->eps);
             }
-            q36k::k_add_rms_q<<<T, 256, 0, st>>>(x, y, L.post_norm, h, (q36k::QB*) xq, N, m->eps);
+            q36k::k_add_rms_q<<<T, 256, 0, st>>>(xh, yh, L.post_norm, hh, (q36k::QB*) xq, N, m->eps);
             xq_post = true;
             if (verify_k) {
-                verify_cmp("add_rms x", x, vx_, (size_t) T * N, " T " + std::to_string(T));
-                verify_cmp("add_rms h", h, vh_, (size_t) T * N, " T " + std::to_string(T));
-                verify_q8("add_rms q8", h, T, " T " + std::to_string(T));
+                verify_cmp("add_rms x", xh, vx_, (size_t) T * N, " T " + std::to_string(T));
+                verify_cmp("add_rms h", hh, vh_, (size_t) T * N, " T " + std::to_string(T));
+                verify_q8("add_rms q8", hh, T, " T " + std::to_string(T));
             }
             return;
         }
-        k_add_rms<<<T, kThreads, 0, st>>>(x, y, L.post_norm, h, N, m->eps);
+        k_add_rms<<<T, kThreads, 0, st>>>(xh, yh, L.post_norm, hh, N, m->eps);
     }
     /// The shared expert's gate + up + SwiGLU + q8_1 image (into q8) for T <= 4 rows in one launch (q36k::k_sh_gu), else false.
     bool shared_gu(const Layer& L, int T) {
@@ -3990,44 +4391,59 @@ struct Engine {
     float *vx_ = nullptr, *vh_ = nullptr;
     /// The MoE block's end (k_moe_out) for T rows.
     void moe_end(int T, const int32_t* prow, const float* shared, const float* sgate, const float* wn, float* hout,
-                 int sgs = 1) {
+                 int sgs = 1, int ro = 0) {
         const int N = (int) m->g.n_embd, Kp = (int) m->top_k;
         // STRATA_Q36_PEER_SUM=1: the small path (k_moe_out_small) has no place for the helpers' sums, so the sums
         // keep the general path.  With the sums on the layer is a prompt chunk (T > kGemmT = 8) anyway, so this
         // never changes an answer - it says so.
-        const bool small = fast_k && T <= 8 && N <= 2048 && N % 256 == 0 && Kp <= 15 && peer_sums_n == 0;
+        const bool small = fast_k && T <= 8 && N <= 2048 && N % 256 == 0 && Kp <= 15 && sums_n_cur == 0;
         // STRATA_Q36_PEER_SUM=1: WHAT THE COMBINE READS.  With the sums on, the weights are the router's own with
         // the helper-owned slots zeroed (those entries' rows are never written - the helpers send per-token sums
         // instead), and the helpers' sums are added on top of the primary's own rows.  Without the sums this is
         // exactly what it always was: the router's own weights and no sums.  The sums' row stride is `tmax`, the
         // buffer's own stride, not T: a layer's window is shorter than the buffer and the next layer's sums land
         // after this one's.
-        const float* wts_read = peer_sums_n > 0 ? peer_wts : ewts;
-        const float* sums_read = peer_sums_n > 0 ? peer_sums : nullptr;
+        // STRATA_Q36_PREFILL_SPLIT=2: with the halves, the row pointers move with the half's row offset.
+        float* xh = x + (size_t) ro * N;
+        // How many of the helpers' sums this combine adds, and where they start.  layer() sets both from the
+        // half's own record (peer_sums_count_h / peer_sums_base_h, which carry the layer's bank), so the one-shot
+        // and the split path both arrive here with the right pair; flag-off they are peer_sums_n and 0, which is
+        // what this read before.
+        const int sums_n = sums_n_cur;
+        const float* wts_read = sums_n > 0 ? peer_wts + (size_t) ro * Kp : ewts + (size_t) ro * Kp;
+        // The half's helpers write per-token sums at row 0 of their slot (transport_rows() == half T).
+        // Do NOT add `+ ro * N`: that was treating the sums buffer as chunk-absolute, but wait() lands at
+        // the slot base.
+        const float* sums_read = sums_n > 0
+            ? peer_sums + (size_t) sums_base_cur * (size_t) tmax * (size_t) N
+            : nullptr;
         if (small && verify_k) {
             if (!vx_) {
                 CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
                 CK(cudaMalloc((void**) &vh_, (size_t) 8 * 2048 * 4));
             }
-            CK(cudaMemcpyAsync(vx_, x, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
+            CK(cudaMemcpyAsync(vx_, xh, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
             k_moe_out<<<T, kThreads, 0, st>>>(vx_, eparts, prow, wts_read, Kp, shared, sgate, sgs, wn, vh_, N, m->eps,
-                                             sums_read, peer_sums_n, tmax);
+                                             sums_read, sums_n, tmax);
         }
         if (small) {
             const bool mkq = wn != nullptr && hout == h;   // the next layer's input, quantized here
-            q36k::k_moe_out_small<<<T, 1024, 0, st>>>(x, eparts, prow, ewts, Kp, shared, sgate, sgs, wn, hout, N, m->eps,
-                                                      mkq ? (q36k::QB*) xq : nullptr);
+            q36k::k_moe_out_small<<<T, 1024, 0, st>>>(xh, eparts + (size_t) ro * Kp * N, prow, wts_read, Kp, shared, sgate, sgs,
+                                                      wn, hout, N, m->eps, mkq ? (q36k::QB*) xq : nullptr);
             xq_ready = mkq;
             if (verify_k) {
                 if (mkq) verify_q8("moe_out q8", hout, T, " T " + std::to_string(T));
-                verify_cmp("moe_out x", x, vx_, (size_t) T * N, " T " + std::to_string(T));
+                verify_cmp("moe_out x", xh, vx_, (size_t) T * N, " T " + std::to_string(T));
                 if (wn) verify_cmp("moe_out h", hout, vh_, (size_t) T * N, " T " + std::to_string(T));
             }
             return;
         }
         xq_ready = false;
-        k_moe_out<<<T, kThreads, 0, st>>>(x, eparts, prow, wts_read, Kp, shared, sgate, sgs, wn, hout, N, m->eps,
-                                         sums_read, peer_sums_n, tmax);
+        // STRATA_Q36_PREFILL_SPLIT=2: `eparts` is chunk-local [T*Kp][N]; the half's rows land at `ro*Kp*N`.
+        // `prow` (the plan's row map or `rinv`) is relative to that base.  Flag-off: ro==0 and the base is `eparts`.
+        const float* eparts_h = eparts + (size_t) ro * Kp * N;
+        k_moe_out<<<T, kThreads, 0, st>>>(xh, eparts_h, prow, wts_read, Kp, shared, sgate, sgs, wn, hout, N, m->eps,
+                                         sums_read, sums_n, tmax);
     }
     /// y [T][n_out] = W x from x's q8_1 image, 8 columns per launch.
     void mmq(const Mat& w, const void* q, float* out, int T) {
@@ -4048,36 +4464,55 @@ struct Engine {
     /// per layer) and the wall clock did not move - the time reappeared in the harvest's wait, because what the host
     /// spent here was the GPU's shared-expert work, not the launches.  The flag stays (it is opt-in, the default path
     /// is byte-identical) and the result is recorded in plans/2026-10-25-q36-mixer-graph.md.
-    void shared_expert(const Layer& L, int T, bool ext) {
+    void shared_expert(const Layer& L, int T, bool ext, int ro = 0) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, FS = (int) g.n_ff_shexp;
+        const float* hh = h + (size_t) ro * N;
+        float* sgh = sgate + (size_t) ro;
+        float* sgh_f16 = sgate + (size_t) ro;   // the F16 path's gate lands in the same rows
+        float* syh = sy + (size_t) ro * N;
+        float* sgh_f16_out = sgate + (size_t) ro;
         if (L.sh_gate.type == 1) {
             // the F16 shared expert (the MTP sidecar): the cuBLAS F16 GEMM at every T, the SwiGLU in FP32, and the
             // down product on the H's FP16 image (x16 again: the gate and the up are done with it by then)
-            k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
-            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_gate.d, sg, T, FS, N, FS, 0.0f);
-            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_up.d, su, T, FS, N, FS, 0.0f);
-            k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
-            k_to_f16<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(shh, x16, (int64_t) T * FS);
-            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_down.d, sy, T, N, FS, N, 0.0f);
-            if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
+            // STRATA_Q36_PREFILL_SPLIT=2: the half's rows.  The shared expert's output `sy` and gate `sgate` are
+            // chunk-local, so they move with the half's row offset.
+            k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(hh, x16, (int64_t) N * T);
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_gate.d, sg + (size_t) ro * FS, T, FS, N, FS, 0.0f);
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_up.d, su + (size_t) ro * FS, T, FS, N, FS, 0.0f);
+            k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg + (size_t) ro * FS, su + (size_t) ro * FS,
+                                                                     shh + (size_t) ro * FS, (int64_t) T * FS);
+            k_to_f16<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(shh + (size_t) ro * FS, x16,
+                                                                     (int64_t) T * FS);
+            gemm.f16((const uint16_t*) x16, (const uint16_t*) L.sh_down.d, syh, T, N, FS, N, 0.0f);
+            if (!ext) f32mm(L.sh_gate_inp, hh, sgh_f16, N, 1, T);
             return;
         }
-        if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
+        if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(hh, x16, (int64_t) N * T);
         if (T <= kGemmT) {
             if (!shared_gu(L, T)) {
-                apply(L.sh_gate, xq, sg, T);
-                apply(L.sh_up, xq, su, T);
-                K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);   // SwiGLU and its q8_1 image in one launch
+                apply(L.sh_gate, xq, sg + (size_t) ro * FS, T);
+                apply(L.sh_up, xq, su + (size_t) ro * FS, T);
+                // STRATA_Q36_PREFILL_SPLIT=2: the q8_1 image lands at `q8 + ro * qb` so mmq below reads the
+                // half's own rows.  The byte offset is one q8_1 row of width FS.
+                const size_t qb_fs = K::native_q8_1_bytes(FS, 1);
+                K::native_swiglu_quantize_q8_1(sg + (size_t) ro * FS, su + (size_t) ro * FS,
+                                                (uint8_t*) q8 + (size_t) ro * qb_fs, FS, T, st);
             }
-            mmq(L.sh_down, q8, sy, T);
+            // mmq reads `q8 + c0 * qb` where c0 is the call's local row index; for the half, the call's
+            // local row 0 is the chunk's row `ro`, so pass `q8` moved by `ro * qb`.
+            {
+                const size_t qb_fs = K::native_q8_1_bytes(FS, 1);
+                mmq(L.sh_down, (const void*) ((const uint8_t*) q8 + (size_t) ro * qb_fs), syh, T);
+            }
         } else {
-            apply(L.sh_gate, xq, sg, T);
-            apply(L.sh_up, xq, su, T);
-            k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
-            mm(L.sh_down, shh, sy, T);
+            apply(L.sh_gate, xq, sg + (size_t) ro * FS, T);
+            apply(L.sh_up, xq, su + (size_t) ro * FS, T);
+            k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg + (size_t) ro * FS, su + (size_t) ro * FS,
+                                                                     shh + (size_t) ro * FS, (int64_t) T * FS);
+            mm(L.sh_down, shh + (size_t) ro * FS, syh, T);
         }
-        if (!ext) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
+        if (!ext) f32mm(L.sh_gate_inp, hh, sgh_f16_out, N, 1, T);
     }
     /// The layer's mixer: the GDN or the attention branch, the norm, the router's GEMV and the top-k.  Its own
     /// method, so the host's cost of it is one thing (the probe's "mixer" segment) and not a hundred lines inside
@@ -4088,9 +4523,11 @@ struct Engine {
     /// Returns the router's fused flag: the router's GEMV wrote g.n_expert + 1 columns (the shared expert's gate is
     /// the last one) and the combine reads the gate from there.
     bool mixer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
-               bool hy_rows, bool mmq_rows) {
+               bool hy_rows, bool mmq_rows, int ro = 0, int64_t kv_len = 0) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
+        const float* hh = h + (size_t) ro * N;
+        float* logh = logits_r + (size_t) ro * (g.n_expert + 1);
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads;
         const int C = (int) g.ssm_conv_channels;
         const int H = (int) g.n_head, HKV = (int) g.n_head_kv, HD = (int) g.head_dim;
@@ -4104,8 +4541,14 @@ struct Engine {
         // by the same mmq_here, so a layer either records all eight slots or none and pp_layer advances once.
         if (pp_gpu_timing && pp_open) {
             const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
-            if (mmq_here)
+            if (mmq_here) {
+                if (pp_t_post_open) {
+                    pp_post_host_ms += ms_since(pp_t_post);
+                    ++pp_post_host_n;
+                    pp_t_post_open = false;
+                }
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 0], st));   // P0
+            }
         }
         // STRATA_Q36_MIXER_SPLIT=1: the branch's entry.  Both branches' entry and exit are timed, and the elapsed
         // time is folded into that branch's accumulator, so the two are separate numbers rather than one mixed one.
@@ -4115,15 +4558,17 @@ struct Engine {
             float* hc_b = verify ? v_hc[li] : hc;
             float* al_b = verify ? v_alpha[li] : alpha;
             float* be_b = verify ? v_beta[li] : beta;
-            prep_in(T, L.f16w());
+            prep_in(T, L.f16w(), ro);
             apply(L.qkv, xq, qkv_b, T);
+            // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the GDN branch's projection, first main layer only.
+            if (T > kGemmT && use_mmq) split_dump_tag(li, ro, T, qkv_b, (size_t) T * (size_t) L.qkv.n_out, "qkv");
             apply(L.zg, xq, z, T);
             if (T <= kGemmT) {
-                k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N,
+                k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, hh, L.dt, L.ssm_a, al_b, be_b, N,
                                                                       HV);
             } else {
-                f32mm(L.alpha, h, al_b, N, HV, T);
-                f32mm(L.beta, h, be_b, N, HV, T);
+                f32mm(L.alpha, hh, al_b, N, HV, T);
+                f32mm(L.beta, hh, be_b, N, HV, T);
                 k_gdn_gb<<<grid1((int64_t) HV * T), kThreads, 0, st>>>(al_b, L.dt, L.ssm_a, be_b, HV, T);
             }
             if (rows_mode) {   // batch rows: a slot's rows (one, or a verify window's two) in sequence on its own state
@@ -4147,21 +4592,28 @@ struct Engine {
                     // (2026-10-26, P100); this says what the rest is.  Off by default: nothing of it runs.
                     static const bool gdn_prof = std::getenv("STRATA_Q36_GDNPROF") != nullptr;
                     static bool gdn_said = false;
-                    cudaEvent_t ge0 = nullptr, ge1 = nullptr;
+                    cudaEvent_t ge0 = nullptr, ge1 = nullptr, ge2 = nullptr;
                     if (gdn_prof && !gdn_said) {
-                        CK(cudaEventCreate(&ge0)); CK(cudaEventCreate(&ge1));
+                        CK(cudaEventCreate(&ge0)); CK(cudaEventCreate(&ge1)); CK(cudaEventCreate(&ge2));
                         CK(cudaEventRecord(ge0, st));
                     }
-                    k_gdn_seq_cols<<<dim3(HV, kGdnColGroups), dim3(128 / kGdnColGroups, 16), 0, st>>>(S[li], hc_b, C, al_b,
-                                                                                                      be_b, gdn_y, HK, HV, T);
+                    static const bool gdn_chunked = std::getenv("STRATA_Q36_GDN_CHUNKED") != nullptr;
+                    if (gdn_chunked)
+                        k_gdn_chunked<<<dim3(HV, kGdnColGroups), dim3(16, 32), 0, st>>>(S[li], hc_b, C, al_b, be_b,
+                                                                                       gdn_y, HK, HV, T);
+                    else
+                        k_gdn_seq_cols<<<dim3(HV, kGdnColGroups), dim3(128 / kGdnColGroups, 16), 0, st>>>(
+                            S[li], hc_b, C, al_b, be_b, gdn_y, HK, HV, T);
+                    if (gdn_prof && !gdn_said) CK(cudaEventRecord(ge1, st));
                     k_gdn_norm<<<dim3(HV, T), 128, 0, st>>>(gdn_y, z, L.ssm_norm, m->eps, gdn_y, HV);
                     if (gdn_prof && !gdn_said) {
-                        CK(cudaEventRecord(ge1, st));
-                        CK(cudaEventSynchronize(ge1));
-                        float ms = 0;
-                        CK(cudaEventElapsedTime(&ms, ge0, ge1));
-                        std::fprintf(stderr, "strata-q36 GDNPROF: the recurrence + the norm, T=%d: %.3f ms (one layer)\n",
-                                     T, ms);
+                        CK(cudaEventRecord(ge2, st));
+                        CK(cudaEventSynchronize(ge2));
+                        float ms = 0, msr = 0;
+                        CK(cudaEventElapsedTime(&msr, ge0, ge1));
+                        CK(cudaEventElapsedTime(&ms, ge0, ge2));
+                        std::fprintf(stderr, "strata-q36 GDNPROF: the recurrence %.3f ms, the norm %.3f ms, "
+                                     "together %.3f ms (T=%d, one layer)\n", msr, ms - msr, ms, T);
                         gdn_said = true;
                     }
                 } else {   // decode, verify windows and commits: one kernel, so a window's rows are a decode step's rows
@@ -4169,8 +4621,15 @@ struct Engine {
                                                            T, !verify);
                 }
             }
+            // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the recurrence's own inputs and output, first main layer only.
+            if (T > kGemmT && use_mmq) {
+                split_dump_tag(li, ro, T, al_b, (size_t) T * (size_t) HV, "al");
+                split_dump_tag(li, ro, T, be_b, (size_t) T * (size_t) HV, "be");
+                split_dump_tag(li, ro, T, gdn_y, (size_t) T * (size_t) HV * 128, "gdny");
+            }
             mm(L.ssm_out, gdn_y, y, T);
-            // STRATA_Q36_MIXER_SPLIT=1: the GDN branch's exit.
+            // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the GDN branch's output before add_rms_post, first main layer only.
+            if (T > kGemmT && use_mmq) split_dump_tag(li, ro, T, y, (size_t) T * (size_t) N, "y");            // STRATA_Q36_MIXER_SPLIT=1: the GDN branch's exit.
             if (mx_timing) {
                 CK(cudaEventRecord(mx_ev[1], st));
                 CK(cudaEventSynchronize(mx_ev[1]));
@@ -4180,7 +4639,7 @@ struct Engine {
                 ++mx_gdn_n;
             }
         } else {
-            prep_in(T, L.f16w());
+            prep_in(T, L.f16w(), ro);
             apply(L.wq, xq, qg, T);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
@@ -4205,6 +4664,12 @@ struct Engine {
                     K8 ? ks8[li] : nullptr, V8 ? vs8[li] : nullptr, H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base,
                     m->eps, d_delta, mtab_now, rs);
             });
+            // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the projections and the K / V this half just wrote, first layer only.
+            if (T > kGemmT && use_mmq) {
+                split_dump_tag(li, ro, T, q, (size_t) T * H * HD, "q");
+                split_dump_tag(li, ro, T, kx, (size_t) T * HKV * HD, "k");
+                split_dump_tag(li, ro, T, vx, (size_t) T * HKV * HD, "v");
+            }
             // STRATA_Q36_QUEST: refresh the K bounds of the chunks k_attn_prep just wrote, then (below, in the
             // split-K branch) let each query row keep only the best `keep` chunks.  Only the chunks this call
             // touched are rescanned: the ones before them were bounded by an earlier call and still hold.
@@ -4226,7 +4691,10 @@ struct Engine {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
                 // FP16 probabilities; the queries in slices whose scores fit
-                const int P = (int) p0 + T;
+                // STRATA_Q36_PREFILL_SPLIT=2: with the halves, this half's K / V must reach the END of the chunk
+                // (the first half's K / V are already in the cache), so P is the half's end - the `kv_len` the
+                // caller gives - not p0 + the chunk's full width.  Flag-off: kv_len is 0 and P is p0 + T as it was.
+                const int P = kv_len != 0 ? (int) kv_len : (int) p0 + T;
                 const int ldp = (P + 7) / 8 * 8;
                 const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
@@ -4269,6 +4737,8 @@ struct Engine {
                     }
                 }
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
+                // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the attention output before the output projection, first layer.
+                split_dump_tag(li, ro, T, att, (size_t) T * H * HD, "att");
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)
@@ -4384,38 +4854,129 @@ struct Engine {
             if (mmq_here)
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 1], st));   // P0b
         }
-        add_rms_post(L, T);
+        add_rms_post(L, T, ro);
+        // STRATA_Q36_SPLIT_DUMP_ATT=<dir>: the residual the experts are about to read, per (layer, half).
+        // Diagnostic only; with the flag unset this is one getenv-free early return.
+        if (T > kGemmT && use_mmq) split_dump_att(li, ro, h + (size_t) ro * N, T, N);
         ev_mark(kSegRouter);   // E1: attention and SSM are behind us; the router follows
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
         // a decode batch of up to 8 rows takes the router and the shared expert's gate in one product too (rows of 257) when the fused
         // router follows; the prompt chunks and the checks keep the separate products
         const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
-        if (ext) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, T);
-        else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
+        if (ext) f32mm(L.router_ext, hh, logh, N, (int) g.n_expert + 1, T);
+        // STRATA_Q36_PREFILL_SPLIT=2: the logits are a COMPACT [T][n_expert] block on this path (f32mm has no row
+        // stride, and native_router_topk reads n_tok rows of n_expert floats), so the half's block starts at
+        // ro*n_expert - NOT at `logh`, whose stride is n_expert + 1 for the extended router.  `logh - ro` was
+        // subtracting ro ELEMENTS from a row-strided base, so half 1 wrote its logits just before its own block
+        // (over half 0's last rows) and then had the top-k read from a different place.  Flag-off: ro==0, base.
+        else f32mm(L.router, hh, logits_r + (size_t) ro * (size_t) g.n_expert, N, (int) g.n_expert, T);
+        const float* logr = ext ? logh : (logits_r + (size_t) ro * (size_t) g.n_expert);
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, nullptr, T,
                                       ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
-            K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
+            K::native_router_topk(logr, ids + (size_t) ro * Kp, ewts + (size_t) ro * Kp, (int) g.n_expert, Kp, T, st);
         return ext;
     }
 
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
+    /// STRATA_Q36_PREFILL_SPLIT=2: `ro` = the half's first row inside the chunk (0 flag-off), `phase` = 0 for
+    /// "mixer + dispatch", 1 for "shared expert + combine" (0 flag-off), `kv_end` = the half's KV length `P`
+    /// (0 = use p0 + T, the flag-off value).  Flag-off calls leave all three default.
     void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
-               const float* wn, float* hout) {
-        const auto& g = m->g;
-        const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff;
+               const float* wn, float* hout, int ro = 0, int phase = 0, int64_t kv_end = 0) {
+        // STRATA_Q36_HELPER_TIMING=1: the host's time in the layer's own enqueues (the mixer, the router), measured
+        // from here to the routing's end.  Zero statements run with the flag off (the ternary takes Clock::now()
+        // only when the flag is on).
+        const auto t_mixer0 = helper_timing() ? Clock::now() : Clock::time_point{};
+        // STRATA_Q36_PREFILL_SPLIT=2: the combine phase (peer wait + moe_end) for a split half.  The dispatch
+        // phase (mixer + router + route kernels + shared expert + peer plan + local MMQ) already ran on a
+        // separate call with phase == 0; it deferred this combine so the helper's compute(h0) could run under
+        // the primary's mixer(h1).  Flag-off (kv_end == 0) this block is not reached.
+        if (kv_end != 0 && phase == 1) {
+            const auto& g1 = m->g;
+            const int N1 = (int) g1.n_embd;
+            const bool peer_here = peer_layer(li);
+            // STRATA_Q36_PREFILL_SPLIT=2: read THIS half's prow slot.  dispatch(h1) overwrites
+            // slot 1 after dispatch(h0); combine(h0) must still see slot 0.
+            const int hb_prow = ro > 0 ? 1 : 0;
+            const int32_t* prow = peer_here
+                ? (peer_prow2 + (size_t) hb_prow * (size_t) tmax * m->top_k)
+                : (rinv + (size_t) hb_prow * (size_t) tmax * (size_t) m->top_k);
+            // Use the half's recorded ext: when the router folded the shared gate into its GEMV,
+            // shared_expert must NOT recompute it (ext=true).  Forcing false always ran the gate
+            // f32mm and could disagree with the logits_r path moe_end actually reads.
+            const bool ext1 = ext_h[ro > 0 ? 1 : 0] != 0;
+            // The dispatch phase issues it before the peer plan, where the stream is synchronized and the GPU
+            // would otherwise idle through the host's plan.  Only a half whose dispatch did not issue it (a
+            // non-MMQ row, where the dispatch returns before that point) still issues it here.
+            if (!sh_h[ro > 0 ? 1 : 0]) shared_expert(L, T, ext1, ro);
+            // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the combine's two inputs - the routed experts' rows and the shared
+            // expert's output - so a remaining difference can be pinned on the experts or on everything else.
+            if (T > kGemmT && use_mmq) {
+                const int Kp1 = (int) m->top_k;
+                split_dump_tag(li, ro, T, eparts + (size_t) ro * Kp1 * N1, (size_t) T * Kp1 * N1, "ep");
+                split_dump_tag(li, ro, T, sy + (size_t) ro * N1, (size_t) T * N1, "sy");
+            }
+            if (pp_gpu_timing && pp_open)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 5], st));   // P1b
+            // STRATA_Q36_PREFILL_SPLIT=2: the half's own wait.  Pass the half's REAL row offset `ro`
+            // (0 or nh), not the half index: wait_impl selects arrays by `ro > 0` AND uses
+            // `ro * top_k` for the non-sum eparts base.  Passing 0/1 made half-1 land at eparts+Kp.
+            if (ro > 0 ? peer_wait_n_h[1] != 0 : peer_wait_n != 0) {
+                const auto t_w = prompt_timing() ? Clock::now() : Clock::time_point{};
+                peer_prefill_wait_impl(ro);
+                if (prompt_timing()) { pp_wait_ms += ms_since(t_w); ++pp_wait_n; }
+            }
+            ev_mark(kSegMerge);
+            if (pp_gpu_timing && pp_open)
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 6], st));   // P2
+            // STRATA_Q36_PREFILL_SPLIT=2: the shared expert's output `sy` and the gate are also chunk-local
+            // (rows [0, T) of the shared-expert product), so they move with the half's row offset too.  The gate's
+            // base has the same two shapes the dispatch phase's `gbase` has: on the ext path the router's last
+            // logit is the shared expert's gate (stride n_expert + 1), otherwise `sgate` already holds it.
+            // What moe_end must add for THIS half: its own helpers' count and slot base.  The base carries the
+            // layer's bank, so the deferred combine of layer l still points into l's bank even though layer l+1
+            // has already planned into the other one.
+            {
+                const int sum_bank1 = prefill_split_halves() == 2 ? (int) (li & 1) : 0;
+                const int sum_hb1 = ro > 0 ? 1 : 0;
+                sums_n_cur = prefill_split_halves() == 2 ? peer_sums_count_h[sum_bank1][sum_hb1] : peer_sums_n;
+                sums_base_cur =
+                    prefill_split_halves() == 2 ? peer_sums_base_h[sum_bank1][sum_hb1] : peer_sums_base_h[0][0];
+            }
+            {
+                const float* gbase1 = ext1 ? (logits_r + (size_t) ro * (g1.n_expert + 1) + g1.n_expert) : (sgate + ro);
+                moe_end(T, prow, sy + (size_t) ro * N1, gbase1, wn, hout + (size_t) ro * N1,
+                        ext1 ? (int) g1.n_expert + 1 : 1, ro);
+            }
+#if defined(STRATA_HAVE_DFLASH2)
+            df2_tap_layer(li, T);
+#endif
+            ev_mark(kSegComb);
+            // STRATA_Q36_PREFILL_SPLIT=2: both halves share ONE layer's 8-event block (pp_ev is
+            // sized 2+8*n_layers).  Advancing on every phase-1 call would write past the array on
+            // the second half of layer n_layers/2 and segfault.  Only the second half (++ once
+            // per layer) advances; the first half may overwrite the same slot's P1b/P2/P3.
+            if (pp_gpu_timing && pp_open) {
+                CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 7], st));   // P3
+                // pp_t_post is deliberately NOT stamped here: with the row split on, both halves write this one
+                // 8-slot row, so a host window opened at this P3 would be closed by a P0 that belongs to a different
+                // half than the event the GPU `post` span measures with.  post_host stays 0 on the split path
+                // (STRATA_Q36_PREFILL_SPLIT / SPLIT_PIPE), where that span is not a P3 -> next P0 window either.
+                if (ro > 0) ++pp_layer;
+            }
+            return;
+        }
         // STRATA_Q36_HELPER_TIMING=1: E0, the start of this layer's tile.  Only opens a tile when the probe is on
         // and no graph is being captured; every other mark below is a no-op unless this one opened it.
         // Only ONE layer of ONE forward carries a tile: the 8 shared events cannot survive 40 layers of records,
         // and the number being explained is the single-token decode step (T==1).  gp_open_this_forward is set by
         // forward() for the LAST layer only, so exactly one tile per forward is ever queued.
         if (gpu_timing && gpu_open_this_forward && !gpu_timing_hold) { gpu_timing_open = true; }
-        // STRATA_Q36_HELPER_TIMING=1: the host's time in the layer's own enqueues (the mixer, the router), measured
-        // from here to the routing's end.  Zero statements run with the flag off (the ternary takes Clock::now()
-        // only when the flag is on).
-        const auto t_mixer0 = helper_timing() ? Clock::now() : Clock::time_point{};
+        const auto& g = m->g;
+        const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff;
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
@@ -4478,7 +5039,15 @@ struct Engine {
                 ++mixer_ge_eager_n;
             }
         } else {
-            ext = mixer(L, li, T, p0, dpos, graph_mode, verify, hy_rows, mmq_rows);
+            ext = mixer(L, li, T, p0, dpos, graph_mode, verify, hy_rows, mmq_rows, ro, kv_end);
+        }
+        // STRATA_Q36_PREFILL_SPLIT=2: the combine phase's gate base depends on this answer, so record it for the
+        // half this call is dispatching.  Written on the split path only; flag-off nothing writes it.
+        if (kv_end != 0 && phase == 0) {
+            ext_h[ro > 0 ? 1 : 0] = ext ? 1 : 0;
+            // Cleared here, where every split dispatch passes, so a half that never reaches the peer plan below
+            // (a row the plan does not serve) still tells its combine to issue the shared expert itself.
+            sh_h[ro > 0 ? 1 : 0] = 0;
         }
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
@@ -4486,7 +5055,17 @@ struct Engine {
         // STRATA_Q36_PEER_SUM=1: this layer's count of the helpers' per-token sums.  Zero until the peer plan
         // counts the helpers that took a share of THIS layer's window - a layer the peer path does not serve
         // (or a decode layer) must not read the sums of the layer before it.
-        peer_sums_n = 0;
+        // STRATA_Q36_PREFILL_SPLIT=2: the two halves of a layer, and the layers around it, must not share sum
+        // slots.  The bank is the layer's parity: layer l fills bank l&1, layer l+1 fills the other, and layer
+        // l+2 reuses l's bank - by which time l's combine has run even under the cross-layer pipeline.  Within a
+        // bank peer_sums_n is the cursor: half 0 takes [0, n0), half 1 continues at n0.  Only the layer's first
+        // half resets, so the second half does not land on the first half's slots.
+        const int sum_bank = prefill_split_halves() == 2 ? (int) (li & 1) : 0;
+        if (ro == 0 || prefill_split_halves() != 2) {
+            peer_sums_n = 0;
+            peer_sums_base_h[sum_bank][0] = peer_sums_base_h[sum_bank][1] = 0;
+            peer_sums_count_h[sum_bank][0] = peer_sums_count_h[sum_bank][1] = 0;
+        }
         ev_mark(kSegDisp);      // E2: routing done; the route D2H and moe_helpers' host wait follow
         // the F16 routed experts (the MTP sidecar): their own path - cuBLAS's FP16 GEMM, one call per expert
         const bool f16_here = L.L.gu_type == 1 && L.L.d_type == 1;
@@ -4523,7 +5102,13 @@ struct Engine {
             // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
             // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
             // combine reads through entry -> sorted row
-
+            //
+            // STRATA_Q36_PREFILL_SPLIT=2: the halves' row split runs this branch against the half's entries.  The
+            // route kernels' `e` index is relative to the base pointer (k_route_scatter's `dst[r] = e` and the
+            // eparts products' row reads), so passing `idh` and `epartsd` moved by the half's `ro * Kp` keeps every
+            // arithmetic step the same.  The two halves' route kernels run on the primary's stream in order, so
+            // their writes to `eparts` cannot collide.
+            //
             // a helper GPU owns this layer's experts, but a prompt chunk outgrows the helper's MAXT window: MMQ
             // (int8, the model's own expert blobs read on this card) and the helper's q8_1 cache cannot serve it
             // through RemoteExperts::begin/finish, so the default route runs it locally.  Warn once - the helper
@@ -4561,12 +5146,21 @@ struct Engine {
             // per-token sums instead).  Issued here, right after the route, so the ids and the mask are ready.
             // The COUNT of the sums is not set here: only the peer plan knows how many helpers took a share of
             // this layer's window, and a helper with no entry sends nothing.
+            // STRATA_Q36_PREFILL_SPLIT=2: the half's entries, not the chunk's.  The route kernels index rows
+            // relative to their base pointer, so moving the base by `ro * Kp` places the half's entries correctly.
+            const int32_t* idh = ids + (size_t) ro * Kp;
             if (peer_here && peer_sum())
-                k_peer_zero_wts<<<grid1(n_ent), kThreads, 0, st>>>(ewts, peer_wts, ids, owned, (int) n_ent);
+                k_peer_zero_wts<<<grid1(n_ent), kThreads, 0, st>>>(ewts + (size_t) ro * Kp, peer_wts + (size_t) ro * Kp,
+                                                                     idh, owned, (int) n_ent);
             CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
-            k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt, owned);
+            k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(idh, (int) n_ent, rcnt, owned);
             k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
-            k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv, owned);
+            // STRATA_Q36_PREFILL_SPLIT=2: write THIS half's rinv slot.  The scatter numbers the half's entries
+            // relative to the half's own window (n_ent = nh*Kp), so both halves would write the same address range
+            // of one buffer and the second dispatch would erase the first half's map before its combine reads it.
+            int32_t* const rinv_h = rinv + (size_t) (ro > 0 ? 1 : 0) * (size_t) tmax * (size_t) Kp;
+            k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(idh, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv_h,
+                                                              owned);
             // STRATA_Q36_PROMPT_TIMING=1: P0c, after the router and every route kernel have been issued on st and
             // before the route D2H below.  Span P0c-P0b is the router + the route kernels; the D2H and the blocking
             // sync that follows are the next span (P0d-P0c).  Inside the MMQ branch (this else-if), so the same layer
@@ -4578,7 +5172,7 @@ struct Engine {
             // (rmax) and then blocks: the ids ride in the SAME D2H pump and land before the same sync, so the plan
             // costs ONE copy folded into an existing synchronisation - not a second sync per layer.  Issued only
             // on a served layer, so a default / unserved layer copies exactly the bytes it always did.
-            if (peer_here) CK(cudaMemcpyAsync(h_peer_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
+            if (peer_here) CK(cudaMemcpyAsync(h_peer_ids, idh, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
             // STRATA_Q36_PROMPT_TIMING=1: host wall around the per-layer cudaStreamSynchronize at the route D2H.
             // This is the sync every prompt MMQ layer already has (it brings rmax back so the MMQ sizes are known),
@@ -4593,6 +5187,16 @@ struct Engine {
             // pp_layer advances once per MMQ layer, the same as P0.
             if (pp_gpu_timing && pp_open && mmq_rows)
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 3], st));   // P0d
+            // THE SHARED EXPERT IS ISSUED HERE, BEFORE THE PEER PLAN.  The stream was just synchronized for the
+            // route D2H, so the GPU is idle for the whole of the plan's host work (measured 1.2 ms of the
+            // dispatch phase's 14.1 on 192.168.1.98).  The shared expert does not read the plan and its output
+            // `sy` is read only by moe_end, in the combine phase, on this same stream - so issuing it now fills
+            // that idle time instead of adding to the combine's critical path.  `sh_h` tells the combine not to
+            // issue it a second time.
+            if (kv_end != 0 && phase == 0) {
+                shared_expert(L, T, ext, ro);
+                sh_h[ro > 0 ? 1 : 0] = 1;
+            }
             if (lhy(li))
                 for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
             const int64_t maxr = hpin[10];
@@ -4607,13 +5211,35 @@ struct Engine {
                 // stream, and staged by the plan below.  The helpers' links are slow (measured 0.81 GB/s against
                 // the primary's 6.03 on 192.168.1.98, 2026-10-25) and the window is the biggest thing the prompt
                 // sends up: a quarter of the bytes is 5 ms -> 1.4 ms per layer on this box.
-                MMQ::quantize(h, nullptr, d_peer_q8, L.L.gu_type, N, N, T, st);
+                // STRATA_Q36_PREFILL_SPLIT=2: the half's rows, not the chunk's.  The window is this half's
+                // entries only, and the helpers' gather reads them at their own ranks.
+                // STRATA_Q36_STAGE_ASYNC: d_peer_q8 is ONE window shared by both halves.  The staged copies now run on
+                // their own stream, so nothing on `st` would stop this half's quantize from overwriting bytes the
+                // previous half's copy may still be reading.  Order it: wait for the last staged copy first.  It was
+                // issued in the previous half's dispatch, so by here it has long completed and the wait costs nothing.
+                if (peer_stage_async && peer_stage_ev != nullptr)
+                    CK(cudaStreamWaitEvent(st, peer_stage_ev, 0));
+                MMQ::quantize(h + (size_t) ro * N, nullptr, d_peer_q8, L.L.gu_type, N, N, T, st);
+                // STRATA_Q36_STAGE_ASYNC: mark the quantized window.  The staging D2H then waits on this mark on its
+                // OWN stream, so it runs alongside the route kernels below instead of ahead of the primary's per-layer
+                // sync - which is what used to make the plan (and the GPU behind it) wait for the transfer.
+                if (peer_stage_async) {
+                    if (peer_stage_q_ev == nullptr) {
+                        CK(cudaEventCreateWithFlags(&peer_stage_q_ev, cudaEventDisableTiming));
+                        CK(cudaStreamCreateWithFlags(&peer_stage_st, cudaStreamNonBlocking));
+                    }
+                    CK(cudaEventRecord(peer_stage_q_ev, st));
+                }
                 // STRATA_Q36_PROMPT_TIMING=1: host wall around peer_plan_or_exit, the host loop over the helpers
                 // (including the ownership cross-check that rows() must agree with the master table).  One of the
                 // four host-side costs the probe exposes alongside the GPU event spans.  The wall time is host work;
                 // the event spans above it cover GPU-side work that overlaps it.
                 const auto t_plan = prompt_timing() ? Clock::now() : Clock::time_point{};
-                peer_plan_or_exit(li, T, h, ids, eparts);
+                // STRATA_Q36_PREFILL_SPLIT=2: the half's own eparts region.  The plan numbers the half's rows
+                // relative to the half's base (the half's eparts region), so the helper's rows land at
+                // `eparts + ro * Kp * N + base` and the local MMQ's products land at the half's own rows.
+                peer_plan_or_exit(li, T, h + (size_t) ro * N, ids + (size_t) ro * Kp,
+                                  eparts + (size_t) ro * Kp * N, ro);
                 if (prompt_timing()) { pp_peer_plan_ms += ms_since(t_plan); ++pp_peer_plan_n; }
             }
             // STRATA_Q36_PROMPT_TIMING=1: P1, after the peer plan and the helpers' launches, and the primary's own
@@ -4652,7 +5278,7 @@ struct Engine {
                 fg.n_embd = g.n_embd;
                 fg.n_ff = g.n_ff;
                 // the activations: one row per token (the kernel reads the token of each routed row)
-                pf16::quantize_act_native(h, T, N, f16_xa8, st);
+                pf16::quantize_act_native(h + (size_t) ro * N, T, N, f16_xa8, st);
                 {
                     static int f16_reported = 0;
                     if (f16_reported < 3) {
@@ -4676,13 +5302,15 @@ struct Engine {
                                           (const uint8_t*) f16_xa8, ent_tok, (uint8_t*) f16_hq8, st);
                     // THE ROW MAP: the fused down computes the SORTED row, and the value belongs to the row
                     // `lid[sorted row]` - the identity without a helper, the plan's row on a served layer.
+                    // STRATA_Q36_PREFILL_SPLIT=2: `lid` numbers the half's entries in the half's own row range, so
+                    // the destination is the half's slice of `eparts` - the same base the MMQ branch below uses.
                     pf16::f16kqc::down_rows(fb, fg, f16_ts, f16_tiles, f16_off, n_local, ne, f16_wb, (const uint8_t*) f16_hq8,
-                                            eparts, lid, st);
+                                            eparts + (size_t) ro * Kp * N, lid, st);
                 }
             } else
 #endif
             {
-                MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_local, st);
+                MMQ::quantize(h + (size_t) ro * N, ent_tok, mq_x, L.L.gu_type, N, N, n_local, st);
                 MMQ::Product gu;
                 gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
                 // gu keeps `ident`: it writes mq_gu in SORTED row order, which is the space swiglu and the down
@@ -4695,13 +5323,30 @@ struct Engine {
                 MMQ::Product dn;
                 dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
                 dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = lid;
-                dn.total_rows = n_local; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
+                // STRATA_Q36_PREFILL_SPLIT=2: the half's own rows of `eparts`.  `lid` maps sorted row -> the half's
+                // eparts row (the plan's row map numbers the half's entries in the half's own row range, so the
+                // row values are relative to `eparts + ro * Kp * N`).  Flag-off: ro is 0 and the base is `eparts`.
+                dn.total_rows = n_local; dn.max_rows = maxr;
+                dn.dst = eparts + (size_t) ro * Kp * N;
+                dn.ld_dst = N;
                 mctx->run(dn, st);
             }
             if (lhy(li)) stream_done();
             // With no helper `prow` stays `rinv`, the map it has always been; on a served layer peer_plan() set it
             // to the per-entry eparts row map the executor's contract defines.
-            prow = peer_here ? peer_prow2 : rinv;
+            // STRATA_Q36_PREFILL_SPLIT=2: same half slot as peer_plan wrote (hb from `ro`).
+            prow = peer_here
+                ? (peer_prow2 + (size_t) (ro > 0 ? 1 : 0) * (size_t) tmax * m->top_k)
+                : (rinv + (size_t) (ro > 0 ? 1 : 0) * (size_t) tmax * (size_t) m->top_k);
+            // STRATA_Q36_PREFILL_SPLIT=2: the dispatch phase ends here.  The peer wait and moe_end are deferred to
+            // the combine phase, so the helper's compute(h0) can run under the primary's mixer(h1).  (The shared
+            // expert is NOT deferred on this path any more: the dispatch issues it before the peer plan.)  Flag-off
+            // (phase == 0 and ro == 0 and kv_end == 0) the layer runs exactly as it did.
+            if (kv_end == 0 && ro == 0 && phase == 0) {
+                // fall through to the combine code below - the flag-off path is unchanged
+            } else if (phase == 0) {
+                return;   // the dispatch phase is done; the combine follows on a second call
+            }
         } else {
             // A helper computes the entries it holds (the window fits begin()'s MAXT); the local grouped kernel
             // below computes every other entry.  Without the flags helpers_enabled() is false, so this is the same
@@ -4726,11 +5371,11 @@ struct Engine {
         if (helper_timing()) {
             const auto t_sh = Clock::now();
             if (sg) CK(cudaGraphLaunch(shared_ge[li], st));
-            else shared_expert(L, T, ext);
+            else shared_expert(L, T, ext, ro);
             d_h_shared_ms += ms_since(t_sh);
         } else {
             if (sg) CK(cudaGraphLaunch(shared_ge[li], st));
-            else shared_expert(L, T, ext);
+            else shared_expert(L, T, ext, ro);
         }
         if (hy_rows) {   // the CPU pool's experts (while the GPU runs the rest), merged
             if (helper_timing()) {
@@ -4790,7 +5435,26 @@ struct Engine {
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 6], st));   // P2
         }
         // the combine, the shared expert's gate, the residual add and the next norm in one launch
-        moe_end(T, prow, sy, ext ? logits_r + g.n_expert : sgate, wn, hout, ext ? (int) g.n_expert + 1 : 1);
+        // STRATA_Q36_PREFILL_SPLIT=2: the gate's base and the shared expert's `sy` output move with the half
+        // (the gate's stride is n_expert + 1 on the ext path; `sy` is chunk-local so its row offset is `ro * N`).
+        const float* gbase = ext ? (logits_r + (size_t) ro * (g.n_expert + 1) + g.n_expert) : (sgate + ro);
+        const float* syh = sy + (size_t) ro * N;
+        sums_n_cur = prefill_split_halves() == 2
+                         ? peer_sums_count_h[(int) (li & 1)][ro > 0 ? 1 : 0]
+                         : peer_sums_n;
+        sums_base_cur = prefill_split_halves() == 2
+                            ? peer_sums_base_h[(int) (li & 1)][ro > 0 ? 1 : 0]
+                            : peer_sums_base_h[0][0];
+        // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the same two combine inputs as the split path's own copy above, for the
+        // arm that runs the whole chunk in one call.
+        if (T > kGemmT && use_mmq) {
+            split_dump_tag(li, ro, T, eparts + (size_t) ro * Kp * N, (size_t) T * Kp * N, "ep");
+            split_dump_tag(li, ro, T, sy + (size_t) ro * N, (size_t) T * N, "sy");
+        }
+        moe_end(T, prow, syh, gbase, wn, hout + (size_t) ro * N, ext ? (int) g.n_expert + 1 : 1, ro);
+#if defined(STRATA_HAVE_DFLASH2)
+        df2_tap_layer(li, T);
+#endif
         ev_mark(kSegComb);      // E7: this layer's tile is complete
         // STRATA_Q36_PROMPT_TIMING=1: P3, after the combine has been issued on the primary stream.  Span P3-P2 is the
         // combine itself (moe_end), which is the time the combine kernel launch takes on the stream.  The next layer's
@@ -4801,11 +5465,64 @@ struct Engine {
             const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
             if (mmq_here) {
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 7], st));   // P3
+                pp_t_post = Clock::now();
+                pp_t_post_open = true;
                 ++pp_layer;
             }
         }
         if (gpu_timing_open && !gpu_timing_hold) gseg_ring.push_back(Gseg{});
         gpu_timing_open = false;
+    }
+
+    /// STRATA_Q36_SPLIT_DUMP=<dir>: one raw FP32 file per layer holding that layer's output rows, so a split run
+    /// and a non-split run can be compared byte for byte, layer by layer.  Diagnostic only: the flag is read here,
+    /// so nothing runs unless a caller asks, and the caller (forward) also gates it to the prompt chunk path.
+    void split_dump(size_t li, const float* dev, int T, int N) {
+        const char* dir = std::getenv("STRATA_Q36_SPLIT_DUMP");
+        if (dir == nullptr || *dir == '\0') return;
+        CK(cudaStreamSynchronize(st));
+        std::vector<float> host((size_t) T * (size_t) N);
+        CK(cudaMemcpy(host.data(), dev, host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        char fn[512];
+        std::snprintf(fn, sizeof fn, "%s/l%03zu.bin", dir, li);
+        std::FILE* f = std::fopen(fn, "wb");
+        if (f == nullptr) return;
+        std::fwrite(host.data(), sizeof(float), host.size(), f);
+        std::fclose(f);
+    }
+
+    /// STRATA_Q36_SPLIT_DUMP_ATT=<dir>: the attention-only residual (h right after add_rms_post), one file per
+    /// (layer, half).  Pairs with split_dump: where the two differ, the error came from the mixer; where the
+    /// attention residual already matches and the layer output does not, it came from the experts.
+    void split_dump_att(size_t li, int ro, const float* dev, int T, int N) {
+        const char* dir = std::getenv("STRATA_Q36_SPLIT_DUMP_ATT");
+        if (dir == nullptr || *dir == '\0') return;
+        CK(cudaStreamSynchronize(st));
+        std::vector<float> host((size_t) T * (size_t) N);
+        CK(cudaMemcpy(host.data(), dev, host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        char fn[512];
+        std::snprintf(fn, sizeof fn, "%s/l%03zu_a%05d.bin", dir, li, ro);
+        std::FILE* f = std::fopen(fn, "wb");
+        if (f == nullptr) return;
+        std::fwrite(host.data(), sizeof(float), host.size(), f);
+        std::fclose(f);
+    }
+
+    /// STRATA_Q36_SPLIT_DUMP_MIX=<dir>: one mixer tensor (q / k / v / att) of the FIRST main layer, so the split
+    /// and non-split runs can say whether the projections or the attention itself is where a row's error starts.
+    /// Diagnostic only: the flag is read here and nothing runs without it.
+    void split_dump_tag(size_t li, int ro, int T, const float* dev, size_t n, const char* tag) {
+        const char* dir = std::getenv("STRATA_Q36_SPLIT_DUMP_MIX");
+        if (dir == nullptr || *dir == '\0' || li != 0) return;
+        CK(cudaStreamSynchronize(st));
+        std::vector<float> host(n);
+        CK(cudaMemcpy(host.data(), dev, n * sizeof(float), cudaMemcpyDeviceToHost));
+        char fn[512];
+        std::snprintf(fn, sizeof fn, "%s/l%03zu_%s_t%05d_a%05d.bin", dir, li, tag, T, ro);
+        std::FILE* f = std::fopen(fn, "wb");
+        if (f == nullptr) return;
+        std::fwrite(host.data(), sizeof(float), n, f);
+        std::fclose(f);
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
@@ -4814,6 +5531,9 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+#if defined(STRATA_HAVE_DFLASH2)
+        df2_arm_forward(p0, T);
+#endif
         // STRATA_Q36_MIXER_GRAPH=1: count this session's decode steps.  The per-layer graphs are captured on the
         // SECOND one: the first decode step is the first use of the decode path's kernels, and a cudaMalloc inside a
         // capture is an error - so the capture would fail on the first step and the eager path would be used for the
@@ -4825,10 +5545,31 @@ struct Engine {
         // branch: stream_kick() has already skipped uploading the helpers' experts by then, so the over-cap answer
         // must be the same at both ends of the forward.
         if (peer_prefill_on) peer_win_ent = (int64_t) T * m->top_k;
+        // STRATA_Q36_PREFILL_SPLIT=2: the split runs layer() TWICE per layer (a dispatch phase and a combine
+        // phase), and only the dispatch phase takes from the expert stream - so the sequence the stream is
+        // primed with must name each hybrid layer TWICE, in the order the dispatch phases consume it.  Without
+        // this the second half's stream_take() finds the NEXT layer's index where it expects this one's and the
+        // run ends at layer 0 with "the expert stream is out of step".  Flag-off the sequence is exactly what it
+        // always was (one entry per hybrid layer), so the default path does not change.
+        // The two halves' widths: half 0 takes T/2 rows and half 1 the rest, so an odd chunk keeps its last row
+        // (T/2 + T/2 would drop it).  `nh` is therefore a LOWER bound on either half's width, which is what the
+        // gate below has to test: both halves must be wide enough to take the MMQ branch on their own (`T > kGemmT`
+        // alone, the chunk's width, would let a 20-token prompt split into two 10-row halves that fall into the
+        // chunk-absolute grouped path, whose kernel has no half offsets at all).
+        const int nh = T / 2;
+        const int nh0 = nh, nh1 = T - nh;
+        const bool split_ok = nh > std::max(kGemmT, hybrid_t);
+        const bool stream_split = prefill_split_halves() == 2 && split_ok && use_mmq && !graph_mode && !verify;
+        // STRATA_Q36_PREFILL_SPLIT=2: f32mm's split-K depth must be the one the WHOLE chunk would have chosen, or a
+        // half's router logits / GDN alpha / beta differ in the last bits from the same rows in a non-split run.
+        mm_chunk_t = stream_split ? T : 0;
         if (main_hybrid && T > hybrid_t && use_mmq) {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
-                if (lhy(l)) seq.push_back((int) l);
+                if (lhy(l)) {
+                    seq.push_back((int) l);
+                    if (stream_split) seq.push_back((int) l);   // the second half's dispatch
+                }
             stream_begin(seq);
         }
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
@@ -4847,6 +5588,41 @@ struct Engine {
             pp_layer = 0;
             CK(cudaEventRecord(pp_ev[0], st));   // forward-start
         }
+        // STRATA_Q36_PREFILL_SPLIT=2: the chunk's rows in two halves, interleaved per layer, so the primary's
+        // mixer for the second half runs while the helpers compute the first half's experts.  The two phases
+        // per half are: dispatch (mixer + router + route + shared expert + peer plan + local MMQ) and combine
+        // (peer wait + moe_end).  The dispatch phases for both halves are enqueued first, then the combines,
+        // so the helper's compute(h0) overlaps the primary's mixer(h1).  Flag-off (halves == 0) the layer loop
+        // runs exactly as it did: one call per layer, no halves, no kv_end, no ro, no phase.
+        const int halves = prefill_split_halves();
+        const bool split = halves == 2 && split_ok && use_mmq && !graph_mode && !verify;
+        // STRATA_Q36_PREFILL_SPLIT=2: half 1's position base.  `pos0` is a device word every kernel reads as
+        // `*dpos + t`, so the second half needs word 1 to hold p0 + nh (see the allocation's comment).  Enqueued on
+        // `st` before every layer call, so it lands ahead of the kernels that read it.  Flag-off: nothing runs.
+        if (split) {
+            hpin[61] = (int32_t) (p0 + nh0);
+            CK(cudaMemcpyAsync(pos0 + 1, hpin + 61, 4, cudaMemcpyHostToDevice, st));
+        }
+        // STRATA_Q36_SPLIT_DUMP=<dir>: per-layer residual-stream dump (see split_dump).  Prompt chunks, eager path
+        // only - the same guard the split itself uses, so a split run and a non-split run are dumped identically.
+        const char* dump_dir = std::getenv("STRATA_Q36_SPLIT_DUMP");
+        if (dump_dir != nullptr && (*dump_dir == '\0' || !(T > kGemmT && use_mmq && !graph_mode))) dump_dir = nullptr;
+        // STRATA_Q36_PREFILL_SPLIT=2: one call of layer `ll` for one half.  Phase 0 dispatches (mixer, router, route,
+        // local MMQ) and phase 1 combines (shared expert, peer wait, moe_end); the two are the same `layer()` call
+        // the non-split path makes, just cut in half.
+        auto half_call = [&](size_t ll, int hi, int phase) {
+            const bool plast = ll + 1 == m->layers.size();
+            const int th = hi == 0 ? nh0 : nh1;
+            const int ro = hi == 0 ? 0 : nh0;
+            layer(m->layers[ll], ll, th, p0 + ro, pos0 + hi, graph_mode, verify,
+                  plast ? m->out_norm : m->layers[ll + 1].attn_norm, plast ? hmain : h, ro, phase, p0 + ro + th);
+        };
+        // STRATA_Q36_SPLIT_DUMP=<dir>: the residual stream after layer `ll`, raw FP32, one file per layer.
+        // Diagnostic only; with the flag unset this returns at once.
+        auto dump_layer = [&](size_t ll) {
+            if (dump_dir == nullptr) return;
+            split_dump(ll, ll + 1 == m->layers.size() ? hmain : h, T, N);
+        };
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
             // STRATA_Q36_HELPER_TIMING=1: arm ONLY the last layer to carry the tile.  The probe's 8 events are
@@ -4860,15 +5636,50 @@ struct Engine {
             // The statement order is the same with the flag off: the timing calls are the only addition.
             if (helper_timing()) {
                 const auto t_layer = Clock::now();
-                layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
-                      last ? hmain : h);
+                if (split && dump_dir == nullptr && split_pipe()) {
+                    // CROSS-LAYER PIPELINE.  Layer l's combine(h1) is the one block of a layer with nothing
+                    // left inside the layer to overlap, so it cost its helper time in full every layer.  It is
+                    // held back one iteration and run after layer l+1's dispatch(h0), which writes only rows
+                    // [0, nh) of `h`/`x`/`eparts`/`sy`/`logits_r` and the half-0 row maps - none of what the
+                    // held-back combine reads.  peer_sums is double-banked by layer parity for the same reason.
+                    half_call(l, 0, 0);
+                    if (l > 0) half_call(l - 1, 1, 1);
+                    half_call(l, 1, 0);
+                    half_call(l, 0, 1);
+                } else if (split) {
+                    // STRATA_Q36_SPLIT_DUMP is on: the layer dump needs the whole layer's output, and by the
+                    // time the pipelined order would dump it the next layer has overwritten its first half.  The
+                    // diagnostic therefore keeps the in-layer order, which is bit-identical to the pipeline's.
+                    for (int hi = 0; hi < 2; ++hi) half_call(l, hi, 0);
+                    for (int hi = 0; hi < 2; ++hi) half_call(l, hi, 1);
+                    dump_layer(l);
+                } else {
+                    layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
+                          last ? hmain : h);
+                    dump_layer(l);
+                }
                 d_host_layer_ms += ms_since(t_layer);
                 ++d_host_layer_n;
             } else {
-                layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
-                      last ? hmain : h);
+                if (split && dump_dir == nullptr && split_pipe()) {
+                    half_call(l, 0, 0);
+                    if (l > 0) half_call(l - 1, 1, 1);
+                    half_call(l, 1, 0);
+                    half_call(l, 0, 1);
+                } else if (split) {
+                    for (int hi = 0; hi < 2; ++hi) half_call(l, hi, 0);
+                    for (int hi = 0; hi < 2; ++hi) half_call(l, hi, 1);
+                    dump_layer(l);
+                } else {
+                    layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
+                          last ? hmain : h);
+                    dump_layer(l);
+                }
             }
         }
+        // the last layer's held-back half (pipelined order only; the in-layer order already ran it)
+        if (split && dump_dir == nullptr && split_pipe()) half_call(m->layers.size() - 1, 1, 1);
+        mm_chunk_t = 0;
         gpu_open_this_forward = false;
         // STRATA_Q36_PROMPT_TIMING=1: close the record and drain ONCE.  The forward-end event is recorded, then a
         // single cudaEventSynchronize (the only one this probe adds) lets pp_drain() read every layer's eight spans.
@@ -5175,6 +5986,10 @@ struct Engine {
             CK(cudaMemcpyAsync(h_helper_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(h_helper_x, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
         }
+        // STRATA_Q36_HELPER_SUM: begin() needs the router's weights on the host (same stream, covered by the
+        // sync below).  The reduce multiplies each owned compact row by these weights before the D2H.
+        if (helper_sum())
+            CK(cudaMemcpyAsync(h_helper_wts, ewts, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
         // Wait for these TWO copies, not for the queue to drain.  cudaStreamSynchronize(st) here waits for
         // everything the host had already issued for this layer - the attention/SSM kernels, the router GEMM and
         // native_router_topk - which measured 135 us per layer (5.4 ms/token over 40 layers on 192.168.1.98,
@@ -5238,13 +6053,17 @@ struct Engine {
         // The harvest waits for the begins before it harvests: a begin that failed is reported there and ends the
         // run, because this layer's local launches are already queued against the helpers' mask - the same
         // reasoning the deferred harvest's failure already follows.
+        // STRATA_Q36_HELPER_SUM: every begin gets the same host weights (h_helper_wts); RemoteExperts
+        // copies only the entries it owns into its reduce metadata.  Null keeps today's row-scatter path.
+        const float* sum_wts = helper_sum() ? h_helper_wts : nullptr;
         if (marshal_ok() && nwin > 1) {
             for (int w = 0; w < nwin; ++w)
-                marshal_post(win[w], 1, li, T, Kp, h_helper_x, h_helper_ids, nullptr);
+                marshal_post(win[w], 1, li, T, Kp, h_helper_x, h_helper_ids, nullptr, sum_wts);
         } else
         for (int w = 0; w < nwin; ++w) {
             const int hi = win[w];
-            if (helpers[(size_t) hi].begin((int64_t) li, h_helper_x, h_helper_ids, T, Kp, nullptr, nullptr, err))
+            if (helpers[(size_t) hi].begin((int64_t) li, h_helper_x, h_helper_ids, T, Kp, nullptr, nullptr, err,
+                                          sum_wts))
                 continue;
             std::fprintf(stderr, "strata-q36: helper CUDA%d, layer %zu: %s\n", hi + 1, li, err.c_str());
             helper_failed = true;
@@ -5285,8 +6104,13 @@ struct Engine {
     /// The window's helpers' finish() calls: each helper's own harvest, in the order the window lists them.
     /// With STRATA_Q36_HELPER_PARALLEL_MARSHAL the helpers after the first harvest on their own workers, so the
     /// three harvests overlap (the helpers' ownerships are disjoint, so their host-side scatters write disjoint
-    /// entries of the same staging buffer).  Returns the helper that failed, or -1.
+    /// entries of the same staging buffer).  STRATA_Q36_HELPER_SUM: each helper writes T contiguous sum rows into
+    /// its own slot of `out` (`out + hi * MAXT * N`) so MARSHAL harvests never race.  Returns the helper that
+    /// failed, or -1.
     int finish_window(const int* win, int nwin, float* out, std::string& err) {
+        // HELPER_SUM: per-helper T-row slots. Default: one sparse buffer every helper scatters into by entry.
+        const size_t sum_stride = helper_sum() ? (size_t) strata::kernels::cpu::MAXT * (size_t) m->g.n_embd : 0;
+        auto out_for = [&](int hi) { return sum_stride ? out + (size_t) hi * sum_stride : out; };
         if (marshal_ok() && nwin > 1) {
             // The begins ran on the workers while the primary issued its own work: they must be done before the
             // harvests (the same worker slots), and a begin that failed is reported here.
@@ -5295,10 +6119,10 @@ struct Engine {
                 if (!marshal_wait(win[w], werr)) { err = werr; return win[w]; }
             }
             for (int w = 0; w < nwin; ++w)
-                if (win[w] != 0) marshal_post(win[w], 2, 0, 0, 0, nullptr, nullptr, out);
+                if (win[w] != 0) marshal_post(win[w], 2, 0, 0, 0, nullptr, nullptr, out_for(win[w]));
             int bad = -1;
             for (int w = 0; w < nwin; ++w)
-                if (win[w] == 0 && !helpers[0].finish(out, err)) bad = 0;
+                if (win[w] == 0 && !helpers[0].finish(out_for(0), err)) bad = 0;
             for (int w = 0; w < nwin; ++w) {
                 if (win[w] == 0) continue;
                 std::string werr;
@@ -5307,8 +6131,26 @@ struct Engine {
             return bad;
         }
         for (int w = 0; w < nwin; ++w)
-            if (!helpers[(size_t) win[w]].finish(out, err)) return win[w];
+            if (!helpers[(size_t) win[w]].finish(out_for(win[w]), err)) return win[w];
         return -1;
+    }
+    /// STRATA_Q36_HELPER_SUM: pack each live helper's T-row weighted sum into peer_sums and zero the
+    /// helper-owned eparts rows / weights so moe_end's combine matches PEER_SUM's shape.
+    void helper_sum_combine(const int* win, int nwin, int N, int64_t n_ent) {
+        const size_t sum_stride = (size_t) strata::kernels::cpu::MAXT * (size_t) N;
+        peer_sums_n = 0;
+        for (int w = 0; w < nwin; ++w) {
+            const int hi = win[w];
+            if (!helpers[(size_t) hi].sum_mode()) continue;
+            const int64_t toks = helpers[(size_t) hi].sum_toks();
+            CK(cudaMemcpyAsync(peer_sums + (size_t) peer_sums_n * (size_t) tmax * (size_t) N,
+                               helper_out + (size_t) hi * sum_stride,
+                               (size_t) toks * (size_t) N * 4, cudaMemcpyHostToDevice, st));
+            ++peer_sums_n;
+        }
+        if (peer_sums_n == 0) return;
+        k_zero_wts_mask<<<grid1(n_ent), kThreads, 0, st>>>(ewts, peer_wts, d_helper_mask, (int) n_ent);
+        k_zero_rows_mask<<<(unsigned) n_ent, kThreads, 0, st>>>(eparts, d_helper_mask, N, (int) n_ent);
     }
     bool helper_finish(const int* win, int nwin, size_t li, int N, int64_t n_ent) {
         std::string err;
@@ -5322,10 +6164,6 @@ struct Engine {
             CK(cudaMemcpyAsync(d_helper_mask, helper_mask.data(), (size_t) n_ent, cudaMemcpyHostToDevice, st));
             return false;
         }
-        // One whole-window upload: finish() scattered the rows each helper computed to their own entry index and
-        // left the rest of helper_out stale, but every entry no helper computed is rewritten by the local paths
-        // below (exactly the rows whose mask bit is 0), so the stale rows are never read.
-        CK(cudaMemcpyAsync(eparts, helper_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         helper_mask_li = (int) li;
         for (int64_t i = 0; i < n_ent; ++i) {
             bool own = false;
@@ -5335,6 +6173,15 @@ struct Engine {
             ++hy_helper;
         }
         CK(cudaMemcpyAsync(d_helper_mask, helper_mask.data(), (size_t) n_ent, cudaMemcpyHostToDevice, st));
+        // HELPER_SUM: T-row sums go to peer_sums; eparts keeps only the local paths' rows.
+        if (helper_sum()) {
+            helper_sum_combine(win, nwin, N, n_ent);
+            return true;
+        }
+        // One whole-window upload: finish() scattered the rows each helper computed to their own entry index and
+        // left the rest of helper_out stale, but every entry no helper computed is rewritten by the local paths
+        // below (exactly the rows whose mask bit is 0), so the stale rows are never read.
+        CK(cudaMemcpyAsync(eparts, helper_out, (size_t) n_ent * N * 4, cudaMemcpyHostToDevice, st));
         return true;
     }
 
@@ -5370,6 +6217,12 @@ struct Engine {
                                  "layer's local launches, and STRATA_Q36_HELPER_PARALLEL_MARSHAL begins the helpers "
                                  "on their own workers, so a helper that fails ends the run here\n");
             std::exit(1);
+        }
+        // HELPER_SUM: finish wrote T-row sums into per-helper slots of helper_out; pack into peer_sums
+        // (mask already on device from moe_helpers). Sparse path: stage + merge into eparts.
+        if (helper_sum()) {
+            helper_sum_combine(win, nwin, wN, n_ent);
+            return;
         }
         // Stage the helpers' sparse rows, then merge them into eparts where the mask marks them.
         CK(cudaMemcpyAsync(helper_stage, helper_out, (size_t) n_ent * wN * 4, cudaMemcpyHostToDevice, st));
@@ -5437,8 +6290,12 @@ struct Engine {
     uint8_t* d_peer_owner = nullptr;
     std::vector<uint8_t> peer_any;   // [n_state]: some expert of this layer is a helper's (so the layer is served)
     int32_t* peer_lid = nullptr;     // [n_ent] the local MMQ's id table: sorted row -> eparts row (peer path only)
-    int32_t* peer_prow2 = nullptr;   // [n_ent] device: entry -> eparts row (moe_end's `prow`)
-    std::vector<int32_t> peer_prow2_h;   // [n_ent] host side of the same plan
+    // [n_ent] (or [2][slot] with STRATA_Q36_PREFILL_SPLIT=2): entry -> eparts row (moe_end's `prow`).
+    // The plan numbers the half's rows RELATIVE to the half's base, so moe_end() adds `ro * Kp * N`.
+    // Split order is dispatch(h0), dispatch(h1), combine(h0), combine(h1): a single slot would let
+    // dispatch(h1) overwrite the map combine(h0) still needs.  Slot stride is tmax*top_k.
+    int32_t* peer_prow2 = nullptr;
+    std::vector<int32_t> peer_prow2_h;
     std::vector<uint8_t> peer_row_seen;  // [n_ent] the duplicate-row check's scratch (kept to avoid a per-layer alloc)
     // The window's per-EXPERT entry counts, on the host.  The routing is already on the host (h_peer_ids), so this is
     // one increment per entry and no CUDA call; what it buys is the host's own count of each helper's WIDEST EXPERT -
@@ -5484,6 +6341,47 @@ struct Engine {
     int peer_wait_n = 0;             // the helpers' launches this layer that moe_end must wait for
     int peer_wait_hi[3] = {-1, -1, -1};
     int64_t peer_wait_li = -1;
+    // STRATA_Q36_PREFILL_SPLIT=2: the per-HALF wait state.  Each half's dispatch plans its own set of helpers'
+    // launches, and the combine of that half must wait for that half's own set.  Two slots, keyed by the half
+    // index; the flag-off path (halves == 0) keeps the old singletons untouched.
+    int peer_wait_n_h[2] = {0, 0};
+    // STRATA_Q36_STAGE_ASYNC: recorded on the staging stream right after the window's D2H copies, so each helper's
+    // stream can wait on it instead of the host blocking on cudaStreamSynchronize.  Created lazily, only when the
+    // variable is set; nullptr is the old blocking path.
+    cudaEvent_t peer_stage_ev = nullptr;
+    // STRATA_Q36_STAGE_ASYNC: the staging copies run on THIS stream, not the primary's, so they overlap the route
+    // kernels instead of being waited for by the primary's own per-layer sync.  `peer_stage_q_ev` marks the
+    // quantized window on the primary's stream, which is what the copies must follow.
+    cudaStream_t peer_stage_st = nullptr;
+    cudaEvent_t peer_stage_q_ev = nullptr;
+    const bool peer_stage_async = std::getenv("STRATA_Q36_STAGE_ASYNC") != nullptr;
+    // STRATA_Q36_PREFILL_SPLIT=2: `ext` is what mixer() RETURNS (whether the router's extended table is in use,
+    // which decides the shared expert's gate base and stride).  The combine phase runs in a second layer() call
+    // that never reaches mixer(), so each half's answer is recorded here by its dispatch phase and read back by
+    // its combine.  Flag-off the array is never written or read.
+    int ext_h[2] = {0, 0};
+    // STRATA_Q36_PREFILL_SPLIT=2: whether each half's dispatch phase already issued its shared expert (the
+    // dispatch issues it before the peer plan, where the GPU is otherwise idle, so the combine must not repeat
+    // it).  Per half because both halves' dispatch phases run before either combine.  Flag-off never read.
+    int sh_h[2] = {0, 0};
+    int peer_wait_hi_h[2][3] = {{-1, -1, -1}, {-1, -1, -1}};
+    int64_t peer_wait_li_h[2] = {-1, -1};
+    int64_t peer_wait_base_h[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    int64_t peer_wait_rows_h[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    int peer_wait_slot_h[2][3] = {{-1, -1, -1}, {-1, -1, -1}};
+    // STRATA_Q36_PREFILL_SPLIT=2: the per-HALF base offset into peer_sums, so the combine reads the half's
+    // helpers' own rows.  The buffer is [2][3][tmax][N]: TWO BANKS of 3 helper slots, the bank chosen by the
+    // layer's parity.  The cross-layer pipeline runs layer l+1's dispatch(h0) before layer l's combine(h1), so a
+    // single bank would let the next layer's plan reuse (and overwrite) the sums the deferred combine is about to
+    // read.  With two banks, layer l and layer l+1 never share slots, and layer l+2 (which reuses l's bank) starts
+    // only after l's combine has run.  peer_sums_base_h[bank][half] is the half's first slot (bank*6 + the bank's
+    // own cursor) and peer_sums_count_h[bank][half] is how many helpers of that half took a share.
+    int peer_sums_base_h[2][2] = {{0, 0}, {0, 0}};
+    int peer_sums_count_h[2][2] = {{0, 0}, {0, 0}};
+    // What moe_end reads for the half it is combining: set by layer()'s phase 1 (and by the one-shot path just
+    // before its own moe_end), so moe_end itself needs no layer parity.  Flag-off these hold peer_sums_n / 0,
+    // which is exactly what moe_end read before.
+    int sums_n_cur = 0, sums_base_cur = 0;
     // STRATA_Q36_PEER_F16=1: where each waiting helper's rows belong and how many there are.  The packed rows land in
     // the primary's staging and are unpacked into `eparts` at the row base the plan gave that helper, so the unpack
     // needs both numbers, and peer_plan() is where they are known.
@@ -5549,7 +6447,8 @@ struct Engine {
     /// (with `err`) = the plan does not add up, or a helper launch was refused: the caller prints and exits - the
     /// primary's MMQ has not been issued yet at plan time, but by the time the combine runs half the layer would
     /// be dead, so there is nothing to fall back to anyway (the failure policy the deferred helper path documents).
-    bool peer_plan(size_t li, int T, const float* hdev, const int32_t* idsdev, float* epartsd, std::string& err) {
+    bool peer_plan(size_t li, int T, const float* hdev, const int32_t* idsdev, float* epartsd, std::string& err,
+                   int ro = 0) {
         const auto& g = m->g;
         const int Kp = (int) m->top_k, ne = (int) g.n_expert, N = (int) g.n_embd;
         const int64_t n_ent = (int64_t) T * Kp;
@@ -5560,12 +6459,14 @@ struct Engine {
         // the forward's critical path.
         const auto t_plan0 = prompt_timing() ? Clock::now() : Clock::time_point{};
         // The plan's host buffers are sized for the largest window this engine can hand a chunk (tmax tokens x top_k
-        // entries).  A bigger window is not something the chunk loop produces, but reading past the buffer would be
-        // silent, so it is refused rather than assumed away.  peer_window_fits() keeps this from being reached: the
-        // MMQ branch only plans a layer whose window fits the helpers' row budget, which is this buffer's size.
-        if (n_ent > (int64_t) peer_prow2_h.size()) {
+        // entries).  With STRATA_Q36_PREFILL_SPLIT=2 there are TWO such slots (dispatch(h1) must not overwrite
+        // the map combine(h0) still needs); the per-half capacity is still one window.  peer_window_fits()
+        // keeps an over-cap window from reaching here.
+        const int hb_prow = ro > 0 ? 1 : 0;
+        const size_t prow_slot = (size_t) tmax * (size_t) m->top_k;
+        if (n_ent > (int64_t) prow_slot) {
             err = "the window is " + std::to_string((long long) n_ent) + " entries, past the " +
-                  std::to_string((long long) peer_prow2_h.size()) + " the peer plan allocated for";
+                  std::to_string((long long) prow_slot) + " the peer plan allocated per half";
             return false;
         }
         const uint8_t* own = peer_owner.data() + li * (size_t) ne;
@@ -5610,9 +6511,25 @@ struct Engine {
         // exactly the experts this helper holds, which the ownership cross-check above has just proved to be this
         // table's `own[e] == r`.  So the two maxima are maxima over the same set of the same numbers.
         int64_t host_maxr[3] = {0, 0, 0};
-        if (prompt_timing()) {
+        // STRATA_Q36_PREFILL_SPLIT=2: THE HOST'S COUNTS ARE ALSO THE LAUNCH'S GRID.  Under the split the host's
+        // count of each helper's owned entries (rows[]) and of its widest expert (host_maxr[]) size the helpers'
+        // launches, so the host does not wait for the device's copy of them (the wait put the helper's whole
+        // layer - upload, compute, down leg - on the primary's critical path).  So the widest-expert count is
+        // needed on every split layer, not only on the ones the timing probe asks for.  The cost is one
+        // histogram over the window's entries and one pass over the experts: no CUDA call.
+        const bool split = prefill_split_halves() == 2;
+        if (prompt_timing() || split) {
             std::fill(peer_ecnt.begin(), peer_ecnt.end(), 0);
-            for (int64_t e = 0; e < n_ent; ++e) ++peer_ecnt[(size_t) h_peer_ids[e]];
+            // ONE PASS FOR BOTH ANSWERS.  The histogram and each helper's owned-row count are two numbers read
+            // off the same entry, so the second loop only re-paid the cache misses of these scattered host reads
+            // (8 KiB of routing ids, each pointing at a random expert's counter) for no new information.
+            for (int64_t e = 0; e < n_ent; ++e) {
+                const int32_t id = h_peer_ids[e];
+                ++peer_ecnt[(size_t) id];
+                const uint8_t o = own[(size_t) id];
+                if (o == kPeerNone) ++n_local;
+                else ++rows[(size_t) (o - 1)];   // the table's helper number is the CUDA ordinal (1..3)
+            }
             for (int32_t e = 0; e < ne; ++e) {
                 const uint8_t o = own[(size_t) e];
                 if (o == kPeerNone) continue;
@@ -5620,11 +6537,12 @@ struct Engine {
                 host_maxr[(size_t) (o - 1)] =
                     std::max(host_maxr[(size_t) (o - 1)], (int64_t) peer_ecnt[(size_t) e]);
             }
-        }
-        for (int64_t e = 0; e < n_ent; ++e) {
-            const uint8_t o = own[(size_t) h_peer_ids[e]];
-            if (o == kPeerNone) ++n_local;
-            else ++rows[(size_t) (o - 1)];   // the table's helper number is the CUDA ordinal (1..3)
+        } else {
+            for (int64_t e = 0; e < n_ent; ++e) {
+                const uint8_t o = own[(size_t) h_peer_ids[e]];
+                if (o == kPeerNone) ++n_local;
+                else ++rows[(size_t) (o - 1)];   // the table's helper number is the CUDA ordinal (1..3)
+            }
         }
         // STRATA_Q36_PROMPT_TIMING=1: the traffic balance (the probe's gate; four increments per layer, no CUDA call).
         if (prompt_timing()) {
@@ -5647,12 +6565,16 @@ struct Engine {
         // rows [0, n_local) the local MMQ writes; a helper j entry's row is base_j plus its rank among j's owned
         // entries - the executor's run.  Every row of the whole window is named exactly once, which is what the
         // duplicate-row check below asserts.
+        // STRATA_Q36_PREFILL_SPLIT=2: write into this half's slot so dispatch(h1) cannot overwrite
+        // the map combine(h0) still needs.  Flag-off: hb_prow==0, same as a single-slot buffer.
+        int32_t* prow_h = peer_prow2_h.data() + (size_t) hb_prow * prow_slot;
+        int32_t* prow_d = peer_prow2 + (size_t) hb_prow * prow_slot;
         int64_t lrank = 0, rank[3] = {0, 0, 0};
         std::fill(peer_row_seen.begin(), peer_row_seen.begin() + (size_t) n_ent, (uint8_t) 0);
         for (int64_t e = 0; e < n_ent; ++e) {
             const uint8_t o = own[(size_t) h_peer_ids[e]];
             const int64_t row = o == kPeerNone ? lrank++ : base[(size_t) (o - 1)] + rank[(size_t) (o - 1)]++;
-            peer_prow2_h[(size_t) e] = (int32_t) row;
+            prow_h[(size_t) e] = (int32_t) row;
             // The second half of the invariant, and the one a real bug would hit first: two entries landing in one
             // eparts row would leave one of them combined twice and the other never.  Silent logit corruption is
             // the failure mode, so it is checked here and ends the run rather than producing a wrong answer.
@@ -5664,13 +6586,13 @@ struct Engine {
             }
             peer_row_seen[(size_t) row] = 1;
         }
-        CK(cudaMemcpyAsync(peer_prow2, peer_prow2_h.data(), (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(prow_d, prow_h, (size_t) n_ent * 4, cudaMemcpyHostToDevice, st));
         // The local MMQ's id table: sorted row r's product goes to eparts row prow2[ent_dst[r]].  Exactly what the
         // identity table does with no helper (there prow2[e] == rinv[e]), so nothing about the local launch changes
         // beyond which rows of eparts it writes - and the rows it does write are the same ones.  Guarded against an
         // empty grid: a window whose every entry is a helper's leaves the primary nothing to launch (a 0-block launch
         // is a CUDA error, and the MMQ's own run() already treats 0 rows as nothing to do).
-        if (n_local > 0) k_peer_lid<<<grid1(n_local), kThreads, 0, st>>>(ent_dst, peer_prow2, (int) n_local, peer_lid);
+        if (n_local > 0) k_peer_lid<<<grid1(n_local), kThreads, 0, st>>>(ent_dst, prow_d, (int) n_local, peer_lid);
         peer_n = n_local;
         peer_lid_map = peer_lid;
         // STRATA_Q36_PEER_SUM=1: THE ROWS THE HELPERS WOULD HAVE WRITTEN ARE ZEROED.  With the sums on, nobody
@@ -5686,8 +6608,18 @@ struct Engine {
         // stream while the primary's MMQ runs below.  A helper with no entry here is not touched at all (its stream
         // stays idle, which is cheaper than an empty launch).  The row bases passed are the same bases the plan
         // numbered the entries with, so a helper's run lands exactly where prow2 says its entries' rows are.
-        peer_wait_n = 0;
-        peer_wait_li = (int64_t) li;
+        // STRATA_Q36_PREFILL_SPLIT=2: the wait state is PER HALF.  `slot` is the half index (0 or 1); with the
+        // flag off it is always 0 (the single-slot array is not touched in that case, the old code reads
+        // peer_wait_n / peer_wait_hi / peer_wait_li / peer_wait_base / peer_wait_rows / peer_wait_slot).
+        // ro==0 is half 0 (the singleton arrays), ro>0 is half 1 (the per-half arrays).
+        int* pn = ro > 0 ? &peer_wait_n_h[1] : &peer_wait_n;
+        int* ph = ro > 0 ? &peer_wait_hi_h[1][0] : &peer_wait_hi[0];
+        int64_t* pli = ro > 0 ? &peer_wait_li_h[1] : &peer_wait_li;
+        int64_t* pb = ro > 0 ? &peer_wait_base_h[1][0] : &peer_wait_base[0];
+        int64_t* pr = ro > 0 ? &peer_wait_rows_h[1][0] : &peer_wait_rows[0];
+        int* ps = ro > 0 ? &peer_wait_slot_h[1][0] : &peer_wait_slot[0];
+        *pn = 0;
+        *pli = (int64_t) li;
         // THE HELPERS PREPARE AT THE SAME TIME.  prepare_begin() only ENQUEUES the window copy and the row plan on
         // the helper's own stream, and prepare_end() is the wait.  Doing all the begins first and all the ends
         // after means the three helpers' window copies run on their three PCIe links CONCURRENTLY, instead of one
@@ -5711,21 +6643,61 @@ struct Engine {
                 const int N = (int) m->g.n_embd;
                 const int64_t n_ent = (int64_t) T * (int64_t) m->top_k;
                 const auto t_st = prompt_timing() ? Clock::now() : Clock::time_point{};
+                // STRATA_Q36_PREFILL_SPLIT=2: the half's own pinned slot.  Host alloc is TWO slots
+                // (2 * tmax * ...).  `ro` is the half's FIRST ROW (0 or nh), NOT a half index - using
+                // `ro` as the slot multiplier OOB'd half-1 (slot = 1024 * tmax * row_bytes) and left
+                // the helpers reading empty/garbage (int8 down-leg magnitude 0).  Half index is 0/1.
+                // Flag-off: hb==0, address is slot 0 as before.
+                const int hb = ro > 0 ? 1 : 0;
+                // peer_stage_q8 is uint8_t*: slot is BYTES.  peer_stage_ids / peer_stage_wts
+                // are typed pointers: slots are ELEMENT counts.  Multiplying ids/wts by
+                // sizeof(*) made half-1's D2H land past the host buffer (cudaMemcpyAsync
+                // invalid argument at the ids copy).
+                const size_t slot_q8 = (size_t) hb * (size_t) tmax * MMQ::q8_row_bytes((int64_t) N);
+                const size_t slot_ids = (size_t) hb * (size_t) tmax * (size_t) m->top_k;
+                const size_t slot_wts = peer_sum() ? (size_t) hb * (size_t) tmax * (size_t) m->top_k : 0;
                 // THE WINDOW GOES UP IN q8_1.  The primary quantized it (the MMQ branch above, the format the
                 // helpers' products read), so the helpers gather their rows instead of quantizing them: the bytes
                 // are the ones their own quantize() would have written, and the upload is a quarter of the size.
-                // THE COPIES RIDE THE PRIMARY'S STREAM.  The window's quantization ran on that stream, and it
-                // is a non-blocking one: a blocking cudaMemcpy on the default stream does NOT wait for it, so
-                // the copy could read the window before the quantization wrote it, and the helpers would have
-                // computed on half-written rows.  Both copies go on the stream and one sync waits for both.
-                CK(cudaMemcpyAsync(peer_stage_q8, d_peer_q8, (size_t) T * MMQ::q8_row_bytes((int64_t) N),
-                                   cudaMemcpyDeviceToHost, st));
-                CK(cudaMemcpyAsync(peer_stage_ids, idsdev, (size_t) n_ent * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+                // THE COPIES MUST FOLLOW THE QUANTIZATION, not the default stream: a blocking cudaMemcpy on the default
+                // stream does NOT wait for a non-blocking stream's kernel, so a copy issued that way could read the
+                // window before the quantization wrote it and the helpers would compute on half-written rows.
+                // Default path: both copies go on the primary's stream and one sync waits for both.
+                // STRATA_Q36_STAGE_ASYNC: they go on the staging stream instead, behind `peer_stage_q_ev`, which is
+                // recorded on the primary's stream right after the quantization - same ordering, different stream.
+                // STRATA_Q36_PREFILL_SPLIT=2: quantize writes THIS half's T rows at `d_peer_q8 + 0` (the device
+                // buffer is one window; each half reuses it).  D2H therefore reads from the base and lands in
+                // the half's host slot so half-1 cannot overwrite half-0's in-flight upload.
+                // STRATA_Q36_PREFILL_SPLIT=2: the half's own window.  Quantized on the primary's stream above and
+                // copied to the half's host slot here.
+                // STRATA_Q36_STAGE_ASYNC: the staged copies ride their own stream, ordered behind the quantized window,
+                // so they overlap the route kernels and the primary's per-layer sync does not wait for them.
+                const cudaStream_t sst = peer_stage_async ? peer_stage_st : st;
+                if (peer_stage_async && peer_stage_q_ev != nullptr)
+                    CK(cudaStreamWaitEvent(sst, peer_stage_q_ev, 0));
+                CK(cudaMemcpyAsync(peer_stage_q8 + slot_q8, d_peer_q8,
+                                   (size_t) T * MMQ::q8_row_bytes((int64_t) N),
+                                   cudaMemcpyDeviceToHost, sst));
+                CK(cudaMemcpyAsync(peer_stage_ids + slot_ids, idsdev, (size_t) n_ent * sizeof(int32_t),
+                                   cudaMemcpyDeviceToHost, sst));
                 // STRATA_Q36_PEER_SUM=1: the routing weights go up with the window and the routing (16 KB for a
                 // 512-token window).  The helpers need them to form the per-token weighted sums.
+                // STRATA_Q36_PREFILL_SPLIT=2: the weights' rows are chunk-local, so the D2H reads from
+                // `ewts + ro * Kp` and lands in the half's own host slot.
                 if (peer_sum())
-                    CK(cudaMemcpyAsync(peer_stage_wts, ewts, (size_t) n_ent * sizeof(float), cudaMemcpyDeviceToHost, st));
-                CK(cudaStreamSynchronize(st));
+                    CK(cudaMemcpyAsync(peer_stage_wts + slot_wts, ewts + (size_t) ro * m->top_k,
+                                       (size_t) n_ent * sizeof(float), cudaMemcpyDeviceToHost, sst));
+                // STRATA_Q36_STAGE_ASYNC: HAND THE WAIT TO THE HELPERS' STREAMS.  Instead of blocking the host on
+                // these copies (measured 2.30 ms a layer, with the GPU idle behind it), record an event after them
+                // and let each helper's upload wait on it (prepare_begin).  The host then goes straight on to issue
+                // the primary's own launches.  Default off: the blocking synchronise, exactly as before.
+                if (peer_stage_async) {
+                    if (peer_stage_ev == nullptr)
+                        CK(cudaEventCreateWithFlags(&peer_stage_ev, cudaEventDisableTiming));
+                    CK(cudaEventRecord(peer_stage_ev, sst));
+                } else {
+                    CK(cudaStreamSynchronize(st));
+                }
                 if (prompt_timing()) { peer_stage_ms += ms_since(t_st); ++peer_stage_n; }
             }
         }
@@ -5735,11 +6707,29 @@ struct Engine {
         // the helpers' wait could shorten, and the GPU has nothing queued while the plan runs, so the plan's whole
         // wall is on the forward's critical path.
         const auto t_book = prompt_timing() ? Clock::now() : Clock::time_point{};
+        // STRATA_Q36_PREFILL_SPLIT=2: the half's own pinned slot (the D2H above already landed the half's bytes
+        // in it).  Same half-index rule as the D2H block: hb is 0/1, never the row offset `ro`.
+        const int hb_slot = ro > 0 ? 1 : 0;
+        // Same typed-pointer rule as the D2H block above: q8 is bytes, ids/wts are elements.
+        const size_t slot_q8 = (size_t) hb_slot * (size_t) tmax * MMQ::q8_row_bytes((int64_t) N);
+        const size_t slot_ids = (size_t) hb_slot * (size_t) tmax * (size_t) m->top_k;
+        const size_t slot_wts = peer_sum() ? (size_t) hb_slot * (size_t) tmax * (size_t) m->top_k : 0;
         for (int r = 0; r < 3; ++r) {
             if (rows[(size_t) r] == 0 || !peer_on[(size_t) r] || peers[(size_t) r] == nullptr) continue;
-            if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err, peer_stage_q8,
-                                                  peer_stage_ids, /*q8_window=*/true,
-                                                  /*wts_staged=*/peer_sum() ? peer_stage_wts : nullptr))
+            // STRATA_Q36_PREFILL_SPLIT=2: THE HOST'S COUNTS, so the launch's grid needs no wait.  The host counted
+            // this helper's owned entries (rows[r]) and its widest expert (host_maxr[r]) from the routing and the
+            // ownership table - the same two numbers the device's plan brings back, counted independently.  The
+            // executor then sizes the launch from them and does not wait for the device's copy, which used to put
+            // the helper's whole layer on the primary's critical path.  The device's numbers are still what the
+            // launch runs on (the plan's kernels are enqueued before it, on the same stream), and the two are
+            // compared inside the executor at the next prepare_begin().  Flag-off: -1, and the executor waits
+            // for the device's numbers exactly as before.
+            if (!peers[(size_t) r]->prepare_begin((int64_t) li, hdev, idsdev, (int64_t) T, err,
+                                                  (const uint8_t*) (peer_stage_q8 + slot_q8),
+                                                  peer_stage_ids + slot_ids, /*q8_window=*/true,
+                                                  /*wts_staged=*/peer_sum() ? (peer_stage_wts + slot_wts) : nullptr,
+                                                  split ? rows[(size_t) r] : -1, split ? host_maxr[(size_t) r] : -1,
+                                                  /*stage_ev=*/peer_stage_ev))
                 return false;
         }
         const auto t_prep = prompt_timing() ? Clock::now() : Clock::time_point{};
@@ -5761,7 +6751,11 @@ struct Engine {
             // would mean the plan and the run disagree about the window, so it is REPORTED here, with both numbers.
             if (prompt_timing()) {
                 const int64_t dev_maxr = peers[(size_t) r]->last_max_rows();
-                if (dev_maxr != host_maxr[(size_t) r]) {
+                // STRATA_Q36_PREFILL_SPLIT=2: under the split the executor's widest-expert number IS the host's
+                // (the host's counts size the launch), so comparing them here would compare the host with itself.
+                // The real comparison - the device's plan against the host's counts - is inside the executor, at
+                // the next prepare_begin(), where the plan's read-back has landed; a disagreement ends the run.
+                if (!split && dev_maxr != host_maxr[(size_t) r]) {
                     ++pp_maxr_mismatch;
                     if (pp_maxr_mismatch <= 8)
                         std::fprintf(stderr,
@@ -5781,12 +6775,18 @@ struct Engine {
                                  (int) pp_maxr_dev[0].back(), (int) pp_maxr_dev[1].back(),
                                  (int) pp_maxr_dev[2].back());
             }
-            if (!peers[(size_t) r]->launch((int64_t) li, epartsd, base[(size_t) r], err)) return false;
+            // STRATA_Q36_PREFILL_SPLIT=2: pass the half's slot (0 or 1) so the executor stages this half's result
+            // into its own pinned up-leg buffer.  Flag-off: ro==0, slot 0, the old single buffer.
+            if (!peers[(size_t) r]->launch((int64_t) li, epartsd, base[(size_t) r], err, ro > 0 ? 1 : 0))
+                return false;
             // Second witness of the ownership invariant, from the executor's side and at one integer's cost: rows()
             // is what the helper's OWN live row plan counted this call (built from its cache's slot_ptr()); rows[r]
             // is what the master table above predicted for the same window.  The expert walk catches a table that
             // names the wrong helper; this catches the same disagreement as it shows up in the run the helper will
             // actually write, which is the number that decides where its rows land.
+            // STRATA_Q36_PREFILL_SPLIT=2: under the split the executor's row count IS the host's (the host's counts
+            // size the launch), so this comparison is the host with itself; the device's own count is compared
+            // against the host's inside the executor instead.
             if (peers[(size_t) r]->rows() != rows[(size_t) r]) {
                 err = "helper CUDA" + std::to_string(r + 1) + " planned " +
                       std::to_string((long long) peers[(size_t) r]->rows()) + " rows of layer " +
@@ -5794,15 +6794,35 @@ struct Engine {
                       std::to_string((long long) rows[(size_t) r]);
                 return false;
             }
-            peer_wait_hi[peer_wait_n] = r;
+            ph[*pn] = r;
             // STRATA_Q36_PEER_F16=1: where this helper's rows go and how many there are, for the unpack.
-            peer_wait_base[peer_wait_n] = base[(size_t) r];
-            peer_wait_rows[peer_wait_n] = rows[(size_t) r];
+            pb[*pn] = base[(size_t) r];
+            pr[*pn] = rows[(size_t) r];
             // STRATA_Q36_PEER_SUM=1: the slot in the sums' buffer this helper's per-token sums go to.  Only a
             // helper that took a share of this window gets one, and the slots are packed (0, 1, 2) in helper
             // order, so the combine adds them without needing to know which helper sent which.
-            peer_wait_slot[peer_wait_n] = peer_sum() ? peer_sums_n++ : -1;
-            ++peer_wait_n;
+            // STRATA_Q36_PEER_SUM=1 / STRATA_Q36_PREFILL_SPLIT=2: the slot in the sums' buffer.  With the split
+            // off, this is the running global count (same as flag-off).  With the split on, the two halves of
+            // the same layer both call peer_plan() and each plans its own helpers' shares.  The first half's
+            // helpers land in slots [0, n0), the second half's in [n0, n0+n1), where n0 is the first half's
+            // count.  peer_sums_base_h[hb] is the half's first slot; peer_sums_count_h[hb] is how many this
+            // half owns.  moe_end reads from the slot base (no +ro*N) with count_h, not the layer total.
+            if (peer_sum()) {
+                const int hb = ro > 0 ? 1 : 0;
+                const int sum_bank = prefill_split_halves() == 2 ? (int) (li & 1) : 0;
+                // The bank is part of the slot number itself, so the wait's `ps[i]` and moe_end's base are
+                // absolute indices into peer_sums and neither needs to know the layer's parity.
+                const int bank_off = prefill_split_halves() == 2 ? (int) (li & 1) * 6 : 0;
+                if (*pn == 0) {
+                    peer_sums_base_h[sum_bank][hb] = bank_off + peer_sums_n;   // first slot of this half's helpers
+                    peer_sums_count_h[sum_bank][hb] = 0;
+                }
+                ps[*pn] = bank_off + peer_sums_n++;
+                ++peer_sums_count_h[sum_bank][hb];
+            } else {
+                ps[*pn] = -1;
+            }
+            ++(*pn);
         }
         if (prompt_timing()) { pp_plan_wait_ms += ms_since(t_prep); ++pp_plan_wait_n; }
         return true;
@@ -5812,9 +6832,9 @@ struct Engine {
     /// would leave those eparts rows holding whatever the previous layer left there, which is a wrong answer, not a
     /// slow one.  (A STARTUP failure is different and falls back cleanly: peer_open() simply does not take the
     /// helper, and every layer then runs the plan-free path.)
-    void peer_plan_or_exit(size_t li, int T, const float* hdev, const int32_t* idsdev, float* epartsd) {
+    void peer_plan_or_exit(size_t li, int T, const float* hdev, const int32_t* idsdev, float* epartsd, int ro = 0) {
         std::string perr;
-        if (peer_plan(li, T, hdev, idsdev, epartsd, perr)) return;
+        if (peer_plan(li, T, hdev, idsdev, epartsd, perr, ro)) return;
         std::fprintf(stderr, "strata-q36: STRATA_Q36_PREFILL_PEERS, layer %zu: %s\n", li, perr.c_str());
         std::fprintf(stderr, "strata-q36: STRATA_Q36_PREFILL_PEERS: the per-entry row plan does not add up; continuing "
                              "would combine rows no one wrote\n");
@@ -5907,8 +6927,13 @@ struct Engine {
         CK(cudaMalloc((void**) &d_peer_owner, (size_t) n_state * (size_t) ne));
         CK(cudaMemcpy(d_peer_owner, peer_owner.data(), (size_t) n_state * (size_t) ne, cudaMemcpyHostToDevice));
         peer_lid = dalloc_t<int32_t>((size_t) tmax * m.top_k);
-        peer_prow2 = dalloc_t<int32_t>((size_t) tmax * m.top_k);
-        peer_prow2_h.resize((size_t) tmax * m.top_k);
+        // STRATA_Q36_PREFILL_SPLIT=2: two slots so dispatch(h1) cannot overwrite the map
+        // combine(h0) still needs.  Flag-off: one slot, same as before.
+        {
+            const size_t prow_slots = prefill_split_halves() == 2 ? 2u : 1u;
+            peer_prow2 = dalloc_t<int32_t>(prow_slots * (size_t) tmax * m.top_k);
+            peer_prow2_h.resize(prow_slots * (size_t) tmax * m.top_k);
+        }
         peer_row_seen.resize((size_t) tmax * m.top_k);
         peer_ecnt.assign((size_t) ne, 0);
         CK(cudaHostAlloc((void**) &h_peer_ids, (size_t) tmax * m.top_k * 4, cudaHostAllocDefault));
@@ -5930,16 +6955,31 @@ struct Engine {
     /// Called just before moe_end, where the existing helper deferral's wait also lands.  A failure ends the run for
     /// the reason the deferred-helper path documents: the primary's MMQ was already issued against this plan, so the
     /// entries the helper took have nothing computing them and there is nothing safe to fall back to mid-layer.
+    /// STRATA_Q36_PREFILL_SPLIT=2: the half's own wait.  Consumes the per-half state `peer_wait_*_h[ro ? 1 : 0]`
+    /// instead of the singleton.  The singleton is still the right one when the flag is off (the default) —
+    /// `ro` is 0 then and the pointer arithmetic below picks the singleton's slot.
     void peer_prefill_wait() {
-        if (peer_wait_n == 0) return;
-        const int n = peer_wait_n;
+        peer_prefill_wait_impl(0);
+    }
+    /// The half's own wait: `ro` is 0 for half 0 (the singleton's arrays), >0 for half 1 (the per-half arrays).
+    void peer_prefill_wait_impl(int ro) {
+        // STRATA_Q36_PREFILL_SPLIT=2: pick the right set of wait arrays.  Use plain pointers to the first
+        // element of each 3-slot row - the array decays to `T*`, not `T (*)[3]`.
+        int* pn   = ro > 0 ? &peer_wait_n_h[1]   : &peer_wait_n;
+        int* ph   = ro > 0 ? &peer_wait_hi_h[1][0]  : &peer_wait_hi[0];
+        int64_t* pli = ro > 0 ? &peer_wait_li_h[1]  : &peer_wait_li;
+        int64_t* pb = ro > 0 ? &peer_wait_base_h[1][0] : &peer_wait_base[0];
+        int64_t* pr = ro > 0 ? &peer_wait_rows_h[1][0] : &peer_wait_rows[0];
+        int* ps   = ro > 0 ? &peer_wait_slot_h[1][0] : &peer_wait_slot[0];
+        if (*pn == 0) return;
+        const int n = *pn;
         int hi[3] = {-1, -1, -1};
         for (int i = 0; i < n; ++i) {
-            hi[i] = peer_wait_hi[i];
-            peer_wait_hi[i] = -1;
+            hi[i] = ph[i];
+            ph[i] = -1;
         }
-        const int64_t li = peer_wait_li;
-        peer_wait_n = 0;
+        const int64_t li = *pli;
+        *pn = 0;
         std::string err;
         for (int i = 0; i < n; ++i) {
             const int r = hi[i];
@@ -5951,17 +6991,25 @@ struct Engine {
             // helper i+1's copy.
             const bool i8 = peer_i8();
             void* stage = i8 ? (void*) peer_i8_stage : (peer_f16() ? (void*) peer_f16_stage : nullptr);
-            if (peers[(size_t) r] != nullptr && peers[(size_t) r]->wait(st, stage, err)) {
+            // STRATA_Q36_PREFILL_SPLIT=2: tell the peer which event slot to use - 0 for the first half of the
+            // layer, 1 for the second.  The engine's `ro` is 0 for half 0, >0 for half 1.
+            const int slot = ro > 0 ? 1 : 0;
+            if (peers[(size_t) r] != nullptr && peers[(size_t) r]->wait(st, stage, err, slot)) {
                 const int N = (int) m->g.n_embd;
                 // STRATA_Q36_PEER_SUM=1: WHERE THE ROWS LAND.  With the sums on, what came back is not the helper's
                 // run of rows but its PER-TOKEN SUMS - one row per token of the window - so they go into the sums'
                 // buffer at this helper's slot, not into eparts.  The executor says how many rows it sent
                 // (transport_rows()); the sums' rows are not the run's rows.
                 const bool sums = peer_sum();
-                const int64_t rows_here = sums ? peers[(size_t) r]->transport_rows() : peer_wait_rows[i];
-                const int64_t base_here = peer_wait_base[i];
-                float* dst = sums ? (peer_sums + (size_t) peer_wait_slot[i] * (size_t) tmax * (size_t) N)
-                                  : (eparts + base_here * N);
+                const int64_t rows_here = sums ? peers[(size_t) r]->transport_rows() : pr[i];
+                const int64_t base_here = pb[i];
+                // STRATA_Q36_PREFILL_SPLIT=2: the half's own eparts base.  The plan's row map numbers the
+                // half's eparts rows in the half's own row range (the local MMQ's products land there), so
+                // the helper's rows must land at `ro * Kp` of the chunk's `eparts` when the split is on.
+                // Flag-off: ro is 0 and the base is the plan's as it was.
+                const int64_t ro_ent = ro * (int64_t) m->top_k;
+                float* dst = sums ? (peer_sums + (size_t) ps[i] * (size_t) tmax * (size_t) N)
+                                  : (eparts + (base_here + ro_ent) * N);
                 if (i8 && peer_i8_stage != nullptr) {
                     // STRATA_Q36_PEER_I8=1: the int8 rows unpack back into the floats the combine reads.  One warp
                     // per row, eight rows a block.
@@ -6258,8 +7306,14 @@ struct Engine {
             chunk_pictures(pos, 1);
             rows_deferred = true;
             // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
+#if defined(STRATA_HAVE_DFLASH2)
+            // an armed tap (the seed step after a prompt) also runs eagerly: the decode graph was captured without taps
+            if (mtab_now || map_on || tap_on_) forward(1, pos, 1, false, false);
+            else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
+#else
             if (mtab_now || map_on) forward(1, pos, 1, false, false);
             else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
+#endif
             mtab_now = nullptr;
             map_on = false;
             rows_deferred = false;
@@ -6269,6 +7323,13 @@ struct Engine {
             on_chunk(1);
             return 1;
         }
+#if defined(STRATA_HAVE_DFLASH2)
+        // prompt: feed the last 2047 residual rows into the DFlash2 ring (decode leaves tap_on_ to the caller)
+        if (use_df2) {
+            tap_on_ = true;
+            tap_first_ = std::max<int64_t>(0, pos + n - 2047);
+        }
+#endif
         for (int64_t i = 0; i < n; i += tmax) {
             const int T = (int) std::min<int64_t>(tmax, n - i);
             CK(cudaStreamSynchronize(st));
@@ -6277,6 +7338,7 @@ struct Engine {
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             chunk_pictures(pos, T);
+            const int64_t p0 = pos;
             forward(T, pos, i + T == n ? 1 : 0, false, false);
             if (m->has_mtp && mtp_d > 0) {
                 // seeds: h_{q-1} for each row q: hlast, then this chunk's rows 0 .. T - 2 (in `y`, free here)
@@ -6287,16 +7349,32 @@ struct Engine {
                 CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
                 forward_mtp(T, pos, mtp_seed(), false, false, pos0_m);
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            if (use_df2) {
+                std::string e;
+                if (!df2_feed_context(p0, e)) {
+                    std::fprintf(stderr, "strata-q36: dflash2 context failed: %s; falling back\n", e.c_str());
+                    use_df2 = false;
+                    tap_on_ = false;
+                }
+            }
+#endif
             CK(cudaMemcpyAsync(hlast, hmain + (size_t) (T - 1) * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             pos += T;
             CK(cudaStreamSynchronize(st));
             mtab_now = nullptr;
             map_on = false;
             if (!on_chunk(i + T)) {
+#if defined(STRATA_HAVE_DFLASH2)
+                if (use_df2) tap_on_ = false;
+#endif
                 if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
                 return i + T;
             }
         }
+#if defined(STRATA_HAVE_DFLASH2)
+        if (use_df2) tap_on_ = false;
+#endif
         if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
         return n;
     }
@@ -6523,11 +7601,33 @@ struct Engine {
         } else if (suffix) {
             ++sfx_bad;
         }
+#if defined(STRATA_HAVE_DFLASH2)
+        // --draft dflash2: pending drafts from the previous commit replace the MTP chain for THIS round.
+        // Suffix lookup still wins when the policy picks it; otherwise df2 sets D and fills drafts[].
+        const bool df2_round = use_df2 && df2_have_drafts_ && !sfx.lookup;
+        if (df2_round) {
+            D = std::min(std::max(D, df2_pending_n_), df2_pending_n_);
+            D = std::min(D, kVerify - 1);
+            if (main_hybrid)
+                D = std::min(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
+        }
+#else
+        const bool df2_round = false;
+#endif
         // The rebalance clamp above can cut this window short of mtp_d; the caller books `offered`, so it needs the
         // size that actually ran, not the size asked for (otherwise a window near a 32-position boundary is charged
         // for drafts it never made, and every acceptance ratio printed is slightly pessimistic).
         if (ran_D != nullptr) *ran_D = D;
-        const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
+#if defined(STRATA_HAVE_DFLASH2)
+        // DFlash2's drafts are not MTP chains: no redo rows.  The window is [x, d1 .. dD] alone.
+        const std::vector<int32_t>* fixp = &fix;
+        const std::vector<int32_t> df2_empty_fix;
+        if (df2_round) fixp = &df2_empty_fix;
+#else
+        const std::vector<int32_t>* fixp = &fix;
+#endif
+        const std::vector<int32_t>& fixv = *fixp;
+        const int T0 = (int) fixv.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
         // STRATA_Q36_MTP_MAPPED: live only with a draft step that has no host block in it, and never with the top-2
         // diagnostic (its runner-up is a host read of ONE logits buffer that pre-submission would let the steps
@@ -6535,9 +7635,9 @@ struct Engine {
         // guarded by it, so with the flag unset this is the loop, statement for statement, that it always was.
         const bool mapped_chain = mapped_chain_live();
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
-        for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
-        hpin[16 + fix.size()] = x_tok;
-        hpin[1] = (int32_t) (pos - (int64_t) fix.size());
+        for (int i = 0; i < (int) fixv.size(); ++i) hpin[16 + i] = fixv[(size_t) i];
+        hpin[16 + fixv.size()] = x_tok;
+        hpin[1] = (int32_t) (pos - (int64_t) fixv.size());
         check_ids(hpin + 16, T0, "the MTP block's tokens");
         CK(cudaMemcpyAsync(tok_m, hpin + 16, (size_t) T0 * 4, cudaMemcpyHostToDevice, st));
         // The chain's positions, staged ONCE for the whole window: element 0 is the T0 rows' base (what the step
@@ -6547,7 +7647,7 @@ struct Engine {
             // element 0 is the T0 rows' base (what the T0 call's *pos0_m reads: pos - fix.size()); element d is
             // chained step d's (pos + d).  Staged once for the whole window; the kernels read their own word at
             // EXECUTION, so a step submitted now still sees its own position while the later ones wait in the queue.
-            hpin[32] = (int32_t) (pos - (int64_t) fix.size());
+            hpin[32] = (int32_t) (pos - (int64_t) fixv.size());
             for (int d = 1; d < D; ++d) hpin[32 + d] = (int32_t) (pos + d);
             CK(cudaMemcpyAsync(pos0_m, hpin + 32, (size_t) D * 4, cudaMemcpyHostToDevice, st));
         } else {
@@ -6555,23 +7655,30 @@ struct Engine {
         }
         // seeds: hmain rows 0 .. fix - 1 are the h of the positions before the fixed rows; hlast is that before x
         float* seeds = mtp_seed();
-        if (!fix.empty())
-            CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
-        CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
-        // A lookup window carries no MTP drafts, so the block only has to advance its own K / V over the redo rows
-        // (draft = false writes none).  An MTP window drafts exactly as before.
-        forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0 && !sfx.lookup, false, pos0_m,
-                    mapped_chain && D > 0 && !sfx.lookup ? 0 : -1);
+        if (!fixv.empty())
+            CK(cudaMemcpyAsync(seeds, hmain, fixv.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+        CK(cudaMemcpyAsync(seeds + fixv.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+        // A lookup / DFlash2 window carries no MTP drafts, so the block only has to advance its own K / V over the
+        // redo rows (draft = false writes none).  An MTP window drafts exactly as before.
+        forward_mtp(T0, pos - (int64_t) fixv.size(), seeds, D > 0 && !sfx.lookup && !df2_round, false, pos0_m,
+                    mapped_chain && D > 0 && !sfx.lookup && !df2_round ? 0 : -1);
         drafts.assign((size_t) D, 0);
         if (sfx.lookup) suffix->fill(drafts, D);   // after the clear: assign() would have wiped a write made before it
+#if defined(STRATA_HAVE_DFLASH2)
+        else if (df2_round) {
+            for (int d = 0; d < D; ++d) drafts[(size_t) d] = df2_pending_[d];
+            df2_have_drafts_ = false;
+            df2_pending_n_ = 0;
+        }
+#endif
         for (int i = 0; i < 16; ++i) mtp_top2_prev[i] = -1;
         // the chain's published slots start empty, so a spin can tell "not yet" from "the token 0" (a draft CAN be 0)
-        if (mapped_chain && D > 0) {
+        if (mapped_chain && D > 0 && !df2_round) {
             for (int d = 0; d < D; ++d) ((volatile int32_t*) pick_h)[d] = -1;
             // step 0's publish rides with the step itself (below), so the first token of the chain is on the device
             // before any chained step is queued.
         }
-        if (D > 0 && !mapped_chain && !sfx.lookup) {
+        if (D > 0 && !mapped_chain && !sfx.lookup && !df2_round) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
             mtp_timing_read(true);   // STRATA_Q36_MTP_TIMING: the window's prep (the MTP block over D+1 rows)
@@ -6579,7 +7686,7 @@ struct Engine {
             if (mtp_top2() && D <= 16) mtp_top2_prev[0] = mtp_top2_tok;
         }
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
-        if (mapped_chain && !sfx.lookup) {
+        if (mapped_chain && !sfx.lookup && !df2_round) {
             // Flash-Next's shape (src/core/mtp.cpp:1623-1658): SUBMIT every chained step before the host waits for
             // anything, then spin on the mapped picks.  A step's seed is the PREVIOUS step's output - a real data
             // dependency - so its D2D copy rides the stream just before that step's launch (stream order: copy_d ->
@@ -6607,7 +7714,7 @@ struct Engine {
             }
             CK(cudaStreamSynchronize(st));
             if (D > 0) drafts[(size_t) D - 1] = ((volatile int32_t*) pick_h)[D - 1];
-        } else if (!sfx.lookup)
+        } else if (!sfx.lookup && !df2_round)
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
             check_ids(&drafts[(size_t) d - 1], 1, "a draft step's token");
             hpin[0] = drafts[(size_t) d - 1];
@@ -6632,8 +7739,21 @@ struct Engine {
         check_ids(hpin + 16, T, "the verify window's tokens");
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+#if defined(STRATA_HAVE_DFLASH2)
+        // arm the taps so the verify window's rows land in tap_dev_ (a graph captured without taps would miss
+        // the tap kernels) and the next draft can read them.
+        if (use_df2) {
+            tap_on_ = true;
+            tap_first_ = pos;
+        }
+#endif
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+#if defined(STRATA_HAVE_DFLASH2)
+        // a graph captured without taps would omit the tap kernels: when taps are on, run the window eagerly
+        if (use_df2) forward(T, pos, T, false, true);
+        else
+#endif
+            graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
@@ -6661,6 +7781,33 @@ struct Engine {
             }
         }
         for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+#if defined(STRATA_HAVE_DFLASH2)
+        // when DF2 owns this window's drafts, the next round's drafts come from this window's taps: the committed
+        // rows plus their picks.  The tap kernel already ran inside the verify forward (taps were armed before it),
+        // so df2_draft_from_taps reads the row data *before* commit() rewrites hmain / hlast.  A suffix lookup round
+        // (sfx.lookup) keeps its own learning below, untouched.
+        if (use_df2 && !sfx.lookup) {
+            const int64_t win_pos = pos;
+            const int32_t anchor = hpin[2 + a];
+            std::string e;
+            if (!df2_draft_from_taps(a + 1, win_pos, anchor, e)) {
+                std::fprintf(stderr, "strata-q36: dflash2 draft failed: %s; falling back\n", e.c_str());
+                use_df2 = false;
+                df2_have_drafts_ = false;
+                tap_on_ = false;
+                // fall through to the MTP / suffix commit path below
+            } else {
+                ++df2_win;
+                df2_acc += a;
+                tap_on_ = false;
+                commit(a + 1);
+                CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+                pos += a + 1;
+                after_rows(a + 1);
+                return a;
+            }
+        }
+#endif
         if (sfx.lookup) {
             ++sfx_win;
             sfx_acc += a;
@@ -6818,8 +7965,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer& L : m.layers) main_need += L.stride * (size_t) ne + kMmqTail;
     const size_t slack = ((size_t) 512 << 20) + (E.kAttScoreFloats - ((size_t) 16 << 20)) * 6;   // reserve + scores
     const bool mtp_cpu_ok = m.has_mtp && std::getenv("STRATA_Q36_NO_MTP_CPU") == nullptr;
+    // In the hybrid mode the decode waits on the CPU pool, not on the dense 1-4 column GEMVs the packed Q8_0 copies
+    // speed up: on a 16 GB RTX 4080 SUPER (UD-Q4_K_XL) they hold 1.78 GiB that buys 26 more expert slots a layer
+    // (66 -> 92 of 256 at 8192 cells), which measured 47.8 against 44.7 tok/s decode and 1,265 against 1,251 tok/s
+    // prompt (32768 cells: 46.9 against 45.0, slots 50 -> 76).  So they are given back there too, when the experts
+    // stay hybrid and the slots are the scarce thing (fewer than a third of the experts fit with them): a card that
+    // holds most of the experts keeps them, where the dense GEMVs are what the decode waits on.
+    // STRATA_Q36_KEEP_PACKED=1 keeps them either way.
+    const size_t staging_est = E.use_mmq ? 2 * (max_layer + kMmqTail) : 0;
+    const size_t room_before = budget > staging_est ? budget - staging_est : 0;
+    const bool packed_makes_it_fit = total <= budget + packed_bytes ||
+                                     (mtp_cpu_ok && main_need <= budget + packed_bytes + slack);
+    const bool slots_scarce = room_before / per_slot < (size_t) ne / 3;
     if (slots <= 0 && vram_gib < 0 && total > budget && packed_bytes > 0 &&
-        (total <= budget + packed_bytes || (mtp_cpu_ok && main_need <= budget + packed_bytes + slack)) &&
+        (packed_makes_it_fit || slots_scarce) &&
         std::getenv("STRATA_Q36_KEEP_PACKED") == nullptr) {
         CK(cudaDeviceSynchronize());
         for (const auto& pk : m.packed) {
@@ -6829,9 +7988,11 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         m.packed.clear();
         E.reset_graphs();
         CK(cudaMemGetInfo(&fr, &tot));
-        std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that every routed "
-                     "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
-                     (double) packed_bytes / (1 << 30));
+        std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back %s "
+                     "(STRATA_Q36_KEEP_PACKED=1 keeps them)\n",
+                     (double) packed_bytes / (1 << 30),
+                     packed_makes_it_fit ? "so that every routed expert fits in VRAM"
+                                         : "to the expert slots: the hybrid mode's decode waits on the CPU pool");
     }
     size_t budget2 = vram_gib >= 0 ? budget : (fr > reserve ? fr - reserve : 0);
     // the MAIN layers' experts fit, the MTP block's not all (UD-Q6_K_XL on 32 GB): the main layers all in VRAM - the
@@ -7636,6 +8797,19 @@ struct Serve {
             ss.live.clear();
             ss.imgs.clear();
             if (E.suffix) E.suffix->reset();
+#if defined(STRATA_HAVE_DFLASH2)
+            E.df2_clear_request();
+#endif
+        } else {
+#if defined(STRATA_HAVE_DFLASH2)
+            // the drafter's ring only holds committed rows of THIS session: a fresh tail was not fed through it,
+            // so the ring is stale - reset it and let the first plain step seed it again
+            if (E.use_df2 && ids.size() > reuse) {
+                E.df2_clear_request();
+                std::fprintf(stderr, "strata serve: session %d: %zu reused: dflash2's ring starts empty\n",
+                             s, reuse);
+            }
+#endif
         }
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
@@ -7695,7 +8869,11 @@ struct Serve {
         // greedy requests alone with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
         // text); sampled ones, and requests beside others, one token at a time.  --suffix-draft uses the same verified
         // window, so it is allowed with --mtp 0: the policy then compares a lookup window against a plain step.
+#if defined(STRATA_HAVE_DFLASH2)
+        const bool spec = (E.mtp_d > 0 || E.suffix || E.use_df2) && !smp.needs_logits() && !adm;
+#else
         const bool spec = (E.mtp_d > 0 || E.suffix) && !smp.needs_logits() && !adm;
+#endif
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = smp.needs_logits() ? -1 : E.greedy();
@@ -7750,13 +8928,21 @@ struct Serve {
             };
             if (!emit(nx)) break;
             if (n_active > 0) window();
-            if (spec && n_active == 0 && E.pos + std::max(E.mtp_d, E.suffix ? 7 : 0) + 1 <= E.ctx) {
+#if defined(STRATA_HAVE_DFLASH2)
+            const bool df2_ready = E.use_df2 && E.df2_have_drafts_;
+            const int df2_room = E.use_df2 ? E.df2_d : 0;
+#else
+            const bool df2_ready = false;
+            const int df2_room = 0;
+#endif
+            if (spec && n_active == 0 &&
+                E.pos + std::max({E.mtp_d, E.suffix ? 7 : 0, df2_room}) + 1 <= E.ctx) {
                 int ran_D = 0;
                 // --mtp-adaptive: the depth this round drafts with is the learned one (0 = the plain step, and the
                 // branch below is skipped so the loop falls through to it); with the flag unset it is mtp_d.
                 const int qd = E.d_adapt ? E.adapt.next : E.mtp_d;
                 const auto ts_a = (E.d_adapt || E.suffix) ? Clock::now() : Clock::time_point{};
-                if (qd > 0 || E.suffix) {
+                if (qd > 0 || E.suffix || df2_ready) {
                 const int a = E.spec_step(nx, fix, qd, drafts, picks, &stop, &ran_D);
                 if (E.d_adapt) E.adapt_observe(qd, a, ms_since(ts_a));
                 offered += ran_D;
@@ -7778,11 +8964,20 @@ struct Serve {
                 if (ended) break;
                 nx = picks[a];
                 continue;
-                }   // qd > 0
+                }   // qd > 0 or df2_ready
                 // qd == 0 (the learner picked the plain step): fall through to it below, untimed here
             }
             if (E.pos + 1 > E.ctx) break;
             const int32_t one = nx;
+#if defined(STRATA_HAVE_DFLASH2)
+            // the first plain step after the prompt: arm taps so this token's row lands in the drafter, then draft
+            // from it so the next round has a window to verify.
+            const int64_t df2_pos_before = E.pos;
+            if (E.use_df2 && !E.df2_have_drafts_ && E.df2_pending_n_ == 0) {
+                E.tap_on_ = true;
+                E.tap_first_ = E.pos;
+            }
+#endif
             if (E.d_adapt && E.adapt.next == 0) {   // the learner picked the plain step: time it, so D = 0's
                 const auto ts_p = Clock::now();   // cost enters the same comparison every round
                 E.process(&one, 1, [](int64_t) {});
@@ -7790,6 +8985,17 @@ struct Serve {
             } else {
                 E.process(&one, 1, [](int64_t) {});
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            if (E.use_df2 && !E.df2_have_drafts_ && E.df2_pending_n_ == 0) {
+                std::string e;
+                if (!E.df2_draft_from_taps(1, df2_pos_before, nx, e)) {
+                    std::fprintf(stderr, "strata-q36: dflash2 draft failed: %s; falling back\n", e.c_str());
+                    E.use_df2 = false;
+                    E.df2_have_drafts_ = false;
+                }
+                E.tap_on_ = false;
+            }
+#endif
             ss.live.push_back(nx);
             if (E.suffix) E.suffix->append(nx);
             fix.clear();
@@ -7798,6 +9004,10 @@ struct Serve {
         if (E.suffix && E.sfx_win > 0)
             std::fprintf(stderr, "strata-q36 SUFFIX: %lld lookup windows, %lld drafts accepted, %lld rounds skipped "
                          "(history did not match the position)\n", E.sfx_win, E.sfx_acc, E.sfx_bad);
+#if defined(STRATA_HAVE_DFLASH2)
+        if (E.use_df2 && E.df2_win > 0)
+            std::fprintf(stderr, "strata-q36 DFLASH2: %lld windows, %lld drafts accepted\n", E.df2_win, E.df2_acc);
+#endif
         E.sess[(size_t) E.cur].pos = E.pos;
         const double decode_ms = ms_since(d0);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0 0 0 0.0 %lld 0\n", produced, ids.size(), prompt_ms,
@@ -8189,7 +9399,14 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
     // the per-entry mask the masked grouping kernels read, for every tier above: the all-in-VRAM placement never
     // reaches place_experts' hybrid branch, where this is otherwise allocated
     if (E.d_helper_mask == nullptr) CK(cudaMalloc(&E.d_helper_mask, E.tmax * (size_t) m.top_k));
-    CK(cudaHostAlloc((void**) &E.helper_out, T * (size_t) m.top_k * (size_t) g.n_embd * 4, cudaHostAllocDefault));
+    // HELPER_SUM: [3][MAXT][N] per-helper T-row sums (disjoint slots for MARSHAL harvest).
+    // Default: one sparse [MAXT*K][N] buffer the helpers scatter into by entry index.
+    if (E.helper_sum()) {
+        CK(cudaHostAlloc((void**) &E.helper_out, 3 * T * (size_t) g.n_embd * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &E.h_helper_wts, T * (size_t) m.top_k * 4, cudaHostAllocDefault));
+    } else {
+        CK(cudaHostAlloc((void**) &E.helper_out, T * (size_t) m.top_k * (size_t) g.n_embd * 4, cudaHostAllocDefault));
+    }
     // STRATA_Q36_HELPER_ASYNC: the helpers' sparse rows staged on the device for the deferred merge into
     // `eparts` (only the entries the per-entry mask marks are written from it).  Allocated only when the
     // variable is set, so a default run's allocations are byte-for-byte what they were.
@@ -8206,6 +9423,11 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
 
 int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file, kv_opt;
+#if defined(STRATA_HAVE_DFLASH2)
+    std::string draft_kind, draft_model;
+    int draft_cap = 0;
+    double draft_conf = 0.0;
+#endif
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     // --mtp-calibrate N (opt-in): measure the acceptance of the first N speculative steps and, below the
     // measured breakeven, finish the answer as plain decode steps.  0 = off, and off is the whole default path.
@@ -8221,6 +9443,32 @@ int strata::qwen35::run(int argc, char** argv) {
     // --expert-cache-device1..3: 0 = off, else the slot count (INT_MAX for "auto")
     std::array<int, 3> expert_cache_remote = {0, 0, 0};
     std::array<bool, 3> expert_cache_auto = {false, false, false};
+    // STRATA_PRIMARY_SPIN=1: the primary's own waits spin instead of sleeping.  A decode step synchronises its
+    // stream six to eight times and every prompt layer does so at its route D2H, while the driver's default
+    // schedule policy sleeps once its first spins fail - and the wake-up then lands INSIDE the wait it was
+    // covering.  The helper tier has spun since 2026-10-25 for exactly this reason (remote_experts.cpp measured
+    // "~0.3 ms per round trip on Windows").  Opt-in, and the flags must be set before the primary context exists,
+    // which is why this is the first CUDA-touching statement of run(): through the standalone strata-q36 binary
+    // nothing CUDA has run before it; through the `strata` launcher, generate.cpp dispatches here with a return
+    // (so set_primary_device() never runs on this path) and may already have created the context - then the call
+    // is refused, reports itself below, and the run behaves exactly as before.  The ordinal is the CURRENT device,
+    // because that is where the engine's streams and allocations land; cudaGetDevice only reads driver state.
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+    if (const char* pspin = std::getenv("STRATA_PRIMARY_SPIN"); pspin != nullptr && pspin[0] == '1' && pspin[1] == '\0') {
+        int spin_dev = 0;
+        const cudaError_t got = cudaGetDevice(&spin_dev);
+        // A refused flag set is not an error in the run: the waits sleep, which is what they did before.  Say so
+        // once, so an arm that never took effect cannot pass for a slow arm.
+        if (got != cudaSuccess) {
+            std::fprintf(stderr, "strata-q36: STRATA_PRIMARY_SPIN: no current device (%s); the waits sleep as before\n",
+                         cudaGetErrorString(got));
+        } else if (const cudaError_t e = cudaInitDevice(spin_dev, cudaDeviceScheduleSpin, 0); e != cudaSuccess) {
+            std::fprintf(stderr, "strata-q36: STRATA_PRIMARY_SPIN: device %d refused the flags (%s); the waits sleep as before\n",
+                         spin_dev, cudaGetErrorString(e));
+        }
+        cudaGetLastError();
+    }
+#endif
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -8276,6 +9524,12 @@ int strata::qwen35::run(int argc, char** argv) {
             mtp_adapt_base = std::atoi(av.c_str());
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
+#if defined(STRATA_HAVE_DFLASH2)
+        else if (a == "--draft") draft_kind = next();
+        else if (a == "--draft-model") draft_model = next();
+        else if (a == "--draft-cap") draft_cap = std::atoi(next().c_str());
+        else if (a == "--draft-conf") draft_conf = std::atof(next().c_str());
+#endif
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
@@ -8340,6 +9594,19 @@ int strata::qwen35::run(int argc, char** argv) {
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
+#if defined(STRATA_HAVE_DFLASH2)
+    if (!draft_kind.empty() && draft_kind != "dflash2" && draft_kind != "mtp") {
+        std::fprintf(stderr, "strata-q36: --draft takes dflash2 or mtp, got %s\n", draft_kind.c_str());
+        return 2;
+    }
+    // dflash2 wants the MTP block as the fallback draft source: if the user did not say so, the block loads anyway.
+    // The drafter's pack is loaded and its D / confidence / cap settled in the early block above (before the
+    // engine's init and expert placement): they run only when the flags are set, so a default run allocates and
+    // prints nothing it did not.  The drafter's tap staging is bound in `df2_bind` below, after the engine is
+    // sized but before the experts go in, so the experts' free-VRAM reading sees the drafter's own footprint
+    // and gives the cache back rather than the other way round.
+    if (draft_kind == "dflash2" && mtp_d == 0) mtp_d = 7;
+#endif
     if (mtp_calib < 0 || mtp_calib > 64) {
         std::fprintf(stderr, "strata-q36: --mtp-calibrate takes 0 .. 64 probe steps\n");
         return 2;
@@ -8361,6 +9628,49 @@ int strata::qwen35::run(int argc, char** argv) {
     E.kv_k8 = kv_k8;
     E.kv_v8 = kv_v8;
     E.use_graph = graph;
+#if defined(STRATA_HAVE_DFLASH2)
+    // The DFlash2 drafter's VRAM, when requested, is taken BEFORE `E.init` and the expert placement so that
+    // `place_experts`' free-VRAM reading sees the pack as already used and gives the expert cache back - the
+    // DFlash2 pack is a small fixed allocation against a multi-GiB expert cache, so it is the right thing to fit
+    // first.  `E.init` has not run yet, so `tmax` is 0; `df2_bind` (called after `E.init`) sizes the tap staging
+    // from the chunk, not from a session.  The drafter's `prepare()` captures its graphs on that buffer then,
+    // before the buffer is used in any model forward.
+    std::string d2err;
+    bool df2_loaded = false;
+    if (draft_kind == "dflash2" && draft_model.empty())
+        std::fprintf(stderr, "strata-q36: --draft dflash2 needs --draft-model PACK; the MTP drafts instead\n");
+    else if (draft_kind == "dflash2" && batch > 0)
+        std::fprintf(stderr, "strata-q36: --draft dflash2 is not for --batch in this build; the MTP drafts instead\n");
+    else if (draft_kind == "dflash2") {
+        if (!E.df2.load(draft_model, 0, d2err)) {
+            std::fprintf(stderr, "strata-q36: %s; the MTP drafts instead\n", d2err.c_str());
+        } else {
+            E.use_df2 = true;
+            E.df2_conf = draft_conf;
+            cudaDeviceProp dp{};
+            int cap = draft_cap;
+            if (cap <= 0 && cudaGetDeviceProperties(&dp, 0) == cudaSuccess)
+                cap = strata::core::dflash2_auto_cap(false, dp.major);
+            int want = mtp_d > 0 ? mtp_d : strata::core::Dflash2Drafter::kDrafts;
+            if (cap > 0) want = std::min(want, cap);
+            E.df2_d = std::max(1, std::min(want, strata::core::Dflash2Drafter::kDrafts));
+            if (cap > 0 && mtp_d > cap) mtp_d = std::min(mtp_d, cap);
+            if (expert_vram < 0) {
+                // the drafter's own footprint (pack 0.65 GiB + ring + tap staging at 2048 rows ~ 0.5 GiB) plus the
+                // engine's KV cache and buffers need ~1.5 GiB more.  Cap the expert cache at `free - 2 GiB`
+                // so they all fit.  A user-supplied `--expert-vram` overrides this.
+                size_t fr = 0, tot = 0;
+                cudaMemGetInfo(&fr, &tot);
+                const double keep = 2.0 * 1073741824.0;
+                expert_vram = (fr > keep ? (double)(fr - keep) : 0.0) / 1073741824.0;
+                if (expert_vram <= 0.0) expert_vram = -1.0;   // back to the auto path
+                std::fprintf(stderr, "strata-q36: dflash2: the expert cache is capped at %.2f GiB to leave room "
+                             "for the drafter and the engine's buffers\n", expert_vram);
+            }
+            df2_loaded = true;
+        }
+    }
+#endif
     // --mtp-gguf with FP16 weights: every projection of that block goes to the cuBLAS F16 GEMM, at one row too, so
     // ITS activations must be left in FP16 by prep().  The flag is per layer (Layer::f16w), not per run: a run-wide
     // one would leave the main layers without their q8_1 image.
@@ -8496,6 +9806,13 @@ int strata::qwen35::run(int argc, char** argv) {
                 std::fprintf(stderr, "strata-q36: STRATA_Q36_PREFILL_PEERS: %lld prompt-chunk layer(s) exceeded the "
                              "helpers' %lld-entry row window and ran on the primary\n", (long long) E.peer_over_cap,
                              (long long) E.peer_cap_rows);
+#if defined(STRATA_HAVE_DFLASH2)
+            // above the hybrid early return: the drafter is usable on a fully VRAM-resident run too
+            if (E.use_df2 && E.df2.rounds > 0)
+                std::fprintf(stderr, "strata-q36 DFLASH2: %lld rounds, %.3f ms/round drafting (GPU %.3f ms/round), %.0f MiB VRAM\n",
+                             (long long) E.df2.rounds, E.df2.ms_draft / (double) E.df2.rounds,
+                             E.df2.ms_gpu / (double) E.df2.rounds, E.df2.vram_bytes() / (1024.0 * 1024.0));
+#endif
             if (!E.m->hybrid) return;
             if (E.helpers_enabled())
                 std::fprintf(stderr, "strata-q36: helper experts: %lld batch entries on the helper GPUs\n",
@@ -8512,6 +9829,20 @@ int strata::qwen35::run(int argc, char** argv) {
     // the full graph the shared expert is already one node.
     if (E.shared_graph_flag() && !E.use_graph) E.capture_shared_graphs();
     E.mtp_d = m.has_mtp ? mtp_d : 0;
+#if defined(STRATA_HAVE_DFLASH2)
+    // the drafter's pack was loaded early (before the engine's init and expert placement, so the expert cache's
+    // free-VRAM reading sees it and gives back rather than the drafter's cudaMalloc failing here); now bind its
+    // tap staging, which needs the engine sized (chunk, kVerify) but not the experts placed.
+    if (df2_loaded) {
+        if (!E.df2_bind(d2err)) {
+            std::fprintf(stderr, "strata-q36: dflash2 bind failed: %s; the MTP drafts instead\n", d2err.c_str());
+            E.use_df2 = false;
+        } else {
+            std::fprintf(stderr, "strata-q36: DFlash2 drafter on (%s, D=%d, tap staging %d rows, graphs captured in %.0f ms)\n",
+                         draft_model.c_str(), E.df2_d, E.tap_cap_, E.df2.ms_capture);
+        }
+    }
+#endif
     if (suffix_k > 0) {
         if (!m.has_mtp) {
             std::fprintf(stderr, "strata-q36: --suffix-draft needs the model's MTP block (its verified window): off\n");
@@ -8610,7 +9941,8 @@ int strata::qwen35::run(int argc, char** argv) {
         // other, so they are NOT additive and no single "unattributed" number is printed (a future reader sees the
         // GPU span sum and the forward total, and a gpu_residual = forward - GPU-spans that should be ~0).
         double d_pp_mixer = 0, d_pp_rr = 0, d_pp_rd2h = 0, d_pp_eplan = 0;
-        double d_pp_pwork = 0, d_pp_hwait = 0, d_pp_combine = 0, d_pp_post = 0;
+        double d_pp_pwork = 0, d_pp_hwait = 0, d_pp_combine = 0, d_pp_post = 0, d_pp_posthost = 0;
+        long long d_pp_posthost_n = 0;
         double d_pp_forward = 0, d_pp_prep_d2h = 0, d_pp_prep_sync = 0, d_pp_stage = 0;
         double d_pp_plan = 0, d_pp_sync3022 = 0, d_pp_ppwait = 0;
         long long d_pp_layers = 0;
@@ -8646,7 +9978,8 @@ int strata::qwen35::run(int argc, char** argv) {
             // step), same way the helper-timing prebegin/route-spin are read at t1: the greedy steps' forwards
             // are decode, not prompt, so they would add zero — but scoping at the measurement boundary is cleaner.
             double r_pp_mixer = 0, r_pp_rr = 0, r_pp_rd2h = 0, r_pp_eplan = 0;
-            double r_pp_pwork = 0, r_pp_hwait = 0, r_pp_combine = 0, r_pp_post = 0;
+            double r_pp_pwork = 0, r_pp_hwait = 0, r_pp_combine = 0, r_pp_post = 0, r_pp_posthost = 0;
+            long long r_pp_posthost_n = 0;
             double r_pp_forward = 0, r_pp_prep_d2h = 0, r_pp_prep_sync = 0, r_pp_stage = 0;
             double r_pp_plan = 0, r_pp_sync3022 = 0, r_pp_ppwait = 0;
             long long r_pp_layers = 0;
@@ -8659,6 +9992,8 @@ int strata::qwen35::run(int argc, char** argv) {
                 r_pp_hwait = E.pp_helper_wait_ms - ppb_hwait;
                 r_pp_combine = E.pp_combine_ms - ppb_combine;
                 r_pp_post = E.pp_post_ms - ppb_post;
+                r_pp_posthost = E.pp_post_host_ms;   // pp_reset() zeroes it at the top of every pass
+                r_pp_posthost_n = E.pp_post_host_n;  // windows, not layers: one fewer than post's, by construction
                 r_pp_forward = E.pp_forward_ms - ppb_forward;
                 double pd2h = 0, psync = 0;
                 for (int r = 0; r < 3; ++r) {
@@ -8784,6 +10119,8 @@ int strata::qwen35::run(int argc, char** argv) {
                 d_pp_hwait += r_pp_hwait;
                 d_pp_combine += r_pp_combine;
                 d_pp_post += r_pp_post;
+                d_pp_posthost += r_pp_posthost;
+                d_pp_posthost_n += r_pp_posthost_n;
                 d_pp_forward += r_pp_forward;
                 d_pp_prep_d2h += r_pp_prep_d2h;
                 d_pp_prep_sync += r_pp_prep_sync;
@@ -9030,13 +10367,14 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr,
                          "strata-q36 PHASE3 AGG benches 0-2 prompt: layers=%lld (all values in ms per layer) | "
                          "mixer=%.3f router_route=%.3f route_d2h=%.3f plan=%.3f primary_work=%.3f "
-                         "helper_wait=%.3f combine=%.3f post_combine=%.3f | "
+                         "helper_wait=%.3f combine=%.3f post_combine=%.3f post_host=%.3f/%lld | "
                          "HOST WALL (overlaps the GPU spans, not additive) prep_d2h=%.3f prep_sync=%.3f "
                          "stage=%.3f peer_plan=%.3f sync3022=%.3f ppwait=%.3f | "
                          "forward=%.3f gpu_spansum=%.3f gpu_residual=%.3f\n",
                          d_pp_layers,
                          d_pp_mixer * pl, d_pp_rr * pl, d_pp_rd2h * pl, d_pp_eplan * pl,
-                         d_pp_pwork * pl, d_pp_hwait * pl, d_pp_combine * pl, d_pp_post * pl,
+                         d_pp_pwork * pl, d_pp_hwait * pl, d_pp_combine * pl, d_pp_post * pl, d_pp_posthost * pl,
+                         d_pp_posthost_n,
                          d_pp_prep_d2h * pl, d_pp_prep_sync * pl, d_pp_stage * pl, d_pp_plan * pl, d_pp_sync3022 * pl,
                          d_pp_ppwait * pl,
                          d_pp_forward * pl, spsum * pl, gres * pl);
@@ -9248,7 +10586,12 @@ int strata::qwen35::run(int argc, char** argv) {
     E.process(prompt.data(), (int64_t) prompt.size(), [](int64_t) {});
     const double pp_ms = ms_since(t0);
     const auto t1 = Clock::now();
-    if ((E.mtp_d > 0 || E.suffix) && forced.empty() && !ff) {
+#if defined(STRATA_HAVE_DFLASH2)
+    const bool gen_spec_on = E.mtp_d > 0 || E.suffix != nullptr || E.use_df2;
+#else
+    const bool gen_spec_on = E.mtp_d > 0 || E.suffix != nullptr;
+#endif
+    if (gen_spec_on && forced.empty() && !ff) {
         // the D the answer drafts with: what was asked for, unless --mtp-calibrate found a deeper-or-shallower D that
         // pays better (it measured D=1 whether or not 1 was the --mtp value, which is the whole point of fix 1).  With
         // the flag unset this is E.mtp_d and the loop below is the one that was always there.
@@ -9258,6 +10601,28 @@ int strata::qwen35::run(int argc, char** argv) {
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
         int nx = E.greedy();
+        // STRATA_Q36_HELPER_TIMING=1: the counters the bench-tg path prints (the PHASE3 lines), snapshotted around
+        // the GENERATE loop instead of around a bench pass.  The bench-tg path never runs spec_step, so its numbers
+        // cannot explain a speculative decode - and the speculative decode is the one worth explaining.  The snapshot
+        // is taken after the prompt (whose own layers would otherwise land in the decode's numbers) and the report is
+        // printed after the loop, so the difference is the decode's own work.
+        // The gate is the same exact-"1" test Engine::helper_timing() applies, so with the flag unset not one
+        // statement of this block runs and the default path is byte-identical.
+        const bool df2_timing = Engine::helper_timing();
+        double t_pre0 = 0, t_spin0 = 0, t_hl0 = 0, t_hm0 = 0, t_hb0 = 0, t_hlo0 = 0, t_hsh0 = 0, t_hcpu0 = 0, t_hf0 = 0;
+        long long t_pn0 = 0, t_sn0 = 0, t_hln0 = 0;
+        double t_hb[3] = {}, t_hw[3] = {}, t_ho[3] = {};
+        if (df2_timing) {
+            t_pre0 = E.d_prebegin_ms; t_spin0 = E.d_route_spin_ms; t_hl0 = E.d_host_layer_ms;
+            t_hm0 = E.d_h_mixer_ms; t_hb0 = E.d_h_begin_ms; t_hlo0 = E.d_h_local_ms;
+            t_hsh0 = E.d_h_shared_ms; t_hcpu0 = E.d_h_cpu_ms; t_hf0 = E.d_h_finish_ms;
+            t_pn0 = E.d_prebegin_n; t_sn0 = E.d_route_spin_n; t_hln0 = E.d_host_layer_n;
+            for (int r = 0; r < 3; ++r) {
+                t_hb[r] = E.helpers[(size_t) r].ms_begin();
+                t_hw[r] = E.helpers[(size_t) r].ms_wait();
+                t_ho[r] = E.helpers[(size_t) r].ms_sync_overhead();
+            }
+        }
         if (E.suffix) {
             E.suffix->append(prompt.data(), prompt.size());
             // the spec_step below needs the history length to equal pos; after the prompt read, pos == prompt.size()
@@ -9266,11 +10631,11 @@ int strata::qwen35::run(int argc, char** argv) {
             // the depth this round: with --mtp-adaptive the learned one (0 = a plain step), else the asked-for
             // gen_D - and with --mtp-calibrate the probe's verdict stands: it dropped the drafts and speculating
             // is false, so the rounds are plain steps, as before.
-            const bool drafting = E.d_adapt ? true : (speculating || E.suffix);
+            const bool drafting = E.d_adapt ? true : (speculating || E.suffix != nullptr);
             const int qd = E.d_adapt ? E.adapt.next : gen_D;
             gen.push_back(nx);
             if ((int) gen.size() >= n_gen) break;
-            if (drafting && (qd > 0 || E.suffix)) {
+            if (drafting && (qd > 0 || E.suffix != nullptr)) {
                 int ran_D = 0;
                 const auto ts_a = E.d_adapt ? Clock::now() : Clock::time_point{};
                 const int a = E.spec_step(nx, fix, qd, drafts, picks, nullptr, &ran_D);
@@ -9290,12 +10655,31 @@ int strata::qwen35::run(int argc, char** argv) {
                 // one token per step.  With the learner on, the plain step's time feeds D = 0's EMA (its committed
                 // token against the step's cost), and its rounds are the only evidence a draft depth worth picking
                 // again can win back from;
+#if defined(STRATA_HAVE_DFLASH2)
+                // the first plain step after the prompt seeds the DFlash2 drafter: arm taps on this row, draft from it.
+                const int64_t df2_pos_before = E.pos;
+                if (E.use_df2 && !E.df2_have_drafts_ && E.df2_pending_n_ == 0) {
+                    E.tap_on_ = true;
+                    E.tap_first_ = E.pos;
+                }
+#endif
                 if (E.d_adapt) {
                     const auto ts_p = Clock::now();
                     E.process(&nx, 1, [](int64_t) {});
                     E.adapt_observe(0, 0, ms_since(ts_p));
                 } else
                     E.process(&nx, 1, [](int64_t) {});
+#if defined(STRATA_HAVE_DFLASH2)
+                if (E.use_df2 && !E.df2_have_drafts_ && E.df2_pending_n_ == 0) {
+                    std::string e;
+                    if (!E.df2_draft_from_taps(1, df2_pos_before, nx, e)) {
+                        std::fprintf(stderr, "strata-q36: dflash2 draft failed: %s; falling back\n", e.c_str());
+                        E.use_df2 = false;
+                        E.df2_have_drafts_ = false;
+                    }
+                    E.tap_on_ = false;
+                }
+#endif
                 if (E.suffix) E.suffix->append(nx);
                 fix.clear();   // a plain step committed its own token: no old drafts seed the next window
                 nx = E.greedy();
@@ -9311,6 +10695,41 @@ int strata::qwen35::run(int argc, char** argv) {
                      offered ? 100.0 * accepted / offered : 0.0,
                      mtp_calib > 0 ? (speculating ? ", drafts kept by the probe" : ", drafts dropped by the probe")
                                    : (E.d_adapt ? ", the learned depth" : ""));
+#if defined(STRATA_HAVE_DFLASH2)
+        if (E.use_df2 && E.df2_win > 0)
+            std::fprintf(stderr, "strata-q36 DFLASH2: %lld windows, %lld drafts accepted\n", E.df2_win, E.df2_acc);
+#endif
+        // STRATA_Q36_HELPER_TIMING=1: the generate path's own per-layer attribution, the counterpart of the PHASE3
+        // lines (which measure the bench-tg path - a T=1 forward that never runs spec_step).  EVERY NUMBER IS PER
+        // LAYER, so the split can be read against the cost model directly; the layer count is the number of layer()
+        // calls the decode made.
+        if (df2_timing) {
+            const long long layers = E.d_host_layer_n - t_hln0;
+            if (layers > 0) {
+                const double L = (double) layers;
+                const double pre = E.d_prebegin_ms - t_pre0;
+                const double spin = E.d_route_spin_ms - t_spin0;
+                const double hostl = E.d_host_layer_ms - t_hl0;
+                std::fprintf(stderr,
+                             "strata-q36 GEN primary: %.1f us/layer | prebegin_sync=%.1f route_spin=%.1f host_own=%.1f "
+                             "| mixer=%.1f begin=%.1f local=%.1f shared=%.1f cpu=%.1f finish=%.1f (us/layer)\n",
+                             1000.0 * hostl / L, 1000.0 * pre / L, 1000.0 * spin / L, 1000.0 * (hostl - pre) / L,
+                             1000.0 * (E.d_h_mixer_ms - t_hm0) / L, 1000.0 * (E.d_h_begin_ms - t_hb0) / L,
+                             1000.0 * (E.d_h_local_ms - t_hlo0) / L, 1000.0 * (E.d_h_shared_ms - t_hsh0) / L,
+                             1000.0 * (E.d_h_cpu_ms - t_hcpu0) / L, 1000.0 * (E.d_h_finish_ms - t_hf0) / L);
+                for (int r = 0; r < 3; ++r) {
+                    if (!E.helper_on[(size_t) r]) continue;
+                    const double hb = E.helpers[(size_t) r].ms_begin() - t_hb[r];
+                    const double hw = E.helpers[(size_t) r].ms_wait() - t_hw[r];
+                    const double ho = E.helpers[(size_t) r].ms_sync_overhead() - t_ho[r];
+                    std::fprintf(stderr,
+                                 "strata-q36 GEN helper CUDA%d: %.1f us/layer | ms_begin=%.1f ms_wait=%.1f "
+                                 "ms_sync_overhead=%.1f (us/layer)\n",
+                                 r + 1, 1000.0 * (hb + hw) / L, 1000.0 * hb / L, 1000.0 * hw / L, 1000.0 * ho / L);
+                }
+                std::fprintf(stderr, "strata-q36 GEN: %lld layers, %zu tokens\n", layers, gen.size());
+            }
+        }
         return 0;
     }    for (int i = 0; i < n_gen; ++i) {
         const int a = E.greedy();

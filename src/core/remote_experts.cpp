@@ -124,11 +124,35 @@ bool RemoteExperts::alloc_win(Win& w, size_t meta_bytes, size_t scratch, std::st
         check(cudaMalloc(&w.d_scratch_, scratch), "scratch", err, device_) &&
         check(cudaMalloc(&w.d_meta_, meta_bytes), "group metadata", err, device_);
     if (!allocated) return false;
+    // STRATA_Q36_HELPER_SUM: device sum buffer when the result is not mapped into h_out_.
+    if (helper_sum_ &&
+        !check(cudaMalloc((void**) &w.d_sum_, (size_t) strata::kernels::cpu::MAXT * n_embd_ * sizeof(float)),
+               "helper sum", err, device_))
+        return false;
     if (rings_ > 1) {
         if (!check(cudaMalloc((void**) &w.d_src_row_, (size_t) cap_ * sizeof(int32_t)), "src_row", err, device_))
             return false;
         if (!check(cudaEventCreateWithFlags(&w.ev_done_, cudaEventDisableTiming), "ring event", err, device_))
             return false;
+    }
+    {
+        // STRATA_REMOTE_FLAG_WAIT=1: the completion word the helper's stream publishes into mapped pinned HOST
+        // memory, so drain() can poll a host address instead of synchronising the event (rings>1) or the stream
+        // (rings==1 - the SUM/MARSHAL decode stack's shape).  BEST EFFORT: if the word cannot be mapped into the
+        // helper's address space the slot keeps d_flag_ null and drain() takes its old wait, so a failure here
+        // must not fail open().  `cudaGetLastError()` clears the sticky error the failed attempt may have set.
+        const char* fw = std::getenv("STRATA_REMOTE_FLAG_WAIT");
+        if (fw != nullptr && fw[0] == '1' && fw[1] == '\0' &&
+            cudaHostAlloc((void**) &w.h_flag_, sizeof(unsigned int),
+                          cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess) {
+            *w.h_flag_ = 0;
+            if (cudaHostGetDevicePointer((void**) &w.d_flag_, w.h_flag_, 0) != cudaSuccess) {
+                w.d_flag_ = nullptr;
+                cudaGetLastError();
+            }
+        } else {
+            cudaGetLastError();
+        }
     }
     if (zero_copy_) {
         if (cudaHostGetDevicePointer((void**) &w.z_x_, w.h_x_, 0) != cudaSuccess ||
@@ -161,6 +185,7 @@ void RemoteExperts::free_win(Win& w) {
     if (w.d_src_row_) cudaFree(w.d_src_row_);
     if (w.d_x_) cudaFree(w.d_x_);
     if (w.d_out_) cudaFree(w.d_out_);
+    if (w.d_sum_) cudaFree(w.d_sum_);
     if (w.d_q8_) cudaFree(w.d_q8_);
     if (w.d_scales_) cudaFree(w.d_scales_);
     if (w.d_scratch_) cudaFree(w.d_scratch_);
@@ -168,6 +193,7 @@ void RemoteExperts::free_win(Win& w) {
     if (w.h_x_) cudaFreeHost(w.h_x_);
     if (w.h_out_) cudaFreeHost(w.h_out_);
     if (w.h_meta_) cudaFreeHost(w.h_meta_);
+    if (w.h_flag_) cudaFreeHost(w.h_flag_);
     w = Win{};
 }
 
@@ -188,6 +214,7 @@ void RemoteExperts::close() {
     device_ = -1;
     rings_ = 1;
     rr_ = 0;
+    helper_sum_ = false;
     stream_ = nullptr;
     read_stream_ = nullptr;
     zero_copy_ = false;
@@ -220,6 +247,24 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
               " experts: STRATA_Q36_HELPER_RING>1 cannot be used with remote_opt reduce (single-window)";
         rings_ = 1;
         return false;
+    }
+    // STRATA_Q36_HELPER_SUM=1: per-helper PEER_SUM-shaped reduce.  Incompatible with remote_opt (shared
+    // h_sum_) and with HELPER_RING (rings>1, device-merge path).  Off by default.
+    {
+        const char* hs = std::getenv("STRATA_Q36_HELPER_SUM");
+        helper_sum_ = hs && hs[0] == '1' && hs[1] == '\0';
+        if (helper_sum_ && remote_opt_ != nullptr) {
+            err = "CUDA" + std::to_string(device) +
+                  " experts: STRATA_Q36_HELPER_SUM cannot be used with remote_opt reduce";
+            helper_sum_ = false;
+            return false;
+        }
+        if (helper_sum_ && rings_ > 1) {
+            err = "CUDA" + std::to_string(device) +
+                  " experts: STRATA_Q36_HELPER_SUM requires rings==1 (not HELPER_RING)";
+            helper_sum_ = false;
+            return false;
+        }
     }
     int count = 0;
     if (!check(cudaGetDeviceCount(&count), "cudaGetDeviceCount", err, device)) return false;
@@ -334,8 +379,10 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     const size_t scratch = std::max<size_t>(
         (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(cap_, n_embd_, n_ff_),
         strata::kernels::native_expert_scratch_bytes(cap_, n_ff_));
-    // remote_opt metadata only when rings==1 (reduce assumes a single window).
-    const size_t meta_bytes = sizeof(RemoteMeta) + (remote_opt_ && rings_ == 1 ? remote_opt_->metadata_bytes() : 0);
+    // remote_opt / HELPER_SUM metadata only when rings==1 (reduce assumes a single window).
+    const size_t meta_bytes = sizeof(RemoteMeta) +
+        (remote_opt_ && rings_ == 1 ? remote_opt_->metadata_bytes()
+                                   : (helper_sum_ ? sum_meta_bytes() : 0));
     if (!check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream", err, device)) {
         close(); return false;
     }
@@ -410,6 +457,16 @@ int64_t RemoteExperts::window_n(int slot) const {
     return win_[(size_t) slot].n_;
 }
 
+bool RemoteExperts::sum_mode(int slot) const {
+    if (slot < 0 || slot >= rings_ || (size_t) slot >= win_.size()) return false;
+    return win_[(size_t) slot].sum_;
+}
+
+int64_t RemoteExperts::sum_toks(int slot) const {
+    if (slot < 0 || slot >= rings_ || (size_t) slot >= win_.size()) return 0;
+    return win_[(size_t) slot].sum_toks_;
+}
+
 int RemoteExperts::begin_win(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                              int64_t k, const int32_t* kind, const int32_t* primary_res,
                              std::string& err) {
@@ -421,9 +478,9 @@ int RemoteExperts::begin_win(int64_t layer, const float* x, const int32_t* ids, 
 
 bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                           int64_t k, const int32_t* kind, const int32_t* primary_res,
-                          std::string& err) {
+                          std::string& err, const float* sum_wts) {
     // Flash-Next / legacy: always slot 0 so finish()/owns() stay single-window.
-    const int s = begin_slot(0, layer, x, ids, n_tok, k, kind, primary_res, err);
+    const int s = begin_slot(0, layer, x, ids, n_tok, k, kind, primary_res, err, sum_wts);
     if (s == -1) return true;
     if (s < 0) return false;
     return true;
@@ -431,7 +488,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
 
 int RemoteExperts::begin_slot(int slot, int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                               int64_t k, const int32_t* kind, const int32_t* primary_res,
-                              std::string& err) {
+                              std::string& err, const float* sum_wts) {
     // cumulative host time in here (staging and launches), reported per request by the driver
     struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
@@ -447,6 +504,8 @@ int RemoteExperts::begin_slot(int slot, int64_t layer, const float* x, const int
     }
     Win& w = win_[(size_t) slot];
     w.n_ = n;
+    w.sum_ = false;
+    w.sum_toks_ = 0;
     std::fill(w.owned_.begin(), w.owned_.begin() + n, 0);
     w.group_id_.clear(); w.ptr_.clear(); w.start_.clear(); w.dst_.clear(); w.tok_.clear(); w.original_row_.clear();
     std::fill(w.src_row_.begin(), w.src_row_.begin() + n, -1);
@@ -494,14 +553,28 @@ int RemoteExperts::begin_slot(int slot, int64_t layer, const float* x, const int
     std::memcpy(meta->tok, w.tok_.data(), w.tok_.size() * sizeof(w.tok_[0]));
     meta->count = (int32_t) w.group_id_.size();
     const bool reduce = remote_opt_ && remote_opt_->active() && rings_ == 1;
+    // HELPER_SUM: per-helper PEER_SUM-shaped reduce. Incompatible with remote_opt / rings>1 (open() refuses).
+    const bool sum = helper_sum_ && sum_wts != nullptr && rings_ == 1 && !reduce;
     if (reduce) remote_opt_->prepare(*this, meta + 1);
+    if (sum) {
+        auto* row = (int32_t*) (meta + 1);
+        auto* weight = row + cap_;
+        std::fill(row, row + n_tok * k, -1);
+        for (size_t i = 0; i < w.original_row_.size(); ++i)
+            row[w.original_row_[i]] = (int32_t) i;
+        std::memcpy(weight, sum_wts, (size_t) n_tok * k * sizeof(float));
+        w.sum_ = true;
+        w.sum_toks_ = n_tok;
+    }
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return -2; }
     w.groups_ = (int32_t) w.group_id_.size();
     const cudaStream_t s = stream_;
+    const size_t meta_extra = reduce ? remote_opt_->metadata_bytes()
+                                     : (sum ? sum_meta_bytes() : 0);
     bool staged =
         (zero_copy_ || check(cudaMemcpyAsync(w.d_x_, w.h_x_, (size_t) n_tok * n_embd_ * sizeof(float), cudaMemcpyHostToDevice, s), "copy input", err, device_)) &&
-        check(cudaMemcpyAsync(w.d_meta_, w.h_meta_, sizeof(RemoteMeta) + (reduce ? remote_opt_->metadata_bytes() : 0),
+        check(cudaMemcpyAsync(w.d_meta_, w.h_meta_, sizeof(RemoteMeta) + meta_extra,
                               cudaMemcpyHostToDevice, s), "copy group metadata", err, device_);
     // Ring device-merge needs helper-side src_row; rings==1 finish uses host scatter only.
     if (staged && rings_ > 1)
@@ -550,24 +623,45 @@ int RemoteExperts::begin_slot(int slot, int64_t layer, const float* x, const int
         // Upstream set this only on its own path; on the layer_layouts_ path the flags come from the global
         // table too, or the kernel would decode a folded down matrix as if it were unfolded.
         if (have_fmt && fmt.had_d) { L.had_block = fmt.had_block; L.d_signs = d_sh_; }
+        // reduce/sum need compact parts in d_out_; only plain zero-copy writes straight to z_out_.
         strata::kernels::native_expert_grouped(L, w.d_ptr_, w.d_start_, w.d_count_, w.d_dst_, w.d_tok_,
                                                w.groups_, (int64_t) w.dst_.size(), w.d_q8_, w.d_scratch_,
-                                               zero_copy_ && !reduce ? w.z_out_ : w.d_out_, s);
+                                               zero_copy_ && !reduce && !sum ? w.z_out_ : w.d_out_, s);
     } else {
         strata::kernels::quantize_q8_0_scaled(zero_copy_ ? w.z_x_ : w.d_x_, w.d_q8_, w.d_scales_, n_tok * n_embd_, s);
         strata::kernels::moe_grouped_s2(w.d_ptr_, w.d_start_, w.d_count_, w.d_dst_, w.d_tok_,
                                         w.groups_, (int64_t) w.dst_.size(), w.d_q8_, w.d_scales_, w.d_scratch_,
-                                        zero_copy_ && !reduce ? w.z_out_ : w.d_out_, s);
+                                        zero_copy_ && !reduce && !sum ? w.z_out_ : w.d_out_, s);
     }
-    const uint64_t compact_bytes = (uint64_t) (reduce ? n_tok : w.dst_.size()) * n_embd_ * sizeof(float);
+    const uint64_t compact_bytes = (uint64_t) ((reduce || sum) ? n_tok : w.dst_.size()) * n_embd_ * sizeof(float);
     if (reduce) {
         if (!remote_opt_->reduce(*this, (RemoteMeta*) w.d_meta_ + 1, err)) return -2;
+    } else if (sum) {
+        // Mapped: write T sum rows into z_out_/h_out_. Non-mapped: reduce into d_sum_ then D2H.
+        float* d_sum = zero_copy_ ? w.z_out_ : w.d_sum_;
+        if (!helper_sum_reduce(s, w.d_out_, (RemoteMeta*) w.d_meta_ + 1, d_sum, w.h_out_,
+                               n_embd_, k, cap_, (int) n_tok, zero_copy_, err)) return -2;
     } else if (!zero_copy_ && !check(cudaMemcpyAsync(w.h_out_, w.d_out_, (size_t) compact_bytes, cudaMemcpyDeviceToHost, s),
                "copy results", err, device_)) return -2;
-    // rings>1: record completion after the last kernel (+ optional D2H). rings==1: no events (byte-identical).
-    if (rings_ > 1) {
-        if (!check(cudaEventRecord(w.ev_done_, s), "ring event record", err, device_)) return -2;
+    // STRATA_REMOTE_FLAG_WAIT=1: publish the completion into the mapped host word.  It is enqueued AFTER this
+    // launch's last kernel and D2H and BEFORE the ring's event, so the word and the event mean the same thing -
+    // "every row this launch produced is in host memory" - and no consumer of either can be released early.
+    // Two different protections are at work here.  The HOST ZERO below is not what stops drain() reading an old
+    // value: flag_seq_ does that, because drain() waits for the NEW value and no earlier launch ever published it.
+    // The zero closes the opposite race - a drain that samples the word in the microseconds between the host's
+    // bump and the device store would otherwise find the PREVIOUS launch's value and return early.  (The store is
+    // volatile like drain's read, or the compiler may drop it.)
+    w.flag_ok_ = false;
+    if (w.d_flag_ != nullptr) {
+        *(volatile unsigned int*) w.h_flag_ = 0;
+        std::atomic_thread_fence(std::memory_order_release);
+        ++w.flag_seq_;
+        w.flag_ok_ = helper_flag_store(s, w.d_flag_, w.flag_seq_, err);
+        if (!w.flag_ok_) err.clear();   // the stream waits still cover the slot: this is not a failure
     }
+    // rings>1: record completion after everything above. rings==1: no events (byte-identical).
+    if (rings_ > 1)
+        if (!check(cudaEventRecord(w.ev_done_, s), "ring event record", err, device_)) return -2;
     w.busy_ = true;
     ++launched_layers_;
     returned_bytes_ += compact_bytes;
@@ -608,9 +702,25 @@ bool RemoteExperts::drain(int slot, std::string& err) {
     }
     {
     const auto w0 = std::chrono::steady_clock::now();
+    // STRATA_REMOTE_FLAG_WAIT=1: poll the mapped host word the helper's stream publishes, so the primary never
+    // touches the cross-device completion event (rings>1) or the helper's stream (rings==1, the SUM stack's shape)
+    // in the common case.  The spin is BOUNDED: if the word is late or lost the code falls through to the wait it
+    // has always done - the worst case is the old cost, never a hang.
+    bool flag_done = false;
+    if (w.d_flag_ != nullptr && w.flag_ok_) {
+        const unsigned int want = w.flag_seq_;
+        const volatile unsigned int* f = w.h_flag_;
+        // A tight spin on purpose: this wait is on the decode's critical path, and yielding would cost more than it
+        // saves.  The bound only exists so a lost word falls through to the ordinary wait instead of hanging.
+        for (unsigned long spins = 0; *f != want; ++spins) {
+            if (spins > 5000000UL) break;
+        }
+        flag_done = *f == want;
+        w.flag_ok_ = false;   // this word is consumed: a later drain of this slot takes the ordinary wait
+    }
     if (rings_ > 1) {
-        if (!check(cudaEventSynchronize(w.ev_done_), "drain", err, device_)) return false;
-    } else {
+        if (!flag_done && !check(cudaEventSynchronize(w.ev_done_), "drain", err, device_)) return false;
+    } else if (!flag_done) {
         // Spin on the stream like PeerExperts::finish instead of the blocking sync: the layer waits for this helper
         // on the CPU pool's critical path, and a blocking sync's wake-up costs more than the helper's small batch
         // takes - on HIP especially, where the CUDA branch's cudaInitDevice(ScheduleSpin) does not exist and the
@@ -689,6 +799,11 @@ void RemoteExperts::drain_rows(float* out) {
     Win& w = win_[0];
     if (w.group_id_.empty()) return;
     if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return; }
+    // HELPER_SUM: h_out_ already holds T contiguous weighted sum rows.
+    if (w.sum_) {
+        std::memcpy(out, w.h_out_, (size_t) w.sum_toks_ * n_embd_ * sizeof(float));
+        return;
+    }
     for (size_t i = 0; i < w.original_row_.size(); ++i)
         std::memcpy(out + (size_t) w.original_row_[i] * n_embd_, w.h_out_ + i * n_embd_, (size_t) n_embd_ * sizeof(float));
 }
