@@ -263,8 +263,9 @@ __global__ void __launch_bounds__(1024) k_moe_out_small(float* x, const float* p
     }
 }
 
-/// k_group / k_group_hy for n_ent <= 64 entries: one block of 64 threads ranks each entry by (expert id, entry) in
-/// parallel instead of one thread walking all the experts; the same group / entry arrays.  HY: only the entries whose
+/// k_group / k_group_hy for n_ent <= 80 entries: one block of 80 threads ranks each entry by (expert id, entry) in
+/// parallel instead of one thread walking all the experts; the same group / entry arrays.  80 = kVerifyMax * top_k
+/// (10 * 8), so a verify / batch-rows window of up to ten rows stays on this path.  HY: only the entries whose
 /// expert has a VRAM slot (slot_of >= 0), the group's blob at blobs + slot * blob.  SKIP (--expert-cache-device1..3,
 /// not null): the entries the helper tier already computed into `eparts`, one = the helper took it.  The grouping
 /// then is the one it would have been had those entries never been in `ids`, so the two paths cover one window
@@ -273,7 +274,7 @@ template <bool HY, bool SKIP>
 __global__ void k_group_small(const int32_t* ids, int n_ent, int K_, const int32_t* slot_of, const uint8_t* skip,
                               const uint8_t* blobs, unsigned long long blob, unsigned long long* grp_ptr, int32_t* grp_start,
                               int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok) {
-    __shared__ int sid[64];
+    __shared__ int sid[80];
     const int e = threadIdx.x;
     const int id = e < n_ent ? ids[e] : 0;
     const bool valid = e < n_ent && (!HY || slot_of[id] >= 0) && (!SKIP || !skip[e]);
@@ -307,17 +308,25 @@ __global__ void k_group_small(const int32_t* ids, int n_ent, int K_, const int32
     }
 }
 
-/// route_topk<256, 8> (native_router.cu, copied: the same expressions) for n_tok <= 8 tokens (one warp each) and, in the same
-/// launch, k_group_small's grouping of the picks.  block (32, 8).  HY as k_group_small.  SKIP (--expert-cache-device1..3):
+/// route_topk<256, 8> (native_router.cu, copied: the same expressions) for up to MAXTOK tokens (one warp each) and, in the same
+/// launch, k_group_small's grouping of the picks.  block (32, warps).  HY as k_group_small.  SKIP (--expert-cache-device1..3):
 /// the entries the helper tier already computed, left out of the grouping exactly as k_group_small leaves them out.
-template <bool HY, bool SKIP>
-__global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ logits, int32_t* __restrict__ ids,
+///
+/// MAXTOK is the block's warps: one per token, so the block holds MAXTOK tokens.  8 is the shape the decode has
+/// always used (the launch bounds and the shared arrays are exactly what they were, so the eight-row window's
+/// numbers and its speed do not move); 16 is the wide shape a verify window of more than eight rows needs
+/// (STRATA_Q36_VERIFY_ROWS), whose rows must come out of the same top-k and the same grouping as a one-row decode
+/// step's.  The shared arrays hold MAXTOK * K ids (the picks of every row) and MAXTOK * K group ids (the entries).
+/// After top-k, grouping enumerates packed entries as e = tk*32 + lane (flat across the block); only e < n_tok*K
+/// participate, so the launch needs warps*32 >= n_tok*K (T=10: 80 entries fit in 3 of the 10 warps).
+template <bool HY, bool SKIP, int MAXTOK>
+__global__ void __launch_bounds__(32 * MAXTOK) k_route_group(const float* __restrict__ logits, int32_t* __restrict__ ids,
                                                      float* __restrict__ weights, int n_tok, int ld, const int32_t* slot_of,
                                                      const uint8_t* skip, const uint8_t* blobs, unsigned long long blob,
                                                      unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
                                                      int32_t* ent_dst, int32_t* ent_tok) {
     constexpr int NE = 256, K = 8, V = NE / 32;
-    __shared__ int sids[64], sid[64];
+    __shared__ int sids[MAXTOK * K], sid[MAXTOK * K];
     const int tk = threadIdx.y;
     const int lane = threadIdx.x;
     if (tk < n_tok) {
@@ -369,7 +378,7 @@ __global__ void __launch_bounds__(256) k_route_group(const float* __restrict__ l
     }
     __syncthreads();
     const int n_ent = n_tok * K;
-    const int e = tk * 32 + lane;   // 0 .. 255: the entries are the first n_ent threads
+    const int e = tk * 32 + lane;   // 0 .. 32 * MAXTOK - 1: the entries are the first n_ent threads
     const int id = e < n_ent ? sids[e] : 0;
     const bool valid = e < n_ent && (!HY || slot_of[id] >= 0) && (!SKIP || !skip[e]);
     int rank = 0;

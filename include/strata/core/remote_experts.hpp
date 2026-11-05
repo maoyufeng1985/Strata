@@ -31,9 +31,11 @@ public:
     /// tens of GiB of portable mapped memory with CUDA.
     static bool preflight(int device, double& free_gib, std::string& err);
     /// `n_embd` / `n_ff` are the model's expert widths (2560 / 640 for Flash-Next, 2048 / 512 for Qwen3.6) and `k`
-    /// the experts routed per token (10 vs 8).  The window (MAXT * k), the staging rows and the scratch follow
+    /// the experts routed per token (10 vs 8).  The window (max_rows * k), the staging rows and the scratch follow
     /// them.  The defaults are Flash-Next's numbers, so a call that omits them allocates and rejects exactly as
     /// before.
+    /// `max_rows` is the window's row budget: 0 (the default) keeps the CPU pool's MAXT, which is what every
+    /// caller but q36's verify window wants.  It cannot exceed kMaxCap / k (the metadata's entry count).
     bool open(int device, int slots, int64_t layers, int64_t experts,
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
@@ -41,7 +43,8 @@ public:
               int64_t n_embd = strata::core::kCompiledGeometry.n_embd,
               int64_t n_ff = strata::core::kCompiledGeometry.n_ff,
               int64_t k = strata::core::kCompiledGeometry.n_expert_used,
-              const std::vector<strata::kernels::NativeExpertLayout>* layer_layouts = nullptr);
+              const std::vector<strata::kernels::NativeExpertLayout>* layer_layouts = nullptr,
+              int max_rows = 0);
     void close();
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
@@ -192,7 +195,8 @@ private:
     int64_t n_embd_ = strata::core::kCompiledGeometry.n_embd;   ///< the model's row width, set by open()
     int64_t n_ff_ = strata::core::kCompiledGeometry.n_ff;      ///< the model's expert intermediate width, for the scratch sizing
     int64_t k_ = 10;          ///< the experts routed per token; begin() checks a window against it
-    int64_t cap_ = 80;        ///< the window's entry count, MAXT * k_ (Flash-Next: 8 * 10)
+    int64_t cap_ = 80;        ///< the window's entry count, max_rows_ * k_ (Flash-Next: 8 * 10)
+    int max_rows_ = 0;        ///< the window's row budget (0 = the CPU pool's MAXT); set by open()
     std::vector<strata::kernels::NativeExpertLayout> layer_layouts_;   ///< per-layer native layout override; empty = use the global expert_layout() table
     bool step_known_ = false;   ///< layer_layouts_ gives a step for EVERY layer (see open: known = verbatim, else 256)
     int64_t computed_ = 0;

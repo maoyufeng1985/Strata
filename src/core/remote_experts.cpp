@@ -9,6 +9,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <optional>
 #include <cstdio>
@@ -17,10 +18,47 @@
 
 namespace strata::core {
 namespace {
-// The window's entry count.  It follows the model's routing width k (Flash-Next's 10, Qwen3.6's 8);
-// allocate the arrays for the widest k the engine admits - MAXT * 10 = 80 entries - so both fit.
+// The window's entry count.  It follows the model's routing width k (Flash-Next's 10, Qwen3.6's 8); allocate the
+// arrays for the widest k the engine admits - MAXT * 10 = 80 entries - so both fit.  The window's row budget
+// cannot exceed this: a helper takes the WHOLE window or the entries it does not take fall to the CPU pool,
+// which is far slower, so a caller that wants more rows needs a bigger kMaxCap, not a bigger window.
 constexpr int64_t kMaxCap = strata::kernels::cpu::MAXT * 10;
 constexpr int kMaxRings = 3;
+
+// STRATA_Q36_GROUP_STATS=1: how many DISTINCT experts a helper window names.  The grouped launch costs one block
+// row, and one expert's weights (~1.8 MiB of gate/up plus down for this model), per distinct id - so this count,
+// not the row count, is what the helpers' per-layer cost scales with.  It is the number that decides whether
+// capping the verify window's expert set (upstream P3545) could pay.  A histogram, printed once at exit; unset,
+// not one counter is touched and the timed path is unchanged.
+bool group_stats_on() {
+    static const bool v = [] {
+        const char* s = std::getenv("STRATA_Q36_GROUP_STATS");
+        return s != nullptr && s[0] == '1' && s[1] == '\0';
+    }();
+    return v;
+}
+struct GroupStats {
+    std::atomic<long long> calls{0};
+    std::atomic<long long> sum{0};
+    std::atomic<long long> hist[9];   // 0..7 distinct experts, 8 = 8 or more
+    GroupStats() { for (auto& h : hist) h.store(0); }
+};
+GroupStats& group_stats() { static GroupStats g; return g; }
+void group_stats_note(long long groups) {
+    GroupStats& g = group_stats();
+    if (g.calls.fetch_add(1) == 0)
+        std::atexit([] {
+            const GroupStats& s = group_stats();
+            const long long n = s.calls.load();
+            if (n <= 0) return;
+            std::fprintf(stderr, "strata-q36 GROUP_STATS: %lld windows, mean %.2f distinct experts | hist",
+                         n, (double) s.sum.load() / (double) n);
+            for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %d:%lld", i, s.hist[i].load());
+            std::fprintf(stderr, " 8+:%lld\n", s.hist[8].load());
+        });
+    g.sum.fetch_add(groups);
+    g.hist[groups > 8 ? 8 : groups].fetch_add(1);
+}
 
 // Small enough to copy as one pinned buffer per layer, whatever the model's shape. The kernels read
 // the individual arrays through pointers into the same device allocation.
@@ -126,7 +164,7 @@ bool RemoteExperts::alloc_win(Win& w, size_t meta_bytes, size_t scratch, std::st
     if (!allocated) return false;
     // STRATA_Q36_HELPER_SUM: device sum buffer when the result is not mapped into h_out_.
     if (helper_sum_ &&
-        !check(cudaMalloc((void**) &w.d_sum_, (size_t) strata::kernels::cpu::MAXT * n_embd_ * sizeof(float)),
+        !check(cudaMalloc((void**) &w.d_sum_, (size_t) max_rows_ * n_embd_ * sizeof(float)),
                "helper sum", err, device_))
         return false;
     if (rings_ > 1) {
@@ -228,16 +266,18 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          const ExpertCache& primary, ExpertSource& source,
                          std::vector<uint8_t>& claimed, std::string& err, bool auto_size,
                          int64_t n_embd, int64_t n_ff, int64_t k,
-                         const std::vector<strata::kernels::NativeExpertLayout>* layer_layouts) {
+                         const std::vector<strata::kernels::NativeExpertLayout>* layer_layouts,
+                         int max_rows) {
     close();
-    if (n_embd <= 0 || n_ff <= 0 || k <= 0 || k > 10 || strata::kernels::cpu::MAXT * k > kMaxCap) {
+    max_rows_ = max_rows > 0 ? max_rows : (int) strata::kernels::cpu::MAXT;
+    if (n_embd <= 0 || n_ff <= 0 || k <= 0 || k > 10 || (int64_t) max_rows_ * k > kMaxCap) {
         err = "experts: the model's row width, expert width and routing width are out of range";
         return false;
     }
     n_embd_ = n_embd;
     n_ff_ = n_ff;
     k_ = k;
-    cap_ = strata::kernels::cpu::MAXT * k_;
+    cap_ = (int64_t) max_rows_ * k_;
     layer_layouts_.clear();
     if (layer_layouts) layer_layouts_ = *layer_layouts;
     rings_ = parse_helper_ring();
@@ -494,7 +534,7 @@ int RemoteExperts::begin_slot(int slot, int64_t layer, const float* x, const int
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
     const int64_t n = n_tok * k;
     if (slot < 0 || slot >= rings_ || (size_t) slot >= win_.size() || n <= 0 || n > cap_ ||
-        n_tok > strata::kernels::cpu::MAXT || k != k_ || layer < 0 ||
+        n_tok > (int64_t) max_rows_ || k != k_ || layer < 0 ||
         (size_t) layer >= layers_present_.size() || device_ < 0) {
         err = "CUDA" + std::to_string(device_) + " experts: invalid layer, routing width or window size";
         return -2;
@@ -569,6 +609,7 @@ int RemoteExperts::begin_slot(int slot, int64_t layer, const float* x, const int
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return -2; }
     w.groups_ = (int32_t) w.group_id_.size();
+    if (group_stats_on()) group_stats_note(w.groups_);
     const cudaStream_t s = stream_;
     const size_t meta_extra = reduce ? remote_opt_->metadata_bytes()
                                      : (sum ? sum_meta_bytes() : 0);
@@ -682,10 +723,14 @@ bool RemoteExperts::drain(int slot, std::string& err) {
     // steady_clock reads.  ms_wait_ times the blocking call alone and cannot see this, so the two together say
     // how much of a drain is driver overhead and how much is really GPU wait.  The gate is exactly "1", the same
     // test Engine::helper_timing() applies (this file cannot call it: it is private and in another
-    // translation unit), so the two counters arm together.  A flag-off run keeps a nullopt and pays no clock read
-    // beyond the one ms_wait_ already took.
-    const char* ht = std::getenv("STRATA_Q36_HELPER_TIMING");
-    const bool hton = ht && ht[0] == '1' && ht[1] == '\0';
+    // translation unit), so the two counters arm together.  One static getenv: under MARSHAL three finish
+    // threads hit drain on the same layer, and a per-call getenv was racey enough to intermittently serialise
+    // the harvest (HELPER_TIMING=1 GPU_TIMING=0: 109.6 then 60.4 in one script, 2026-11-04).  A flag-off run
+    // keeps a nullopt and pays no clock read beyond the one ms_wait_ already took.
+    static const bool hton = [] {
+        const char* ht = std::getenv("STRATA_Q36_HELPER_TIMING");
+        return ht && ht[0] == '1' && ht[1] == '\0';
+    }();
     std::optional<std::chrono::steady_clock::time_point> oh0;
     if (hton) oh0 = std::chrono::steady_clock::now();
     // The overhead window closes BEFORE the blocking sync (so it times host cost only) and its destructor -

@@ -63,6 +63,7 @@
 #include <cctype>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -392,6 +393,18 @@ __global__ void k_add(float* x, const float* y, int64_t n) {
 __global__ void k_swiglu(const float* g, const float* u, float* h, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) h[i] = silu(g[i]) * u[i];
+}
+/// STRATA_Q36_WARM_GPU: a busy kernel with no purpose but to make the card work.  It reads and writes a scratch
+/// buffer - enough traffic to lift the SM clock and the memory clock - and its result is thrown away.  The write
+/// keeps the reads from being optimized away, and the last line keeps the writes from being optimized away.
+__global__ void k_warm_gpu(float* buf, int n) {
+    float v = (float) threadIdx.x;
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        v = fmaf(v, 1.0000001f, buf[i]);
+        buf[i] = v;
+    }
+    if (v == 1.0e30f) buf[0] = v;
 }
 /// y[t][o] = W[o] . x[t] for f32 W [n_out][n_in], n_in a multiple of 128: one warp per row, float4 loads, 8 rows per
 /// block (grid (ceil(n_out / 8), T)).
@@ -2226,8 +2239,15 @@ struct Engine {
     std::vector<int8_t*> kc8, vc8;
     std::vector<__half*> ks8, vs8;
     bool kv_k8 = false, kv_v8 = false;
-    // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
+    // verify windows (T <= vrows): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
+    /// The row buffers' hard ceiling.  kVerify is the DEFAULT width; the runtime vrows (STRATA_Q36_VERIFY_ROWS) may
+    /// raise it to kVerifyMax, so the arrays that cannot be sized at run time are sized by kVerifyMax and the
+    /// allocations by vrows - with the default vrows == kVerify, the default path allocates exactly as before.
+    /// 10 rows is the ceiling the metadata allows: a window of T rows carries T * top_k entries, and the remote
+    /// metadata's capacity is cpu::MAXT * 10 = 80 entries, which 10 rows x top-8 exactly fills.
+    static constexpr int kVerifyMax = 10;
+    int vrows = kVerify;   // the verify window's row budget (STRATA_Q36_VERIFY_ROWS)
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
@@ -2298,7 +2318,7 @@ struct Engine {
     // graphs: [0] the decode step, [T] a verify window of T rows, gm1[d] the MTP draft step of chain depth d
     // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
     struct GSet {
-        cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1[kChainMax] = {};
+        cudaGraphExec_t g1 = nullptr, gv[kVerifyMax + 1] = {}, gm1[kChainMax] = {};
     };
     std::vector<GSet> gsets;
     GSet& gs() { return gsets[(size_t) cur]; }
@@ -2386,12 +2406,41 @@ struct Engine {
         }();
         return v;
     }
-    std::vector<std::vector<cudaGraphExec_t>> mixer_ge;   // [session][layer]
-    std::vector<std::vector<uint8_t>> mixer_ge_gr;        // [session][layer]: the captured grouped_by_route
-    std::vector<std::vector<uint8_t>> mixer_ge_ext;       // [session][layer]: the captured ext
-    std::vector<std::vector<uint8_t>> mixer_ge_xq;        // [session][layer]: the xq_ready the capture saw
+    std::vector<std::vector<cudaGraphExec_t>> mixer_ge;   // [session][layer * kMgStride + T]
+    std::vector<std::vector<uint8_t>> mixer_ge_gr;        // [session][layer * kMgStride + T]: the captured grouped_by_route
+    std::vector<std::vector<uint8_t>> mixer_ge_ext;       // [session][layer * kMgStride + T]: the captured ext
+    std::vector<std::vector<uint8_t>> mixer_ge_xq;        // [session][layer * kMgStride + T]: the xq_ready the capture saw
     std::vector<int> mixer_ge_step;                       // [session]: the decode steps done in it
+    std::vector<std::vector<int>> mixer_ge_vstep;         // [session][T]: the verify windows of that width done in it
     std::vector<int> mixer_ge_nc;                         // [session]: the chunk count the graphs were captured with
+    /// The graph slots are indexed by (layer, window width T): the mixer's grids depend on T, so a graph captured
+    /// for T=1 says nothing about a window of T=5.  kMgStride is wider than kVerify (8), so every window width the
+    /// engine can run has a slot of its own.
+    static constexpr int kMgStride = 16;
+    size_t mg_idx(size_t li, int T) const { return li * (size_t) kMgStride + (size_t) T; }
+    /// STRATA_Q36_MIXER_GRAPH_V=1 (opt-in): the mixer's kernels of a VERIFY WINDOW (T > 1) also come from a
+    /// per-layer CUDA graph, the way STRATA_Q36_MIXER_GRAPH does for the single-token decode.
+    ///
+    /// WHY IT EXISTS: the DFlash2 decode's forward is a verify window of T = D + 1 rows (five with the shipped
+    /// --draft-cap 4), and the single-token gate (T == 1 && !verify) never fires there.  So the window that
+    /// carries the whole decode launches the mixer's kernels one by one, exactly the way the single-token decode
+    /// did before its graph existed - and the decode's host is the critical path.  Same capture, same rules, same
+    /// chunk-count refresh; one graph set per window width, because the mixer's grids depend on T.
+    static bool mixer_graph_v_flag() {
+        static const bool v = [] {
+            const char* e = std::getenv("STRATA_Q36_MIXER_GRAPH_V");
+            return e && e[0] == '1' && e[1] == '\0';
+        }();
+        return v;
+    }
+    /// The flags the mixer's graphs are on, named in the teardown line: the single-token set, the verify-window set,
+    /// or both.  The line itself keeps the STRATA_Q36_MIXER_GRAPH: prefix, so a reader (or a script) can find it.
+    static std::string mixer_graph_flags() {
+        std::string s;
+        if (mixer_graph_flag()) s += "STRATA_Q36_MIXER_GRAPH=1 ";
+        if (mixer_graph_v_flag()) s += "STRATA_Q36_MIXER_GRAPH_V=1 ";
+        return s;
+    }
     /// The capture happens on the SECOND decode step of a session, not the first.  The reason is the lazy
     /// allocations: the decode path's first step is the first use of its kernels (the MMQ's workspace, the
     /// MMVQ's buffers), and a cudaMalloc inside a capture is an error - so the capture would fail on the first
@@ -2433,7 +2482,8 @@ struct Engine {
     /// A failure is NOT fatal: the flag is opt-in, so a capture that the driver refuses falls back to the eager
     /// path (and says so once) instead of killing the run.
     bool mixer_graph_ok = true;
-    bool capture_mixer_graph(size_t li, int64_t p0, const int32_t* dpos, bool hy_rows, bool* gr_out, bool* ext_out) {
+    bool capture_mixer_graph(size_t li, int64_t p0, const int32_t* dpos, bool hy_rows, int T, bool verify,
+                              size_t gi, bool* gr_out, bool* ext_out) {
         cudaGraph_t g = nullptr;
         const bool xq_save = xq_ready;
         // The GPU timing probe's readings must not happen inside a capture (the records are legal, the readings are
@@ -2449,7 +2499,7 @@ struct Engine {
             gpu_timing_hold = hold_save;
             return false;
         }
-        const bool ext = mixer(m->layers[li], li, 1, p0, dpos, false, false, hy_rows, false);
+        const bool ext = mixer(m->layers[li], li, T, p0, dpos, false, verify, hy_rows, false);
         e = cudaStreamEndCapture(st, &g);
         gpu_timing_hold = hold_save;
         if (e != cudaSuccess || !g) {
@@ -2471,11 +2521,11 @@ struct Engine {
             xq_ready = xq_save;
             return false;
         }
-        mixer_ge[(size_t) cur][li] = ge;
+        mixer_ge[(size_t) cur][gi] = ge;
         *gr_out = grouped_by_route;
         *ext_out = ext;
         // bit 0: the xq_ready the capture saw (prep_in's branch), bit 1: the xq_post the capture left.
-        mixer_ge_xq[(size_t) cur][li] = (uint8_t) ((xq_save ? 1 : 0) | (xq_post ? 2 : 0));
+        mixer_ge_xq[(size_t) cur][gi] = (uint8_t) ((xq_save ? 1 : 0) | (xq_post ? 2 : 0));
         xq_ready = xq_save;
         ++mixer_ge_captured;
         return true;
@@ -2595,12 +2645,23 @@ struct Engine {
     // codes and its FP16 scales, so a batch window reads the right session's store
     int8_t **d_kc8_tab = nullptr, **d_vc8_tab = nullptr;
     __half **d_ks8_tab = nullptr, **d_vs8_tab = nullptr;
-    int32_t *d_rcell = nullptr, *d_rslot = nullptr, *d_rdelta = nullptr;   // [kVerify] the rows' cell / session / rotary offset
+    int32_t *d_rcell = nullptr, *d_rslot = nullptr, *d_rdelta = nullptr;   // [vrows] the rows' cell / session / rotary offset
     // the GDN layers run a slot's rows in sequence: per group (a slot) its session, its first row and its row count
     int32_t *d_gslot = nullptr, *d_grow0 = nullptr, *d_gcnt = nullptr;
     int rows_G = 0;                                                        // groups of the rows being run
     int32_t* hrow = nullptr;                                                // pinned staging for the rows
+    // The pinned staging's layout: five row arrays (tokens, cells, slots, deltas, picks) and three group arrays
+    // (slot, first row, row count), each kVerifyMax wide.  The stride must cover the widest window: with the old
+    // stride of 8 a window of more than 8 rows put the cells on top of the tokens.
+    enum : int {
+        kRowTok = 0, kRowCell = kVerifyMax, kRowSlot = 2 * kVerifyMax, kRowDelta = 3 * kVerifyMax,
+        kRowPick = 4 * kVerifyMax, kGrpSlot = 5 * kVerifyMax, kGrpRow0 = 6 * kVerifyMax, kGrpCnt = 7 * kVerifyMax,
+    };
     bool rows_mode = false;                                                 // layer(): the rows are sessions' (not consecutive cells)
+    /// Set for the duration of forward(..., verify=true): a verify window (MTP, DFlash2) whatever its width.  chunk()
+    /// reads it so a window of more than kGemmT rows still takes the decode arithmetic - without it the window would
+    /// silently take the prompt chunk's GEMMs and its rows would no longer match a one-row decode step.
+    bool verify_win = false;
     bool bmtp = false;                                                      // --batch-mtp: batch windows verify MTP proposals
     // --suffix-draft N (opt-in): the suffix drafter and its per-round policy.  Null unless the flag is set, and the
     // spec_step call site checks the pointer before touching it, so an unset flag adds nothing to the default path.
@@ -2688,7 +2749,7 @@ struct Engine {
         // step, and the verify window.  The drafter's ring (2048 rows) is the hard cap on what it remembers, and the
         // tap staging is sized to at least that; a request whose prompt is longer just drops the oldest rows from
         // the drafter's view, which is the same behaviour the ring itself imposes on the context.
-        const int want = std::max({2048, tmax > 0 ? tmax : 0, kVerify});
+        const int want = std::max({2048, tmax > 0 ? tmax : 0, kVerifyMax});
         if (!df2_ensure_taps(want, err)) return false;
         if (!df2.prepare(tap_dev_, err)) return false;
         return true;
@@ -2720,6 +2781,65 @@ struct Engine {
         tap_rows_ = 0;
         tap_row0_ = 0;
     }
+#if defined(STRATA_HAVE_DFLASH2)
+    /// STRATA_Q36_SERVE_DF2: one draft context per served session, so several sessions can verify their own drafts
+    /// in ONE window.  The parent `df2` keeps slot 0 - its graphs are captured on tap_dev_ and slot 0's rows start
+    /// at the window base, which IS tap_dev_ - and every other slot gets a clone with a fixed kRows-row region of
+    /// its own, because draft() runs captured graphs whose taps pointer is baked in at prepare()
+    /// (src/core/dflash2.cpp:727).  context() uses no graphs (dflash2.cpp:1011), so prompt rows can be fed from a
+    /// slice without a copy; the decode path needs no context() call at all, since draft() advances the ring itself
+    /// for the committed rows.
+    std::vector<std::unique_ptr<strata::core::Dflash2Drafter>> df2_slot;
+    std::vector<float*> df2_slot_taps;
+    bool df2_serve = false;   // serve mode with --draft dflash2: Serve::window_df2 owns the decode
+    int df2_slot_cap = 0;     // drafts offered per session a round
+    cudaEvent_t df2_tap_ev_ = nullptr;   // orders a window's tap writes after the drafter's queued context() rows
+
+    bool df2_bind_slots(int n, std::string& err) {
+        if (!use_df2 || n <= 1) return true;
+        const int nt = (int) df2.tap_layers().size();
+        const int N = (int) m->g.n_embd;
+        if (nt <= 0 || N <= 0) { err = "dflash2 serve: the pack has no tap layers"; return false; }
+        const size_t per = (size_t) vrows * (size_t) nt * (size_t) N;   // floats, one slot's fixed region
+        df2_slot_cap = std::max(1, std::min(df2_d, vrows / std::max(1, n) - 1));
+        if (df2_slot_cap <= 0) { err = "dflash2 serve: no room for a draft in a window of " + std::to_string(vrows) +
+                                       " rows over " + std::to_string(n) + " sessions"; return false; }
+        // the tap buffer already holds >= 2048 rows (df2_bind), so the per-slot regions fit inside it
+        if (tap_cap_ < vrows * (int) n) { err = "dflash2 serve: tap staging too small"; return false; }
+        // slot 0 is the parent: its own draft depth has to come down to the serve cap too, or it pays for kDrafts
+        // rows of head/top-k/selector work every round and the window uses only df2_slot_cap of them
+        if (df2_slot_cap != df2_d) {
+            df2.set_max_drafts(df2_slot_cap);
+            if (!df2.prepare(tap_dev_, err)) return false;
+        }
+        df2_slot_taps.assign((size_t) n, nullptr);
+        df2_slot_taps[0] = tap_dev_;
+        for (int s = 1; s < n; ++s) {
+            df2_slot_taps[(size_t) s] = tap_dev_ + (size_t) s * per;
+            auto d = std::unique_ptr<strata::core::Dflash2Drafter>(new strata::core::Dflash2Drafter());
+            if (!d->clone_alloc(df2, err)) return false;
+            if (!d->clone_bind(df2, err)) return false;
+            d->set_max_drafts(df2_slot_cap);
+            if (!d->prepare(df2_slot_taps[(size_t) s], err)) return false;
+            df2_slot.push_back(std::move(d));
+        }
+        df2_serve = true;
+        std::fprintf(stderr, "strata-q36: DFlash2 serve: %d draft context(s), %d draft(s) a round each\n", n, df2_slot_cap);
+        return true;
+    }
+    strata::core::Dflash2Drafter& df2_of(int slot) {
+        if (slot <= 0 || df2_slot.empty()) return df2;
+        return *df2_slot[(size_t) std::min<size_t>((size_t) slot - 1, df2_slot.size() - 1)];
+    }
+    /// A new conversation in `slot`: its drafter's ring holds committed rows of whatever ran there before, so it
+    /// starts empty.  Slot 0 is the parent, which also resets the shared request state.
+    void df2_clear_slot(int slot) {
+        if (!use_df2) return;
+        if (slot <= 0) { df2_clear_request(); return; }
+        if (df2_slot.empty()) return;
+        df2_of(slot).reset();
+    }
+#endif
     int df2_trim(int n) const {
         if (n <= 0) return 0;
         n = std::min(n, df2_d > 0 ? df2_d : strata::core::Dflash2Drafter::kDrafts);
@@ -2759,6 +2879,13 @@ struct Engine {
 #endif
     };
     std::vector<Hy> hy;
+    // STRATA_Q36_PRIMARY_RES: the primary's residency in the shape RemoteExperts::begin_slot reads it -
+    // [layer * n_expert + expert], >= 0 meaning "the primary holds a slot for this expert, the helper yields
+    // that entry".  One row per layer plus one for the MTP block's layer, which only carries slots under
+    // STRATA_Q36_MTP_HELPER=1 (otherwise that layer never reaches a helper).  The row a window is about to
+    // use is rewritten just before the begins, so a rebalance() that moves the primary's slots cannot leave a
+    // stale answer here - the reason this is not built once at open.
+    std::vector<int32_t> primary_res_;
     int hybrid_t = 32;
     // STRATA_Q36_PREFILL_SPLIT=2: the width of the chunk the split cut in half, so f32mm's split-K depth can be
     // chosen as the whole chunk would have chosen it (see f32mm).  Zero on every path that does not split.
@@ -2957,6 +3084,25 @@ struct Engine {
         }();
         return on;
     }
+    /// STRATA_Q36_PRIMARY_RES=1 (opt-in): the helpers keep EVERY expert - their caches, their ownership and
+    /// STRATA_Q36_PEER_KEEP_RESIDENT's default shape are untouched - but they yield the entries whose expert the
+    /// primary holds a VRAM slot for, so the primary's grouped MMQ computes those while the helpers compute the
+    /// rest.  The way out of the trap that the keep-resident filter falls into: that filter drops the primary's
+    /// experts from the helper's list at OPEN time, and rebalance() then moves the slots to hotter experts, so an
+    /// expert dropped at open but not re-chosen afterwards has no holder at all and falls to the CPU pool.
+    /// MEASURED 2026-11-04 with the filter (2.5 / 3.4 GiB of slots): 3.5 / 6.6% of the entries reached the pool
+    /// for 286 / 531 ms of the run, and the decode read 96.7 / 84.5 tok/s against 113.2.  With this flag every
+    /// entry has a holder whatever rebalance() does.
+    /// Decode windows only (T <= vrows): a prompt chunk keeps the whole layer on the helpers, where the primary is
+    /// busy with its own MMQ rather than idle behind a round trip.  Unset: begin's primary_res stays null and the
+    /// mask is the ownership rule alone, byte-identical to the path before it.
+    static bool primary_res_flag() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_PRIMARY_RES");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
     /// STRATA_Q36_MTP_VRAM=1 (opt-in): the MTP block's own layer keeps ALL of its experts in the PRIMARY's VRAM
     /// (its 256 slots), so that layer is not hybrid: the CPU pool never touches it, and the MTP's mapped chain
     /// (STRATA_Q36_MTP_MAPPED=1) is not refused because the block's layer is hybrid.  Measured 2026-10-25
@@ -3042,7 +3188,7 @@ struct Engine {
     int32_t* h_helper_ids = nullptr;
     float* h_helper_x = nullptr;
     float* h_helper_wts = nullptr;  // STRATA_Q36_HELPER_SUM: routing weights for begin()'s per-helper reduce
-    float* helper_out = nullptr;   // [n_entries][N] sparse rows; HELPER_SUM: [3][MAXT][N] per-helper T-row sums
+    float* helper_out = nullptr;   // [n_entries][N] sparse rows; HELPER_SUM: [3][vrows][N] per-helper T-row sums
     float* helper_stage = nullptr;   // STRATA_Q36_HELPER_ASYNC: [n_entries][N] the deferred upload's staging
     std::vector<uint8_t> helper_mask;
     uint8_t* d_helper_mask = nullptr;   // current layer mask for local grouping / CPU skip
@@ -3084,6 +3230,57 @@ struct Engine {
     // the critical path, because the whole decode step is host-bound on this box (MEASURED 2026-10-25: the host's
     // own work is 282 us per layer, the GPU's timeline 427 us, and the GPU waits).
     double d_h_mixer_ms = 0, d_h_begin_ms = 0, d_h_local_ms = 0, d_h_shared_ms = 0, d_h_cpu_ms = 0, d_h_finish_ms = 0;
+    // STRATA_Q36_SERVE_TIMING=1: the decode windows' own per-layer split.  The counters above are cumulative, so a
+    // window takes the DELTA of its own: the prompts' forward() calls (prefill-shaped, T = the chunk) run between
+    // the windows, and a global baseline would mix them into the decode's numbers.  Off by default: no clock is read
+    // and no counter is touched.
+    static bool serve_timing() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_SERVE_TIMING");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    bool s_taken = false;   // at least one window was measured
+    // the counters at the window's start
+    double w_pre = 0, w_spin = 0, w_hl = 0, w_hm = 0, w_hb = 0, w_hlo = 0, w_hsh = 0, w_hcpu = 0, w_hf = 0, w_hsc = 0;
+    long long w_hln = 0;
+    double w_mhb[3] = {}, w_mhw[3] = {}, w_mho[3] = {};
+    // the sum over the windows
+    double s_pre = 0, s_spin = 0, s_hl = 0, s_hm = 0, s_hb = 0, s_hlo = 0, s_hsh = 0, s_hcpu = 0, s_hf = 0, s_hsc = 0;
+    long long s_hln = 0;
+    double s_hb3[3] = {}, s_hw3[3] = {}, s_ho3[3] = {};
+    void serve_window_snap() {
+        if (!serve_timing()) return;
+        w_pre = d_prebegin_ms; w_spin = d_route_spin_ms; w_hl = d_host_layer_ms; w_hln = d_host_layer_n;
+        w_hm = d_h_mixer_ms; w_hb = d_h_begin_ms; w_hlo = d_h_local_ms; w_hsh = d_h_shared_ms;
+        w_hcpu = d_h_cpu_ms; w_hf = d_h_finish_ms; w_hsc = d_h_sumc_ms;
+        for (int r = 0; r < 3; ++r) {
+            w_mhb[r] = helpers[(size_t) r].ms_begin();
+            w_mhw[r] = helpers[(size_t) r].ms_wait();
+            w_mho[r] = helpers[(size_t) r].ms_sync_overhead();
+        }
+    }
+    void serve_window_acc() {
+        if (!serve_timing()) return;
+        if (d_host_layer_n < w_hln) return;   // the counters were zeroed under the window (discard_pass): skip it
+        s_pre += d_prebegin_ms - w_pre; s_spin += d_route_spin_ms - w_spin;
+        s_hl += d_host_layer_ms - w_hl; s_hln += d_host_layer_n - w_hln;
+        s_hm += d_h_mixer_ms - w_hm; s_hb += d_h_begin_ms - w_hb;
+        s_hlo += d_h_local_ms - w_hlo; s_hsh += d_h_shared_ms - w_hsh;
+        s_hcpu += d_h_cpu_ms - w_hcpu; s_hf += d_h_finish_ms - w_hf; s_hsc += d_h_sumc_ms - w_hsc;
+        for (int r = 0; r < 3; ++r) {
+            s_hb3[r] += helpers[(size_t) r].ms_begin() - w_mhb[r];
+            s_hw3[r] += helpers[(size_t) r].ms_wait() - w_mhw[r];
+            s_ho3[r] += helpers[(size_t) r].ms_sync_overhead() - w_mho[r];
+        }
+        s_taken = true;
+    }
+    // STRATA_Q36_HELPER_TIMING=1 only: the part of the finish window spent in HELPER_SUM's result upload + the two
+    // mask kernels, so `finish - sumc` is the rest of moe_helpers_wait (the drains, their host scatters and the
+    // finish_window bookkeeping) rather than one undivided number.  Accumulated on the HELPER_ASYNC path only; the
+    // sync path's sum combine runs inside helper_finish, outside this timer, so a sync run prints sumc = 0.
+    double d_h_sumc_ms = 0;
     // ---- STRATA_Q36_HELPER_PARALLEL_MARSHAL=1 (opt-in): the helper window's begin() calls, and the finish()
     // calls in moe_helpers_wait, run on their own worker threads, so the three helpers are dispatched at the
     // same time instead of one after the other.
@@ -3127,6 +3324,78 @@ struct Engine {
         static const bool v = [] {
             const char* e = std::getenv("STRATA_Q36_HELPER_PARALLEL_MARSHAL");
             return e && e[0] == '1' && e[1] == '\0';
+        }();
+        return v;
+    }
+    /// STRATA_Q36_NO_HOST_EXPERTS=1: no pinned host copy of the routed experts.  The arena is every layer's
+    /// `[gate|up|down]` blob, ~18.75 GiB here, and on a 31 GiB box it is most of the RAM.  Whittle already runs
+    /// without it (docs/WHITTLE45B.md: `--mmap-experts` reads the GGUF in place).  Three readers must be shown
+    /// elsewhere first: the decode (every entry a helper's), the streamed prompt (the peers' own weights, for
+    /// every expert), and the CPU pool.  The pool is the awkward one - it is not off the path by default, because
+    /// a helper's window is at most vrows rows, so place_experts narrows hybrid_t to vrows and the wider batches
+    /// stream instead.  Open refuses the rest, and the read sites fail loudly rather than using a null arena.
+    static bool no_host_experts() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_NO_HOST_EXPERTS");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    /// Whether that configuration is sound, given the helpers' caches as they actually opened.  Called once, after
+    /// open_helpers() and before any forward: the ownership it needs is built in peer_open(), which place_experts
+    /// (the function that drops the arena) runs before.  Every check here is a case where an expert would reach a
+    /// kernel with no weights behind it; each is refused with the way out rather than tolerated until it computes
+    /// garbage.
+    bool validate_no_host_experts(std::string& err) const {
+        if (!use_mmq) {
+            err = "STRATA_Q36_NO_HOST_EXPERTS=1 needs the MMQ prompt path (libstrata_kq.so with STRATA_MMQ_KQ=1, "
+                  "and STRATA_Q36_NO_MMQ unset): without it no batch streams, so every one goes to the primary's "
+                  "slots and the CPU pool, which has no host copy of the experts to read";
+            return false;
+        }
+        if (placed_slots > 0) {
+            err = "STRATA_Q36_NO_HOST_EXPERTS=1 needs every expert on a helper, but the primary holds " +
+                  std::to_string(placed_slots) + " expert slot(s) a layer and a slot is filled from the host "
+                  "arena.  Give it none with --expert-vram 0.01 (--expert-slots 0 is the default and means 'as "
+                  "many as the VRAM budget allows', so passing it changes nothing)";
+            return false;
+        }
+        if (!peer_all_owned) {
+            err = "STRATA_Q36_NO_HOST_EXPERTS=1 needs a helper to hold EVERY expert of every layer, and one does "
+                  "not, so that expert would have no weights anywhere.  Set STRATA_Q36_PREFILL_PEERS=1 (with "
+                  "STRATA_Q36_PREFILL_PEERS_HOST=1 when there is no direct link) and let every helper open, or run "
+                  "without this variable";
+            return false;
+        }
+        // a window wider than the helpers' budget falls back to the whole layer on the primary, which streams from
+        // the arena.  (The under-bound miss - n_ent <= hybrid_t*top_k - is the hy_rows path, which never streams:
+        // the clamp in place_experts makes hybrid_t == vrows, so the helpers serve that window.)
+        if ((int64_t) tmax * (int64_t) m->top_k > peer_cap_rows) {
+            err = "STRATA_Q36_NO_HOST_EXPERTS=1 needs every prompt window to fit the helpers' row budget: a chunk of " +
+                  std::to_string(tmax) + " rows is " + std::to_string((int64_t) tmax * (int64_t) m->top_k) +
+                  " entries against a budget of " + std::to_string(peer_cap_rows) +
+                  ".  Lower the chunk size (--chunk), or run without this variable";
+            return false;
+        }
+        // The MTP block streams too when its layer is hybrid, and `lhy()` is the test the forward itself uses to
+        // send it there - so this covers MTP_HELPER (which never raises n_slots) and a slot budget that left the
+        // block short, not just the flag being absent.
+        if (m->has_mtp && lhy(m->layers.size())) {
+            err = "STRATA_Q36_NO_HOST_EXPERTS=1 needs the MTP block's experts all in the primary's VRAM, and its "
+                  "layer is hybrid: pass STRATA_Q36_MTP_VRAM=1 (or use the FP16 block), or run without this variable";
+            return false;
+        }
+        return true;
+    }
+    /// STRATA_Q36_MARSHAL_FINISH=0: keep the parallel begins but harvest the helpers on the calling thread,
+    /// one drain after another.  NOT yet measured as faster: the serial-drain waits seen on 2026-11-04 came from
+    /// an arm that also had serial begins, so the helper head start differs and the comparison does not carry over.
+    /// This switch exists to A/B that on the wall clock.  Unset or any value other than exactly "0" keeps the
+    /// concurrent harvest, so the default is unchanged.
+    static bool marshal_finish() {
+        static const bool v = [] {
+            const char* e = std::getenv("STRATA_Q36_MARSHAL_FINISH");
+            return !(e && e[0] == '0' && e[1] == '\0');
         }();
         return v;
     }
@@ -3176,9 +3445,14 @@ struct Engine {
             if (kind == 0) return;   // the stop
             std::string err;
             bool ok = true;
-            if (kind == 1)
-                ok = helpers[(size_t) r].begin((int64_t) li, x, ids, T, Kp, nullptr, nullptr, err, sum_wts);
-            else
+            if (kind == 1) {
+                // STRATA_Q36_PRIMARY_RES: the row for this layer was written by moe_helpers() before the post (the
+                // same lifetime sum_wts already relies on), so the worker reads it rather than carrying a pointer
+                // through the job.
+                const int32_t* pres = primary_res_flag() && T <= (int) vrows && li < hy.size()
+                                          ? primary_res_.data() : nullptr;
+                ok = helpers[(size_t) r].begin((int64_t) li, x, ids, T, Kp, nullptr, pres, err, sum_wts);
+            } else
                 ok = helpers[(size_t) r].finish(out, err);
             {
                 std::lock_guard<std::mutex> lk(m.mu);
@@ -3213,6 +3487,7 @@ struct Engine {
         marshal_on = false;
     }
     ~Engine() {
+        keep_gpus_warm_stop();
         marshal_stop();
         for (auto& gx : shared_ge)
             if (gx) { CK(cudaGraphExecDestroy(gx)); gx = nullptr; }
@@ -3221,10 +3496,11 @@ struct Engine {
         for (auto& sess_ge : mixer_ge)
             for (auto& gx : sess_ge)
                 if (gx) { CK(cudaGraphExecDestroy(gx)); gx = nullptr; }
-        if (mixer_graph_flag())
-            std::fprintf(stderr, "strata-q36: STRATA_Q36_MIXER_GRAPH: %d layer graphs captured, %d captures refused "
+        if (mixer_graph_flag() || mixer_graph_v_flag())
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_MIXER_GRAPH: flags: %s| %d layer graphs captured, %d captures refused "
                          "by the driver | the host's mixer: %.3f us a layer over %lld graph launches, %.3f us a layer "
                          "over %lld eager fallbacks\n",
+                         mixer_graph_flags().c_str(),
                          mixer_ge_captured, mixer_ge_failed,
                          mixer_ge_host_n ? mixer_ge_host_ms * 1000.0 / (double) mixer_ge_host_n : 0.0, mixer_ge_host_n,
                          mixer_ge_eager_n ? mixer_ge_eager_ms * 1000.0 / (double) mixer_ge_eager_n : 0.0, mixer_ge_eager_n);
@@ -3621,9 +3897,27 @@ struct Engine {
     void init(const Model& model, int ctx_, int tmax_, int n_sessions = 1, bool vision_ = false) {
         m = &model;
         ctx = ctx_;
-        n_sess = std::max(1, std::min(n_sessions, kVerify));
+        // STRATA_Q36_VERIFY_ROWS=N: the verify window's row budget (8 by default).  It is read here, before the
+        // allocations that are sized by it, and it is the ONLY thing that makes a window wider than 8 rows: with the
+        // variable unset vrows == kVerify and every row count, allocation and clamp below is what it always was.
+        {
+            const char* e = std::getenv("STRATA_Q36_VERIFY_ROWS");
+            if (e && *e) {
+                char* end = nullptr;
+                const long n = std::strtol(e, &end, 10);
+                if (end && *end == '\0' && n >= kVerify && n <= kVerifyMax) {
+                    vrows = (int) n;
+                    std::fprintf(stderr, "strata-q36: STRATA_Q36_VERIFY_ROWS=%d: the verify window holds %d rows\n",
+                                 vrows, vrows);
+                } else {
+                    std::fprintf(stderr, "strata-q36: STRATA_Q36_VERIFY_ROWS=%s is outside [%d, %d]; using %d\n", e,
+                                 kVerify, kVerifyMax, vrows);
+                }
+            }
+        }
+        n_sess = std::max(1, std::min(n_sessions, vrows));
         vision = vision_;
-        tmax = std::max(tmax_, kVerify);
+        tmax = std::max(tmax_, vrows);
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
@@ -3694,7 +3988,7 @@ struct Engine {
             d_peer_q8 = dalloc_t<uint8_t>(MMQ::q8_bytes((int64_t) tmax, (int64_t) N));
         }
         sg = dalloc(T * g.n_ff_shexp); su = dalloc(T * g.n_ff_shexp); shh = dalloc(T * g.n_ff_shexp); sy = dalloc(T * N);
-        sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) kVerify * g.n_vocab);
+        sgate = dalloc(T); ewts = dalloc(T * Kp); logits = dalloc((size_t) vrows * g.n_vocab);
         const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp});
         CK(cudaMalloc(&q8, K::native_q8_1_bytes(max_in, 1) * T));
         CK(cudaMalloc(&xq, K::native_q8_1_bytes((int) N, 1) * T));
@@ -3813,9 +4107,9 @@ struct Engine {
         // cells 0 .. nh-1 with rotary positions 0 .. nh-1 instead of nh .. 2nh-1.  Nothing crashed; the prompt simply
         // came out as a different (coherent-looking) answer.  Flag-off: slot 0 only, exactly the old one word.
         pos0 = dalloc_t<int32_t>(prefill_split_halves() == 2 ? 2 : 1);
-        pick = dalloc_t<int32_t>(kVerify);
-        amv = dalloc((size_t) kArgBlocks * kVerify);
-        ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
+        pick = dalloc_t<int32_t>(vrows);
+        amv = dalloc((size_t) kArgBlocks * vrows);
+        ami = dalloc_t<int32_t>((size_t) kArgBlocks * vrows);
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
         att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
@@ -3833,10 +4127,10 @@ struct Engine {
             if (L.attn) {
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
             } else {
-                v_qkv.push_back(dalloc((size_t) kVerify * C));
-                v_hc.push_back(dalloc((size_t) kVerify * C));
-                v_alpha.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
-                v_beta.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
+                v_qkv.push_back(dalloc((size_t) vrows * C));
+                v_hc.push_back(dalloc((size_t) vrows * C));
+                v_alpha.push_back(dalloc((size_t) vrows * g.ssm_v_heads));
+                v_beta.push_back(dalloc((size_t) vrows * g.ssm_v_heads));
             }
         }
         sess.resize((size_t) n_sess);
@@ -3861,14 +4155,16 @@ struct Engine {
             }
         }
         for (Sess& ss : sess) alloc_session(ss);
-        // STRATA_Q36_MIXER_GRAPH=1: one graph slot per (session, layer).  The graphs themselves are captured
-        // lazily, at the first decode step of their session.
-        if (mixer_graph_flag()) {
-            mixer_ge.assign((size_t) n_sess, std::vector<cudaGraphExec_t>(m->layers.size(), nullptr));
-            mixer_ge_gr.assign((size_t) n_sess, std::vector<uint8_t>(m->layers.size(), 0));
-            mixer_ge_ext.assign((size_t) n_sess, std::vector<uint8_t>(m->layers.size(), 0));
-            mixer_ge_xq.assign((size_t) n_sess, std::vector<uint8_t>(m->layers.size(), 0));
+        // STRATA_Q36_MIXER_GRAPH=1: one graph slot per (session, layer, window width).  The graphs themselves
+        // are captured lazily, at the first decode step of their session.
+        if (mixer_graph_flag() || mixer_graph_v_flag()) {
+            const size_t slots = m->layers.size() * (size_t) kMgStride;
+            mixer_ge.assign((size_t) n_sess, std::vector<cudaGraphExec_t>(slots, nullptr));
+            mixer_ge_gr.assign((size_t) n_sess, std::vector<uint8_t>(slots, 0));
+            mixer_ge_ext.assign((size_t) n_sess, std::vector<uint8_t>(slots, 0));
+            mixer_ge_xq.assign((size_t) n_sess, std::vector<uint8_t>(slots, 0));
             mixer_ge_step.assign((size_t) n_sess, 0);
+            mixer_ge_vstep.assign((size_t) n_sess, std::vector<int>((size_t) kMgStride, 0));
             mixer_ge_nc.assign((size_t) n_sess, -1);
         }
         if (m->has_mtp) {   // the MTP block's own buffers (its K / V went with the sessions, in alloc_session)
@@ -3930,13 +4226,13 @@ struct Engine {
                 CK(cudaMemcpy((void*) *tb.first, tb.second->data(), tb.second->size() * sizeof(void*),
                               cudaMemcpyHostToDevice));
             }
-            d_rcell = dalloc_t<int32_t>(kVerify);
-            d_rslot = dalloc_t<int32_t>(kVerify);
-            d_rdelta = dalloc_t<int32_t>(kVerify);
-            d_gslot = dalloc_t<int32_t>(kVerify);
-            d_grow0 = dalloc_t<int32_t>(kVerify);
-            d_gcnt = dalloc_t<int32_t>(kVerify);
-            CK(cudaHostAlloc((void**) &hrow, 128 * sizeof(int32_t), cudaHostAllocDefault));
+            d_rcell = dalloc_t<int32_t>(vrows);
+            d_rslot = dalloc_t<int32_t>(vrows);
+            d_rdelta = dalloc_t<int32_t>(vrows);
+            d_gslot = dalloc_t<int32_t>(vrows);
+            d_grow0 = dalloc_t<int32_t>(vrows);
+            d_gcnt = dalloc_t<int32_t>(vrows);
+            CK(cudaHostAlloc((void**) &hrow, (size_t) (8 * kVerifyMax) * sizeof(int32_t), cudaHostAllocDefault));
         }
         if (vision) {
             d_mtab = dalloc_t<int32_t>((size_t) ctx * 3);
@@ -3976,7 +4272,7 @@ struct Engine {
     /// y [T][n_out] = W [n_out][n_in] (f32) x [T][n_in]: a decode batch on the warp-per-row kernel, a prompt chunk on
     /// cuBLAS's FP32 GEMM (the router and the GDN alpha / beta stay in FP32, as llama.cpp keeps them).
     void f32mm(const float* W, const float* xin, float* out, int n_in, int n_out, int T) {
-        if (T <= kGemmT) {
+        if (!chunk(T)) {
             k_gemv_f32<<<dim3(rows8(n_out), T), kThreads, 0, st>>>(W, xin, out, n_in, n_out);
             return;
         }
@@ -4014,16 +4310,25 @@ struct Engine {
     /// A batch above kGemmT tokens (a prompt chunk) runs its projections as GEMMs (prefill::Gemm::native: the GGUF
     /// blocks dequantized to FP16, the activations FP16); a decode batch on the native MMVQ (q8_1 activations).
     static constexpr int kGemmT = 8;
+    /// Is this batch a PROMPT CHUNK - the arithmetic that runs on the GEMM path?  The switch is "this is a prompt
+    /// chunk", not "T > kGemmT": a verify window (verify_win: set by forward() for the window's duration) and a
+    /// batch-rows window (rows_mode: the DFlash2 decode's multi-session step) are DECODE batches whatever their
+    /// width, and their rows must come out as a one-row decode step's rows would.  A window of more than kGemmT
+    /// rows would otherwise take the prompt chunk's arithmetic - the FP16 GEMMs, the split-K router, the chunk
+    /// attention over ONE session's K / V - and its rows would no longer be the rows a decode step computes.
+    /// Every path that exists today with the default vrows == kVerify satisfies chunk(T) == (T > kGemmT): a
+    /// verify / batch-rows window is at most eight rows, and a prompt chunk is neither.
+    bool chunk(int T) const { return T > kGemmT && !rows_mode && !verify_win; }
     /// The activations in the form the layer's products read: FP16 (a prompt chunk, or a layer whose weights are
     /// FP16 - the cuBLAS F16 GEMM in apply() reads that, and such a layer has no q8_1 image) or the q8_1 image
     /// (the MMVQ products).  `f16w` is the LAYER's own flag: a model-wide one would leave the main layers without
     /// their q8_1 image, and their MMVQ would read a stale one - wrong numbers, not a crash.
     void prep(const float* xin, int n, int T, void* q, bool f16w) {
-        if (T > kGemmT || f16w) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
+        if (chunk(T) || f16w) k_to_f16<<<grid1((int64_t) n * T), kThreads, 0, st>>>(xin, x16, (int64_t) n * T);
         else quant(xin, n, T, q);
     }
     void apply(const Mat& w, const void* q, float* out, int T) {
-        if (T > kGemmT) {
+        if (chunk(T)) {
             gemm.native((const uint16_t*) x16, w.type, w.d, out, T, w.n_out, w.n_in);
             return;
         }
@@ -4060,10 +4365,12 @@ struct Engine {
         }
     }
     /// A Q8_0 matrix that is not on the packed decode kernel (the shared expert, attention k / v: fewer than 2048
-    /// rows) for T <= 8 columns: one warp per row (q36k::k_q8_rows) in place of the 4-warp block of
-    /// native_small_mmvq_kernel; the same bits.
+    /// rows) for a decode batch: one warp per row (q36k::k_q8_rows) in place of the 4-warp block of
+    /// native_small_mmvq_kernel; the same bits.  T <= 8 is the shape the decode has always used; a batch-rows
+    /// window of more than eight rows (STRATA_Q36_VERIFY_ROWS) takes the same kernel at its own T, so its rows
+    /// come out as a one-row decode step's.  A prompt chunk (chunk(T)) keeps the fall-through to native_mmvq.
     bool q8_small(const Mat& w, const void* q, float* out, int T) {
-        if (!fast_k || w.type != 8 || T < 1 || T > 8 || w.n_in % 32 != 0) return false;
+        if (!fast_k || w.type != 8 || T < 1 || chunk(T) || T > kVerifyMax || w.n_in % 32 != 0) return false;
         if (K::native_q8_0_packed_eligible(w.n_in, w.n_out) && K::native_q8_0_packed_enabled()) return false;
         const int nb = w.n_in / 32;
         if (nb > 64) return false;
@@ -4075,10 +4382,13 @@ struct Engine {
         if (NJ == 1) q36k::launch_q8_rows<NCV, 1, false>(wp, dpl, q, out, nb, w.n_out, st);                  \
         else q36k::launch_q8_rows<NCV, 2, false>(wp, dpl, q, out, nb, w.n_out, st);                          \
         break;
-        switch (T) { Q36_Q8(1) Q36_Q8(2) Q36_Q8(3) Q36_Q8(4) Q36_Q8(5) Q36_Q8(6) Q36_Q8(7) Q36_Q8(8) }
+        switch (T) {
+            Q36_Q8(1) Q36_Q8(2) Q36_Q8(3) Q36_Q8(4) Q36_Q8(5) Q36_Q8(6) Q36_Q8(7) Q36_Q8(8)
+            Q36_Q8(9) Q36_Q8(10)
+        }
 #undef Q36_Q8
         if (verify_k) {
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
+            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) kVerifyMax * 16384 * 4));
             const size_t qb = K::native_q8_1_bytes(w.n_in, 1);
             for (int c0 = 0; c0 < T; c0 += 8) {
                 const int nc = std::min(8, T - c0);
@@ -4097,7 +4407,7 @@ struct Engine {
     void verify_q8(const char* what, const float* hsrc, int T, const std::string& tag) {
         const int N = (int) m->g.n_embd;
         const size_t qb = K::native_q8_1_bytes(N, 1);
-        if (!vq) CK(cudaMalloc(&vq, qb * 8));
+        if (!vq) CK(cudaMalloc(&vq, qb * kVerifyMax));
         K::native_quantize_q8_1(hsrc, vq, N * T, 1, st);
         const long long before = v_bad;
         verify_cmp(what, (const float*) xq, (const float*) vq, qb * (size_t) T / 4, tag);
@@ -4132,7 +4442,7 @@ struct Engine {
     }
     void prep_in(int T, bool f16w, int ro = 0) {
         // an F16 layer has no q8_1 image to reuse: it needs the FP16 one (prep writes it below)
-        if (!f16w && xq_ready && T <= kGemmT && ro == 0) {
+        if (!f16w && xq_ready && !chunk(T) && ro == 0) {
             xq_ready = false;
             return;
         }
@@ -4149,11 +4459,11 @@ struct Engine {
         // previous layer left behind.  Flag-off: ro==0, the same base as before.
         float* yh = y;
         float* hh = h + (size_t) ro * N;
-        if (fast_k && T <= kGemmT) {
+        if (fast_k && !chunk(T)) {
             if (verify_k) {
                 if (!vx_) {
-                    CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
-                    CK(cudaMalloc((void**) &vh_, (size_t) 8 * 2048 * 4));
+                    CK(cudaMalloc((void**) &vx_, (size_t) kVerifyMax * 2048 * 4));
+                    CK(cudaMalloc((void**) &vh_, (size_t) kVerifyMax * 2048 * 4));
                 }
                 CK(cudaMemcpyAsync(vx_, xh, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
                 k_add_rms<<<T, kThreads, 0, st>>>(vx_, yh, L.post_norm, vh_, N, m->eps);
@@ -4196,10 +4506,10 @@ struct Engine {
         switch (T) { Q36_SH(1) Q36_SH(2) Q36_SH(3) Q36_SH(4) }
 #undef Q36_SH
         if (verify_k) {
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
-            if (!vq) CK(cudaMalloc(&vq, K::native_q8_1_bytes(m->g.n_embd, 1) * 8));
+            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) kVerifyMax * 16384 * 4));
+            if (!vq) CK(cudaMalloc(&vq, K::native_q8_1_bytes(m->g.n_embd, 1) * kVerifyMax));
             float* vg = vbuf;
-            float* vu = vbuf + (size_t) 8 * FS;
+            float* vu = vbuf + (size_t) kVerifyMax * FS;
             mmq_ref(a, xq, vg, T);
             mmq_ref(b, xq, vu, T);
             K::native_swiglu_quantize_q8_1(vg, vu, vq, FS, T, st);
@@ -4234,12 +4544,15 @@ struct Engine {
     }
     /// VERIFY: the old grouping of the current `ids` into scratch, compared with grp_ptr / grp_start / n_groups / ent_dst / ent_tok.
     void group_verify(const Layer& L, const int32_t* slot_of, int T) {
-        if (!vgrp) CK(cudaMalloc((void**) &vgrp, 2048));
+        // kVerifyMax * top_k = 80 entries (and at most that many groups).  The old 64-slot layout
+        // was enough for an eight-row window; a ten-row verify window overflows it.
+        constexpr int kGrpCap = kVerifyMax * 8;
+        if (!vgrp) CK(cudaMalloc((void**) &vgrp, (size_t) (kGrpCap + 1) * 8 + (size_t) (kGrpCap + 1 + 2 + 2 * kGrpCap) * 4));
         unsigned long long* o_ptr = (unsigned long long*) vgrp;
-        int32_t* o_start = (int32_t*) (o_ptr + 65);
-        int32_t* o_ng = o_start + 66;
+        int32_t* o_start = (int32_t*) (o_ptr + kGrpCap + 1);
+        int32_t* o_ng = o_start + kGrpCap + 1;
         int32_t* o_dst = o_ng + 2;
-        int32_t* o_tok = o_dst + 64;
+        int32_t* o_tok = o_dst + kGrpCap;
         group_old(L, slot_of, nullptr, T, o_ptr, o_start, o_ng, o_dst, o_tok);
         CK(cudaStreamSynchronize(st));
         int nn = 0, no = 0;
@@ -4249,7 +4562,7 @@ struct Engine {
         bool bad = nn != no;
         if (!bad) {
             std::vector<unsigned long long> a((size_t) nn + 1), b((size_t) nn + 1);
-            std::vector<int32_t> sa((size_t) nn + 1), sb((size_t) nn + 1), da(64), db(64), ta(64), tb(64);
+            std::vector<int32_t> sa((size_t) nn + 1), sb((size_t) nn + 1), da(kGrpCap), db(kGrpCap), ta(kGrpCap), tb(kGrpCap);
             CK(cudaMemcpy(a.data(), grp_ptr, (size_t) nn * 8, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(b.data(), o_ptr, (size_t) nn * 8, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(sa.data(), grp_start, ((size_t) nn + 1) * 4, cudaMemcpyDeviceToHost));
@@ -4274,28 +4587,44 @@ struct Engine {
     /// `slot_of`: the hybrid mode's slot table (null: every expert resident).  `skip`: the helper tier's per-entry
     /// mask (--expert-cache-device1..3, null when no helper took part), the entries it already computed into `eparts`.
     /// Returns false when the old kernels must run.
+    /// The launch: MAXTOK is the block's warps, one per token.  Eight rows is the shape the decode has always used
+    /// (the same block, the same launch bounds, the same shared arrays - so its numbers and its speed do not
+    /// move).  A batch-rows window of more than eight rows (STRATA_Q36_VERIFY_ROWS) takes the wide shape: one warp
+    /// per row, the same top-k and the same grouping, so its rows come out as a one-row decode step's rows.  The
+    /// prompt chunk keeps the eight-row gate: it is not a batch-rows window, and its path must not move.
+    template <int MAXTOK>
+    void route_group_launch(const Layer& L, const int32_t* slot_of, const uint8_t* skip, int T, int ld, int warps) {
+        const dim3 blk(32, warps);
+        if (slot_of && skip)
+            q36k::k_route_group<true, true, MAXTOK><<<1, blk, 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, skip, L.blobs, L.stride, grp_ptr,
+                                                                         grp_start, n_groups, ent_dst, ent_tok);
+        else if (slot_of)
+            q36k::k_route_group<true, false, MAXTOK><<<1, blk, 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, nullptr, L.blobs, L.stride, grp_ptr,
+                                                                          grp_start, n_groups, ent_dst, ent_tok);
+        else if (skip)
+            q36k::k_route_group<false, true, MAXTOK><<<1, blk, 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, skip, L.blobs, L.stride, grp_ptr,
+                                                                          grp_start, n_groups, ent_dst, ent_tok);
+        else
+            q36k::k_route_group<false, false, MAXTOK><<<1, blk, 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, nullptr, L.blobs, L.stride, grp_ptr,
+                                                                           grp_start, n_groups, ent_dst, ent_tok);
+    }
     bool route_group(const Layer& L, const int32_t* slot_of, const uint8_t* skip, int T, int ld) {
         const int Kp = (int) m->top_k;
         grouped_by_route = false;
-        if (!fast_k || T > 8 || m->g.n_expert != 256 || Kp != 8) return false;
-        if (slot_of && skip)
-            q36k::k_route_group<true, true><<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, skip, L.blobs, L.stride, grp_ptr,
-                                                                       grp_start, n_groups, ent_dst, ent_tok);
-        else if (slot_of)
-            q36k::k_route_group<true, false><<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, slot_of, nullptr, L.blobs, L.stride, grp_ptr,
-                                                                        grp_start, n_groups, ent_dst, ent_tok);
-        else if (skip)
-            q36k::k_route_group<false, true><<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, skip, L.blobs, L.stride, grp_ptr,
-                                                                        grp_start, n_groups, ent_dst, ent_tok);
-        else
-            q36k::k_route_group<false, false><<<1, dim3(32, 8), 0, st>>>(logits_r, ids, ewts, T, ld, nullptr, nullptr, L.blobs, L.stride, grp_ptr,
-                                                                         grp_start, n_groups, ent_dst, ent_tok);
+        if (!fast_k || m->g.n_expert != 256 || Kp != 8) return false;
+        // T <= 8 keeps the historical shape.  A verify / batch-rows window past eight rows (!chunk(T))
+        // takes the wide MAXTOK=16 launch so its top-k and grouping stay the decode ones; a prompt
+        // chunk (chunk(T)) keeps returning false and the old kernels.
+        if (T <= 8) route_group_launch<8>(L, slot_of, skip, T, ld, 8);
+        else if (!chunk(T) && T <= 16) route_group_launch<16>(L, slot_of, skip, T, ld, T);
+        else return false;
         grouped_by_route = true;
         if (verify_k) {
             // the old top-k into scratch, the ids / weights compared, then the old grouping of the new ids
-            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) 8 * 16384 * 4));
-            int32_t* vid = (int32_t*) (vbuf + 8 * 8192);
-            float* vw = vbuf + 8 * 8192 + 64;
+            if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) kVerifyMax * 16384 * 4));
+            // vid needs T*top_k ints (up to kVerifyMax*8); the old +64 only covered an eight-row window.
+            int32_t* vid = (int32_t*) (vbuf + kVerifyMax * 8192);
+            float* vw = vbuf + kVerifyMax * 8192 + kVerifyMax * 8;
             K::native_router_topk(logits_r, vid, vw, 256, Kp, T, st);
             verify_cmp("route ids", (const float*) ids, (const float*) vid, (size_t) T * Kp, " T " + std::to_string(T));
             verify_cmp("route weights", ewts, vw, (size_t) T * Kp, " T " + std::to_string(T));
@@ -4311,18 +4640,20 @@ struct Engine {
             return;
         }
         const int Kp = (int) m->top_k, n_ent = T * Kp;
-        if (fast_k && n_ent <= 64) {
+        // 80 = kVerifyMax * top_k (10 * 8): a verify / batch-rows window of up to ten rows stays on
+        // k_group_small so its grouping matches the decode path.  Wider windows keep group_old.
+        if (fast_k && n_ent <= 80) {
             if (slot_of && skip)
-                q36k::k_group_small<true, true><<<1, 64, 0, st>>>(ids, n_ent, Kp, slot_of, skip, L.blobs, L.stride, grp_ptr, grp_start,
+                q36k::k_group_small<true, true><<<1, 80, 0, st>>>(ids, n_ent, Kp, slot_of, skip, L.blobs, L.stride, grp_ptr, grp_start,
                                                                  n_groups, ent_dst, ent_tok);
             else if (slot_of)
-                q36k::k_group_small<true, false><<<1, 64, 0, st>>>(ids, n_ent, Kp, slot_of, nullptr, L.blobs, L.stride, grp_ptr, grp_start,
+                q36k::k_group_small<true, false><<<1, 80, 0, st>>>(ids, n_ent, Kp, slot_of, nullptr, L.blobs, L.stride, grp_ptr, grp_start,
                                                                   n_groups, ent_dst, ent_tok);
             else if (skip)
-                q36k::k_group_small<false, true><<<1, 64, 0, st>>>(ids, n_ent, Kp, nullptr, skip, L.blobs, L.stride, grp_ptr, grp_start,
+                q36k::k_group_small<false, true><<<1, 80, 0, st>>>(ids, n_ent, Kp, nullptr, skip, L.blobs, L.stride, grp_ptr, grp_start,
                                                                    n_groups, ent_dst, ent_tok);
             else
-                q36k::k_group_small<false, false><<<1, 64, 0, st>>>(ids, n_ent, Kp, nullptr, nullptr, L.blobs, L.stride, grp_ptr, grp_start,
+                q36k::k_group_small<false, false><<<1, 80, 0, st>>>(ids, n_ent, Kp, nullptr, nullptr, L.blobs, L.stride, grp_ptr, grp_start,
                                                                     n_groups, ent_dst, ent_tok);
             if (verify_k) group_verify(L, slot_of, T);
             return;
@@ -4394,9 +4725,14 @@ struct Engine {
                  int sgs = 1, int ro = 0) {
         const int N = (int) m->g.n_embd, Kp = (int) m->top_k;
         // STRATA_Q36_PEER_SUM=1: the small path (k_moe_out_small) has no place for the helpers' sums, so the sums
-        // keep the general path.  With the sums on the layer is a prompt chunk (T > kGemmT = 8) anyway, so this
+        // keep the general path.  With the sums on the layer is a prompt chunk (chunk(T)) anyway, so this
         // never changes an answer - it says so.
-        const bool small = fast_k && T <= 8 && N <= 2048 && N % 256 == 0 && Kp <= 15 && sums_n_cur == 0;
+        // The decode path (not a prompt chunk) takes k_moe_out_small up to kVerifyMax rows: a batch-rows window
+        // of more than eight rows (STRATA_Q36_VERIFY_ROWS) must combine the same way a one-row decode step does,
+        // and k_moe_out_small's grid is T blocks with no fixed-size T arrays.  A prompt chunk keeps the general
+        // k_moe_out, exactly as T > 8 always did.
+        const bool small = fast_k && !chunk(T) && T <= kVerifyMax && N <= 2048 && N % 256 == 0 && Kp <= 15 &&
+                           sums_n_cur == 0;
         // STRATA_Q36_PEER_SUM=1: WHAT THE COMBINE READS.  With the sums on, the weights are the router's own with
         // the helper-owned slots zeroed (those entries' rows are never written - the helpers send per-token sums
         // instead), and the helpers' sums are added on top of the primary's own rows.  Without the sums this is
@@ -4419,8 +4755,8 @@ struct Engine {
             : nullptr;
         if (small && verify_k) {
             if (!vx_) {
-                CK(cudaMalloc((void**) &vx_, (size_t) 8 * 2048 * 4));
-                CK(cudaMalloc((void**) &vh_, (size_t) 8 * 2048 * 4));
+                CK(cudaMalloc((void**) &vx_, (size_t) kVerifyMax * 2048 * 4));
+                CK(cudaMalloc((void**) &vh_, (size_t) kVerifyMax * 2048 * 4));
             }
             CK(cudaMemcpyAsync(vx_, xh, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, st));
             k_moe_out<<<T, kThreads, 0, st>>>(vx_, eparts, prow, wts_read, Kp, shared, sgate, sgs, wn, vh_, N, m->eps,
@@ -4488,8 +4824,8 @@ struct Engine {
             if (!ext) f32mm(L.sh_gate_inp, hh, sgh_f16, N, 1, T);
             return;
         }
-        if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(hh, x16, (int64_t) N * T);
-        if (T <= kGemmT) {
+        if (chunk(T)) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(hh, x16, (int64_t) N * T);
+        if (!chunk(T)) {
             if (!shared_gu(L, T)) {
                 apply(L.sh_gate, xq, sg + (size_t) ro * FS, T);
                 apply(L.sh_up, xq, su + (size_t) ro * FS, T);
@@ -4540,7 +4876,7 @@ struct Engine {
         // (P0b/P0c/P0d/P1/P1b/P2/P3) record into the same 8-slot row this P0 opens, and every one of them is gated
         // by the same mmq_here, so a layer either records all eight slots or none and pp_layer advances once.
         if (pp_gpu_timing && pp_open) {
-            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && chunk(T) && use_mmq;
             if (mmq_here) {
                 if (pp_t_post_open) {
                     pp_post_host_ms += ms_since(pp_t_post);
@@ -4561,9 +4897,9 @@ struct Engine {
             prep_in(T, L.f16w(), ro);
             apply(L.qkv, xq, qkv_b, T);
             // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the GDN branch's projection, first main layer only.
-            if (T > kGemmT && use_mmq) split_dump_tag(li, ro, T, qkv_b, (size_t) T * (size_t) L.qkv.n_out, "qkv");
+            if (chunk(T) && use_mmq) split_dump_tag(li, ro, T, qkv_b, (size_t) T * (size_t) L.qkv.n_out, "qkv");
             apply(L.zg, xq, z, T);
-            if (T <= kGemmT) {
+            if (!chunk(T)) {
                 k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, hh, L.dt, L.ssm_a, al_b, be_b, N,
                                                                       HV);
             } else {
@@ -4584,9 +4920,9 @@ struct Engine {
                 // differently from k_conv_seq's, a 1-ulp difference in h that the Q8_1 activation rounding can turn into a
                 // flipped near-tie later; with them the KL is the same, 1.05x / 0.81x the floor, but MTP would not be exact.)
                 // a prompt chunk: tiles of kConvTile tokens side by side (tile mode); else one block per head walks the tokens
-                const int tiles = (fast_k && T > kGemmT && !verify) ? (T + kConvTile - 1) / kConvTile : 1;
+                const int tiles = (fast_k && chunk(T) && !verify) ? (T + kConvTile - 1) / kConvTile : 1;
                 k_conv_seq<<<dim3(C / 128, tiles), 128, 0, st>>>(conv[li], qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, T, !verify);
-                if (T > kGemmT && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
+                if (chunk(T) && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
                     // STRATA_Q36_GDNPROF=1: the recurrence's own time, once per run (the first prompt chunk).  The
                     // mixer's span is 4.81 ms a layer and the three dense GEMMs were measured at 2.86 ms of it
                     // (2026-10-26, P100); this says what the rest is.  Off by default: nothing of it runs.
@@ -4622,14 +4958,14 @@ struct Engine {
                 }
             }
             // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the recurrence's own inputs and output, first main layer only.
-            if (T > kGemmT && use_mmq) {
+            if (chunk(T) && use_mmq) {
                 split_dump_tag(li, ro, T, al_b, (size_t) T * (size_t) HV, "al");
                 split_dump_tag(li, ro, T, be_b, (size_t) T * (size_t) HV, "be");
                 split_dump_tag(li, ro, T, gdn_y, (size_t) T * (size_t) HV * 128, "gdny");
             }
             mm(L.ssm_out, gdn_y, y, T);
             // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the GDN branch's output before add_rms_post, first main layer only.
-            if (T > kGemmT && use_mmq) split_dump_tag(li, ro, T, y, (size_t) T * (size_t) N, "y");            // STRATA_Q36_MIXER_SPLIT=1: the GDN branch's exit.
+            if (chunk(T) && use_mmq) split_dump_tag(li, ro, T, y, (size_t) T * (size_t) N, "y");            // STRATA_Q36_MIXER_SPLIT=1: the GDN branch's exit.
             if (mx_timing) {
                 CK(cudaEventRecord(mx_ev[1], st));
                 CK(cudaEventSynchronize(mx_ev[1]));
@@ -4665,7 +5001,7 @@ struct Engine {
                     m->eps, d_delta, mtab_now, rs);
             });
             // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the projections and the K / V this half just wrote, first layer only.
-            if (T > kGemmT && use_mmq) {
+            if (chunk(T) && use_mmq) {
                 split_dump_tag(li, ro, T, q, (size_t) T * H * HD, "q");
                 split_dump_tag(li, ro, T, kx, (size_t) T * HKV * HD, "k");
                 split_dump_tag(li, ro, T, vx, (size_t) T * HKV * HD, "v");
@@ -4687,7 +5023,7 @@ struct Engine {
                     if (q_timing) CK(cudaEventRecord(q_ev[4 * li + 1], st));
                 }
             }
-            if (T > kGemmT) {
+            if (chunk(T)) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
                 // FP16 probabilities; the queries in slices whose scores fit
@@ -4850,20 +5186,20 @@ struct Engine {
         // mmq_rows is not defined yet), so only MMQ layers record and pp_layer advances consistently with P0c / P0d
         // / P1 / P1b / P2 / P3, all of which follow in this layer.
         if (pp_gpu_timing && pp_open) {
-            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && chunk(T) && use_mmq;
             if (mmq_here)
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 1], st));   // P0b
         }
         add_rms_post(L, T, ro);
         // STRATA_Q36_SPLIT_DUMP_ATT=<dir>: the residual the experts are about to read, per (layer, half).
         // Diagnostic only; with the flag unset this is one getenv-free early return.
-        if (T > kGemmT && use_mmq) split_dump_att(li, ro, h + (size_t) ro * N, T, N);
+        if (chunk(T) && use_mmq) split_dump_att(li, ro, h + (size_t) ro * N, T, N);
         ev_mark(kSegRouter);   // E1: attention and SSM are behind us; the router follows
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
         // a decode batch of up to 8 rows takes the router and the shared expert's gate in one product too (rows of 257) when the fused
         // router follows; the prompt chunks and the checks keep the separate products
-        const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && T <= kGemmT && g.n_expert == 256 && Kp == 8);
+        const bool ext = one || (fast_k && std::getenv("STRATA_Q36_NO_EXT") == nullptr && !verify_k && !chunk(T) && g.n_expert == 256 && Kp == 8);
         if (ext) f32mm(L.router_ext, hh, logh, N, (int) g.n_expert + 1, T);
         // STRATA_Q36_PREFILL_SPLIT=2: the logits are a COMPACT [T][n_expert] block on this path (f32mm has no row
         // stride, and native_router_topk reads n_tok rows of n_expert floats), so the half's block starts at
@@ -4914,7 +5250,7 @@ struct Engine {
             if (!sh_h[ro > 0 ? 1 : 0]) shared_expert(L, T, ext1, ro);
             // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the combine's two inputs - the routed experts' rows and the shared
             // expert's output - so a remaining difference can be pinned on the experts or on everything else.
-            if (T > kGemmT && use_mmq) {
+            if (chunk(T) && use_mmq) {
                 const int Kp1 = (int) m->top_k;
                 split_dump_tag(li, ro, T, eparts + (size_t) ro * Kp1 * N1, (size_t) T * Kp1 * N1, "ep");
                 split_dump_tag(li, ro, T, sy + (size_t) ro * N1, (size_t) T * N1, "sy");
@@ -4980,7 +5316,7 @@ struct Engine {
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
-        const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
+        const bool mmq_rows = !hy_rows && chunk(T) && use_mmq;
         // the mixer's kernels: the GDN or the attention branch, the norm, the router and the top-k.  Its own
         // method, so the host's cost of it is one thing (the probe's "mixer" segment) and not a hundred lines
         // inside layer().
@@ -4994,12 +5330,22 @@ struct Engine {
         // flag and the probe are exclusive, and the graph's own host time is reported instead (mixer_ge_host_ms).
         // The MTP block's layer is m->layers[m->layers.size()] (the layer index is one past the main layers), and the
         // graph slots only cover the main layers, so the MTP layer never uses a graph.
-        const bool mg = mixer_graph_flag() && mixer_graph_ok && !mixer_ge.empty() && T == 1 && !verify && !rows_mode &&
+        // STRATA_Q36_MIXER_GRAPH_V=1 adds the verify window: the DFlash2 decode's forward is a window of
+        // D + 1 rows, and the single-token gate (T == 1 && !verify) never fires there, so the window that
+        // carries the decode's cost launches the mixer's kernels one by one.  The two sets are separate (the
+        // mixer's grids depend on T) and each has its own capture rule: the single-token set captures at the
+        // session's second decode step, the window set at the second window of THAT WIDTH, so the kernels of
+        // a width have run eagerly once before they are captured.
+        const bool mg_single = T == 1 && !verify;
+        const bool mg_window = verify && T > 1;
+        const bool mg_on = mg_single ? mixer_graph_flag() : (mg_window ? mixer_graph_v_flag() : false);
+        const bool mg = mg_on && mixer_graph_ok && !mixer_ge.empty() && !rows_mode &&
                         mtab_now == nullptr && !quest_on() && !gpu_timing && !mx_timing && !pp_gpu_timing &&
-                        !verify_k && !use_graph && li < m->layers.size();
+                        !verify_k && !use_graph && li < m->layers.size() && T < kMgStride;
         bool ext;
         if (mg) {
             auto& gl = mixer_ge[(size_t) cur];
+            const size_t gi = mg_idx(li, T);
             // The chunk count moves every 256 positions, and the captured grid is sized by it, so a graph that
             // spans two chunk counts would read a different set of chunks than the eager path.  When it changes,
             // the session's graphs are dropped and captured again (the layers do it as they are reached).
@@ -5008,26 +5354,28 @@ struct Engine {
                 mixer_graph_drop((size_t) cur);
                 mixer_ge_nc[(size_t) cur] = nc_now;
             }
-            if (!gl[li] && mixer_graph_capture_due((size_t) cur)) {
+            const bool due = mg_single ? mixer_graph_capture_due((size_t) cur)
+                                       : mixer_ge_vstep[(size_t) cur][(size_t) T] >= 2;
+            if (!gl[gi] && due) {
                 bool gr = false, ex = false;
-                if (capture_mixer_graph(li, p0, dpos, hy_rows, &gr, &ex)) {
-                    mixer_ge_gr[(size_t) cur][li] = gr ? 1 : 0;
-                    mixer_ge_ext[(size_t) cur][li] = ex ? 1 : 0;
+                if (capture_mixer_graph(li, p0, dpos, hy_rows, T, verify, gi, &gr, &ex)) {
+                    mixer_ge_gr[(size_t) cur][gi] = gr ? 1 : 0;
+                    mixer_ge_ext[(size_t) cur][gi] = ex ? 1 : 0;
                 }
             }
             // the graph baked in the mixer's own host-side branches, so the host state must be the same as when it
             // was captured: prep_in's xq_ready decides whether the layer's input is quantized (the two ways are
             // not the same bytes) and add_rms_post's xq_post says the image is already there.  When the state
             // differs the eager path runs for this layer and this step; the graph stays for the others.
-            const uint8_t xq = gl[li] ? mixer_ge_xq[(size_t) cur][li] : 0;
-            if (gl[li] && (((xq & 1) != 0) == xq_ready)) {
+            const uint8_t xq = gl[gi] ? mixer_ge_xq[(size_t) cur][gi] : 0;
+            if (gl[gi] && (((xq & 1) != 0) == xq_ready)) {
                 // the host's own cost of this layer's mixer: one graph launch instead of a dozen kernel launches
                 const auto t_ge = Clock::now();
-                CK(cudaGraphLaunch(gl[li], st));
+                CK(cudaGraphLaunch(gl[gi], st));
                 mixer_ge_host_ms += ms_since(t_ge);
                 ++mixer_ge_host_n;
-                ext = mixer_ge_ext[(size_t) cur][li] != 0;
-                grouped_by_route = mixer_ge_gr[(size_t) cur][li] != 0;
+                ext = mixer_ge_ext[(size_t) cur][gi] != 0;
+                grouped_by_route = mixer_ge_gr[(size_t) cur][gi] != 0;
                 // the host flags the graph's kernels cannot set: prep_in cleared xq_ready, add_rms_post left
                 // xq_post as the capture saw it.
                 xq_ready = false;
@@ -5081,14 +5429,14 @@ struct Engine {
             // longer copies at all.
             CK(cudaMemcpyAsync(h_ids, ids, (size_t) n_ent * 4, cudaMemcpyDeviceToHost, st));
             CK(cudaMemcpyAsync(h_h, h, (size_t) T * N * 4, cudaMemcpyDeviceToHost, st));
-            // A helper GPU takes the entries it holds in its VRAM cache (MAXT windows only); the local hybrid path
+            // A helper GPU takes the entries it holds in its VRAM cache (vrows windows only); the local hybrid path
             // below takes the primary's own slots and the host pool's, and no entry is computed twice: the three
             // buckets are separated at run time by the per-entry mask moe_helpers() writes (the grouping skips the
             // helper's entries, moe_hybrid_cpu's h_miss skips them too).  With no helper this is the plain slots +
             // host pool split it always was.  Note this is a split of WORK, not of arithmetic: the helper and the
             // CPU pool are two different implementations, so their rows differ (see moe_helpers).
             if (helper_timing()) d_h_mixer_ms += ms_since(t_mixer0);   // the host's enqueues up to the routing
-        if (helpers_enabled() && helper_layer(li) && T <= strata::kernels::cpu::MAXT && !helper_failed)
+        if (helpers_enabled() && helper_layer(li) && T <= vrows && !helper_failed)
                 moe_helpers(li, T, h_h, h_ids);   // the two copies are issued: stage from them, no D2H of its own
             if (helper_timing()) {   // the host's enqueues for the local grouped kernel and the shared expert
                 const auto t_local = Clock::now();
@@ -5098,7 +5446,7 @@ struct Engine {
                 moe_hybrid_gpu(L, li, T, h_ids, h_h);
             }   // the same copies feed the CPU pool: no D2H of its own either
             ev_mark(kSegGrp);    // E3: the local grouped kernel follows
-        } else if (T > kGemmT && use_mmq) {
+        } else if (chunk(T) && use_mmq) {
             // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
             // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
             // combine reads through entry -> sorted row
@@ -5109,10 +5457,10 @@ struct Engine {
             // arithmetic step the same.  The two halves' route kernels run on the primary's stream in order, so
             // their writes to `eparts` cannot collide.
             //
-            // a helper GPU owns this layer's experts, but a prompt chunk outgrows the helper's MAXT window: MMQ
+            // a helper GPU owns this layer's experts, but a prompt chunk outgrows the helper's window: MMQ
             // (int8, the model's own expert blobs read on this card) and the helper's q8_1 cache cannot serve it
             // through RemoteExperts::begin/finish, so the default route runs it locally.  Warn once - the helper
-            // must not idle silently; the decode windows (T <= MAXT) still offload through the branches above.
+            // must not idle silently; the decode windows (T <= vrows) still offload through the branches above.
             // STRATA_Q36_PREFILL_PEERS replaces that warning with an actual split (see the block below).
             //
             // Over-cap fallback: the `cap_rows` rule of the Flash-Next prompt path (src/prefill/prefill.cpp:3826-3834,
@@ -5133,7 +5481,7 @@ struct Engine {
             const bool peer_here = peer_layer(li);
             if (peer_owned_layer(li) && !peer_here) ++peer_over_cap;
             if (helpers_enabled() && helper_layer(li) && !mmq_helper_warned && !peer_here)
-                std::fprintf(stderr, "strata-q36: a prompt MMQ chunk keeps a helper-owned layer local; its experts stay idle on the helper GPU (MMQ int8 vs the helper q8_1 cache; T=%d > MAXT=%d)\n", T, (int) strata::kernels::cpu::MAXT);
+                std::fprintf(stderr, "strata-q36: a prompt MMQ chunk keeps a helper-owned layer local; its experts stay idle on the helper GPU (MMQ int8 vs the helper q8_1 cache; T=%d > the helper window=%d)\n", T, vrows);
             if (helpers_enabled() && helper_layer(li) && !peer_here) mmq_helper_warned = true;
             const int ne = (int) g.n_expert;
             // STRATA_Q36_PREFILL_PEERS: the entries whose expert a helper holds are NOT in the sorted order this
@@ -5348,10 +5696,10 @@ struct Engine {
                 return;   // the dispatch phase is done; the combine follows on a second call
             }
         } else {
-            // A helper computes the entries it holds (the window fits begin()'s MAXT); the local grouped kernel
+            // A helper computes the entries it holds (the window fits begin()'s row budget); the local grouped kernel
             // below computes every other entry.  Without the flags helpers_enabled() is false, so this is the same
             // grouping + grouped launch as it always was.
-            const bool via_helper = helpers_enabled() && helper_layer(li) && T <= strata::kernels::cpu::MAXT &&
+            const bool via_helper = helpers_enabled() && helper_layer(li) && T <= vrows &&
                                     !helper_failed && moe_helpers(li, T);
             if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
             // route_group ran before moe_helpers (it makes the `ids` moe_helpers reads), so its grouping covers
@@ -5409,7 +5757,7 @@ struct Engine {
         // Same gate as P2/P3 (mmq_here, since mmq_rows is out of scope after the branch), so only MMQ layers record
         // and pp_layer advances once, the same as P0/P0b/P0c/P0d/P1.
         if (pp_gpu_timing && pp_open) {
-            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && chunk(T) && use_mmq;
             if (mmq_here)
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 5], st));   // P1b
         }
@@ -5430,7 +5778,7 @@ struct Engine {
         // launches.  On a layer with no helpers the wait is empty, so P2 still sits here.  Gated by the same MMQ
         // condition as P0/P1/P3, so only MMQ layers advance pp_layer and the event slots line up in pp_drain().
         if (pp_gpu_timing && pp_open) {
-            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && chunk(T) && use_mmq;
             if (mmq_here)
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 6], st));   // P2
         }
@@ -5447,7 +5795,7 @@ struct Engine {
                             : peer_sums_base_h[0][0];
         // STRATA_Q36_SPLIT_DUMP_MIX=<dir>: the same two combine inputs as the split path's own copy above, for the
         // arm that runs the whole chunk in one call.
-        if (T > kGemmT && use_mmq) {
+        if (chunk(T) && use_mmq) {
             split_dump_tag(li, ro, T, eparts + (size_t) ro * Kp * N, (size_t) T * Kp * N, "ep");
             split_dump_tag(li, ro, T, sy + (size_t) ro * N, (size_t) T * N, "sy");
         }
@@ -5462,7 +5810,7 @@ struct Engine {
         // for MMQ layers: non-MMQ layers did not record P0 and would leave an unpaired event.  The layer counter
         // advances here so the next layer's events write to the right slot.
         if (pp_gpu_timing && pp_open) {
-            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && T > kGemmT && use_mmq;
+            const bool mmq_here = !(lhy(li) && (T <= hybrid_t || !main_hybrid)) && chunk(T) && use_mmq;
             if (mmq_here) {
                 CK(cudaEventRecord(pp_ev[2 + 8 * pp_layer + 7], st));   // P3
                 pp_t_post = Clock::now();
@@ -5531,6 +5879,8 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
+        // A verify window must keep decode arithmetic whatever its width (see chunk()).  Cleared before return.
+        verify_win = verify;
 #if defined(STRATA_HAVE_DFLASH2)
         df2_arm_forward(p0, T);
 #endif
@@ -5539,6 +5889,11 @@ struct Engine {
         // capture is an error - so the capture would fail on the first step and the eager path would be used for the
         // whole run.  The second step's kernels are the same, with the same shapes, and the allocations are made.
         if (mixer_graph_flag() && T == 1 && !verify && !mixer_ge_step.empty()) ++mixer_ge_step[(size_t) cur];
+        // STRATA_Q36_MIXER_GRAPH_V=1: the same counter for a verify window, one per window width: the capture
+        // of a width happens at the SECOND window of that width, so the kernels of that shape have run eagerly
+        // once (and made their lazy allocations) before the capture tries to record them.
+        if (mixer_graph_v_flag() && verify && T > 1 && !mixer_ge_vstep.empty() && T < kMgStride)
+            ++mixer_ge_vstep[(size_t) cur][(size_t) T];
         // STRATA_Q36_PREFILL_PEERS: the window this forward works on, recorded before stream_begin() consults it (see
         // peer_win_ent).  Flag-guarded, so no write happens at all in a default run and nothing reads it there either
         // (peer_layer() answers false on `!peer_prefill_on` alone).  It has to be recorded HERE rather than in the MMQ
@@ -5583,7 +5938,7 @@ struct Engine {
         // with graph_mode true) must never run pp_drain's cudaEventSynchronize inside the capture.  The prompt path
         // (process) always calls with graph_mode false.  With the flag off pp_gpu_timing is false, so nothing here
         // runs and the default path is unchanged.
-        if (pp_gpu_timing && T > kGemmT && use_mmq && !graph_mode) {
+        if (pp_gpu_timing && chunk(T) && use_mmq && !graph_mode) {
             pp_open = true;
             pp_layer = 0;
             CK(cudaEventRecord(pp_ev[0], st));   // forward-start
@@ -5606,7 +5961,7 @@ struct Engine {
         // STRATA_Q36_SPLIT_DUMP=<dir>: per-layer residual-stream dump (see split_dump).  Prompt chunks, eager path
         // only - the same guard the split itself uses, so a split run and a non-split run are dumped identically.
         const char* dump_dir = std::getenv("STRATA_Q36_SPLIT_DUMP");
-        if (dump_dir != nullptr && (*dump_dir == '\0' || !(T > kGemmT && use_mmq && !graph_mode))) dump_dir = nullptr;
+        if (dump_dir != nullptr && (*dump_dir == '\0' || !(chunk(T) && use_mmq && !graph_mode))) dump_dir = nullptr;
         // STRATA_Q36_PREFILL_SPLIT=2: one call of layer `ll` for one half.  Phase 0 dispatches (mixer, router, route,
         // local MMQ) and phase 1 combines (shared expert, peer wait, moe_end); the two are the same `layer()` call
         // the non-split path makes, just cut in half.
@@ -5686,7 +6041,7 @@ struct Engine {
         // The accumulators span layers AND chunks (a prompt longer than tmax is several process() chunks), so nothing
         // is cleared here - the bench harness resets them between prompt passes with pp_reset().  Same eager-path
         // guard as the open above: decode forwards and graph-captured batch forwards stay clear of this probe.
-        if (pp_gpu_timing && T > kGemmT && use_mmq && !graph_mode) {
+        if (pp_gpu_timing && chunk(T) && use_mmq && !graph_mode) {
             CK(cudaEventRecord(pp_ev[1], st));   // forward-end
             pp_drain();
             pp_layer = 0;   // the next chunk renumbers from the start of the same slot range; the span accumulators
@@ -5696,6 +6051,7 @@ struct Engine {
         // STRATA_Q36_HELPER_TIMING=1: the one armed layer has recorded its tile, so this is the ONE place the probe
         // drains and reads elapsed times.  It syncs the last event once per forward, not per layer.
         if (gpu_timing) gp_drain();
+        verify_win = false;
     }
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
@@ -5883,6 +6239,15 @@ struct Engine {
         // two route kernels skip the rest), so it addresses only non-owned experts' weights.  The table is static
         // for the run (a helper's cache is filled at open time), so it is read from the host copy - no D2H here.
         const uint8_t* owned = peer_mask_host(stream_seq[(size_t) i]);
+        // STRATA_Q36_NO_HOST_EXPERTS: there is no arena to stream from, so this layer must be served by the peers
+        // in full.  An unserved layer here would read a null pointer, so it ends the run with the reason instead.
+        if (no_host_experts() && owned == nullptr) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_NO_HOST_EXPERTS=1: layer %lld's prompt window (%lld entries) "
+                                 "is not served by the helpers (row budget %lld), so its expert rows have no source: "
+                                 "the host arena is off\n",
+                         (long long) stream_seq[(size_t) i], (long long) peer_win_ent, (long long) peer_cap_rows);
+            std::exit(1);
+        }
         // fewer than half the experts resident (a 12 GB card): the one whole-layer copy is faster than many small ones
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs).  A whole-layer copy cannot skip
         // anything, so on a served layer both shortcuts fall through to the per-run loop (which then skips).
@@ -5930,8 +6295,8 @@ struct Engine {
         ++stream_pos;
     }
 
-    /// Every routed entry of a helper-owned layer, computed on that helper GPU (T <= MAXT windows only: begin() takes
-    /// a window of at most MAXT tokens, so a bigger batch keeps the local path).  The rows land in `eparts` exactly
+    /// Every routed entry of a helper-owned layer, computed on that helper GPU (T <= vrows windows only: begin() takes
+    /// a window of at most vrows tokens, so a bigger batch keeps the local path).  The rows land in `eparts` exactly
     /// where the local grouped kernel would have put them - `RemoteExperts::begin` keys its output on the entry
     /// index it was given (tok * k + j), which is `eparts`' own row - so `k_moe_out` combines one way either.
     /// A helper takes only the (layer, expert) pairs it really holds in its VRAM cache, not the whole layer: a P104
@@ -5973,6 +6338,18 @@ struct Engine {
         helper_wait_ent = 0;
         helper_wait_N = 0;
         if (nwin <= 0) return true;
+        // STRATA_Q36_PRIMARY_RES: this layer's row of the primary's residency, written before the begins.  The
+        // table is sized for every layer plus the MTP block's on the first window, so data() cannot move under a
+        // worker afterwards; the row is rewritten per layer because rebalance() moves the primary's slots.
+        const bool pres_on = primary_res_flag() && T <= (int) vrows && li < hy.size();
+        if (primary_res_flag()) {
+            const size_t need = ((size_t) g.n_layers + 1) * (size_t) g.n_expert;
+            if (primary_res_.size() < need) primary_res_.assign(need, -1);
+            int32_t* row = primary_res_.data() + li * (size_t) g.n_expert;
+            for (int64_t e = 0; e < g.n_expert; ++e) row[e] = li < hy.size() ? hy[li].slot_of[(size_t) e] : -1;
+        }
+        const int32_t* pres = pres_on ? primary_res_.data() : nullptr;
+        const size_t pres_base = li * (size_t) g.n_expert;
         // ONE COPY, TWO CONSUMERS (staged_* set by the hy_rows call site): this caller issues the D2H of `ids`/`h`
         // into `staged_ids`/`staged_x`, so staging the helper's window here is a HOST copy of the bytes that
         // landed - at decode (T=1, n_embd 2048, top_k 8) n_ent*4 + T*N*4 = 32 B + 8192 B = 8.2 KiB, roughly 1-2 us,
@@ -6039,6 +6416,9 @@ struct Engine {
             for (int64_t i = 0; i < n_ent; ++i) {
                 const int32_t e = h_helper_ids[i];
                 if (e < 0 || e >= (int32_t) m->g.n_expert) continue;
+                // the primary's slot wins this entry (begin_slot's primary_res yields it), so the mask must not
+                // claim it: the local grouped kernel skips every masked row and would leave it unwritten
+                if (pres != nullptr && pres[pres_base + (size_t) e] >= 0) continue;
                 bool own = false;
                 for (int w = 0; w < nwin && !own; ++w) own = helpers[(size_t) win[w]].holds((int64_t) li, e);
                 if (!own) continue;
@@ -6062,7 +6442,7 @@ struct Engine {
         } else
         for (int w = 0; w < nwin; ++w) {
             const int hi = win[w];
-            if (helpers[(size_t) hi].begin((int64_t) li, h_helper_x, h_helper_ids, T, Kp, nullptr, nullptr, err,
+            if (helpers[(size_t) hi].begin((int64_t) li, h_helper_x, h_helper_ids, T, Kp, nullptr, pres, err,
                                           sum_wts))
                 continue;
             std::fprintf(stderr, "strata-q36: helper CUDA%d, layer %zu: %s\n", hi + 1, li, err.c_str());
@@ -6105,18 +6485,25 @@ struct Engine {
     /// With STRATA_Q36_HELPER_PARALLEL_MARSHAL the helpers after the first harvest on their own workers, so the
     /// three harvests overlap (the helpers' ownerships are disjoint, so their host-side scatters write disjoint
     /// entries of the same staging buffer).  STRATA_Q36_HELPER_SUM: each helper writes T contiguous sum rows into
-    /// its own slot of `out` (`out + hi * MAXT * N`) so MARSHAL harvests never race.  Returns the helper that
+    /// its own slot of `out` (`out + hi * vrows * N`) so MARSHAL harvests never race.  Returns the helper that
     /// failed, or -1.
     int finish_window(const int* win, int nwin, float* out, std::string& err) {
         // HELPER_SUM: per-helper T-row slots. Default: one sparse buffer every helper scatters into by entry.
-        const size_t sum_stride = helper_sum() ? (size_t) strata::kernels::cpu::MAXT * (size_t) m->g.n_embd : 0;
+        const size_t sum_stride = helper_sum() ? (size_t) vrows * (size_t) m->g.n_embd : 0;
         auto out_for = [&](int hi) { return sum_stride ? out + (size_t) hi * sum_stride : out; };
         if (marshal_ok() && nwin > 1) {
             // The begins ran on the workers while the primary issued its own work: they must be done before the
-            // harvests (the same worker slots), and a begin that failed is reported here.
+            // harvests (the same worker slots), and a begin that failed is reported here.  This wait is required
+            // even when the harvest itself is serial (STRATA_Q36_MARSHAL_FINISH=0): every begin was posted to a
+            // worker, so the main thread must not touch that helper's stream until its begin has returned.
             for (int w = 0; w < nwin; ++w) {
                 std::string werr;
                 if (!marshal_wait(win[w], werr)) { err = werr; return win[w]; }
+            }
+            if (!marshal_finish()) {
+                for (int w = 0; w < nwin; ++w)
+                    if (!helpers[(size_t) win[w]].finish(out_for(win[w]), err)) return win[w];
+                return -1;
             }
             for (int w = 0; w < nwin; ++w)
                 if (win[w] != 0) marshal_post(win[w], 2, 0, 0, 0, nullptr, nullptr, out_for(win[w]));
@@ -6137,7 +6524,7 @@ struct Engine {
     /// STRATA_Q36_HELPER_SUM: pack each live helper's T-row weighted sum into peer_sums and zero the
     /// helper-owned eparts rows / weights so moe_end's combine matches PEER_SUM's shape.
     void helper_sum_combine(const int* win, int nwin, int N, int64_t n_ent) {
-        const size_t sum_stride = (size_t) strata::kernels::cpu::MAXT * (size_t) N;
+        const size_t sum_stride = (size_t) vrows * (size_t) N;
         peer_sums_n = 0;
         for (int w = 0; w < nwin; ++w) {
             const int hi = win[w];
@@ -6221,7 +6608,13 @@ struct Engine {
         // HELPER_SUM: finish wrote T-row sums into per-helper slots of helper_out; pack into peer_sums
         // (mask already on device from moe_helpers). Sparse path: stage + merge into eparts.
         if (helper_sum()) {
-            helper_sum_combine(win, nwin, wN, n_ent);
+            if (helper_timing()) {
+                const auto t_sumc = Clock::now();
+                helper_sum_combine(win, nwin, wN, n_ent);
+                d_h_sumc_ms += ms_since(t_sumc);
+            } else {
+                helper_sum_combine(win, nwin, wN, n_ent);
+            }
             return;
         }
         // Stage the helpers' sparse rows, then merge them into eparts where the mask marks them.
@@ -6281,6 +6674,12 @@ struct Engine {
     // False: every peer statement in this file is dead.  Set once, in peer_open(), and the ONLY reader that is not
     // behind an `if` is the ternary that picks moe_end's row map - which resolves to `rinv` when this is false.
     bool peer_prefill_on = false;
+    /// peer_open's answer to "does a helper hold EVERY expert of EVERY main layer": the precondition
+    /// STRATA_Q36_NO_HOST_EXPERTS needs, because without the host arena an unowned expert has no weights anywhere.
+    bool peer_all_owned = false;
+    /// place_experts' primary slot count, kept so the no-host-experts validation can refuse a configuration that
+    /// would need the arena for a slot copy.
+    int placed_slots = 0;
     /// [n_state * n_expert] host master, [n_state * n_expert] device mirror: 0xFF = the primary computes this
     /// (layer, expert), else the index of the helper whose cache holds it.  ONE table, read by the route kernels'
     /// skip, by stream_kick's run splitting and by the per-layer plan, so the three cannot disagree about who owns
@@ -6924,6 +7323,11 @@ struct Engine {
                     ++n_owned;
                 }
         }
+        // Every expert of every main layer is a helper's.  STRATA_Q36_NO_HOST_EXPERTS=1 has no arena to fall back
+        // to, so it reads this instead of assuming peer_prefill_on (which only says that SOME helper opened and
+        // that some experts are owned).  True is the normal shape on this box (the three caches tile the 256
+        // experts of every layer), but a helper that failed the copy probe leaves a gap that must be refused.
+        peer_all_owned = n_owned == (int64_t) g.n_layers * ne;
         CK(cudaMalloc((void**) &d_peer_owner, (size_t) n_state * (size_t) ne));
         CK(cudaMemcpy(d_peer_owner, peer_owner.data(), (size_t) n_state * (size_t) ne, cudaMemcpyHostToDevice));
         peer_lid = dalloc_t<int32_t>((size_t) tmax * m.top_k);
@@ -7115,8 +7519,22 @@ struct Engine {
             // Three buckets, as in Qwen3.8 Flash's expert pool: an entry a helper computed is already in `eparts`
             // and its expert has no primary slot, so the mask keeps the pool off it.
             h_miss[e] = H.slot_of[(size_t) x] < 0 && !(helper_masked(li) && helper_mask[(size_t) e]);
+            if (h_miss[e]) ++n_miss;
+        }
+        hy_cpu += n_miss;
+        hy_gpu += n_ent - n_miss;
+        // STRATA_Q36_NO_HOST_EXPERTS: the pool reads `L.hblobs`, so entries that fell to it have no weights behind
+        // them.  Every entry must be a helper's or a slot's; anything else ends the run rather than computing wrong.
+        // Before the job loop, so that no job is built on the null arena.
+        if (no_host_experts() && n_miss > 0) {
+            std::fprintf(stderr, "strata-q36: STRATA_Q36_NO_HOST_EXPERTS=1: layer %lld left %lld entries to the CPU "
+                                 "pool, which has no host copy of the experts to read\n",
+                         (long long) li, (long long) n_miss);
+            std::exit(1);
+        }
+        for (int e = 0; e < n_ent; ++e) {
             if (!h_miss[e]) continue;
-            ++n_miss;
+            const int x = h_ids[e];
             const int t = e / Kp;
             if (!quantized[(size_t) t]) {
                 C::native_quant_act(H.fmt, h_h + (size_t) t * N, acts + (size_t) t * C::kNativeActBytes);
@@ -7134,8 +7552,6 @@ struct Engine {
             j.out[j.nt] = cpu_out + (size_t) e * N;
             ++j.nt;
         }
-        hy_cpu += n_miss;
-        hy_gpu += n_ent - n_miss;
         if (n_miss == 0) return;
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
@@ -7159,6 +7575,8 @@ struct Engine {
             Hy& H = hy[li];
             const Layer& L = layer_at((int) li);
             const int S = L.n_slots;
+            // with STRATA_Q36_NO_HOST_EXPERTS there is no arena behind a slot copy, and S is 0 for every layer
+            // (validate_no_host_experts refuses any other placement), so this return is what keeps the copy below off
             if (S <= 0 || S >= ne) continue;
             std::vector<int> order((size_t) ne);
             for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
@@ -7385,8 +7803,12 @@ struct Engine {
     std::map<int, cudaGraphExec_t> row_graphs;   // by (rows, groups, kind): graphs of the batch windows
     /// A slot's rows of one window: `n` consecutive cells from the session's position (1: the next token; 2: also an MTP
     /// proposal the window verifies).
-    struct Group { int slot; int n; int32_t tok[2]; };
-    int32_t rows_pick[kVerify] = {};
+    // A group is one session's rows in a batch window: its own token, plus the proposals or drafts it verifies.
+    // `tok` was 2 (a token and one MTP proposal); DFlash2 verifies up to `--draft-cap` drafts in a row, so it is
+    // the window's row budget instead.  run_rows() only ever reads tok[0..n), so a larger array changes nothing
+    // for the 1- and 2-token groups the MTP path builds.
+    struct Group { int slot; int n; int32_t tok[kVerifyMax]; };
+    int32_t rows_pick[kVerifyMax] = {};
     int rows_G_last = 0;   // groups of the window run last (commit_rows takes their keep counts)
 
     void run_graph_key(int key, const std::function<void()>& body) {
@@ -7404,37 +7826,39 @@ struct Engine {
         int T = 0;
         for (int g = 0; g < G; ++g) {
             const Sess& ss = sess[(size_t) gr[g].slot];
-            hrow[40 + g] = gr[g].slot;
-            hrow[48 + g] = T;
-            hrow[56 + g] = gr[g].n;
+            hrow[kGrpSlot + g] = gr[g].slot;
+            hrow[kGrpRow0 + g] = T;
+            hrow[kGrpCnt + g] = gr[g].n;
             for (int j = 0; j < gr[g].n; ++j) {
                 hrow[T] = gr[g].tok[j];
-                hrow[8 + T] = (int32_t) (ss.pos + j);
-                hrow[16 + T] = gr[g].slot;
-                hrow[24 + T] = ss.rdelta;
+                hrow[kRowCell + T] = (int32_t) (ss.pos + j);
+                hrow[kRowSlot + T] = gr[g].slot;
+                hrow[kRowDelta + T] = ss.rdelta;
                 ++T;
             }
             pmax = std::max<int64_t>(pmax, ss.pos + gr[g].n - 1);
         }
         check_ids(hrow, T, "the batched rows' tokens");
         CK(cudaMemcpyAsync(tok, hrow, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_rcell, hrow + 8, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_rslot, hrow + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_rdelta, hrow + 24, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_gslot, hrow + 40, (size_t) G * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_grow0, hrow + 48, (size_t) G * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_gcnt, hrow + 56, (size_t) G * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_rcell, hrow + kRowCell, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_rslot, hrow + kRowSlot, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_rdelta, hrow + kRowDelta, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_gslot, hrow + kGrpSlot, (size_t) G * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_grow0, hrow + kGrpRow0, (size_t) G * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_gcnt, hrow + kGrpCnt, (size_t) G * 4, cudaMemcpyHostToDevice, st));
         mtab_now = nullptr;
         map_on = false;
         rows_mode = true;
         rows_G = G;
         rows_deferred = true;
-        run_graph_key((verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
+        // the key names the window's shape: the groups and the rows.  The row count has to be the HIGH part of the
+        // product's stride, or two shapes share a key (G*10 + T-G collided once a window could hold 16 rows).
+        run_graph_key((verify ? 1000 : 0) + G * 32 + T, [&] { forward(T, pmax, T, use_graph, verify); });
         rows_deferred = false;
         rows_mode = false;
-        CK(cudaMemcpyAsync(hrow + 32, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(hrow + kRowPick, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        for (int r = 0; r < T; ++r) rows_pick[r] = hrow[32 + r];
+        for (int r = 0; r < T; ++r) rows_pick[r] = hrow[kRowPick + r];
         if (!verify)
             for (int g = 0; g < G; ++g) sess[(size_t) gr[g].slot].pos += gr[g].n;
         pos = sess[(size_t) cur].pos;
@@ -7446,7 +7870,7 @@ struct Engine {
     }
     /// One window for the next token of each of the rows' sessions (no proposals): the greedy picks in rows_pick.
     void step_rows(const Row* rows, int nb) {
-        Group gr[kVerify];
+        Group gr[kVerifyMax];
         for (int r = 0; r < nb; ++r) gr[r] = {rows[r].slot, 1, {rows[r].tok, 0}};
         run_rows(gr, nb, false);
     }
@@ -7456,8 +7880,8 @@ struct Engine {
         const auto& g = m->g;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, C = (int) g.ssm_conv_channels;
         sess[(size_t) cur].pos = pos;
-        for (int i = 0; i < G; ++i) hrow[56 + i] = keep[i];   // (hrow's slot / first-row words are the window's, unchanged)
-        CK(cudaMemcpyAsync(d_gcnt, hrow + 56, (size_t) G * 4, cudaMemcpyHostToDevice, st));
+        for (int i = 0; i < G; ++i) hrow[kGrpCnt + i] = keep[i];   // (hrow's slot / first-row words are the window's, unchanged)
+        CK(cudaMemcpyAsync(d_gcnt, hrow + kGrpCnt, (size_t) G * 4, cudaMemcpyHostToDevice, st));
         rows_mode = true;
         rows_G = G;
         run_graph_key(2000 + G, [&] {
@@ -7481,32 +7905,32 @@ struct Engine {
     /// hidden at `seed` (device, n_embd floats); its draft - the block's greedy pick after that row - ends up in
     /// mtp_pick[r], and the block's K / V cells are written.
     struct MtpRow { int slot; int32_t tok; int64_t cell; const float* seed; };
-    int32_t mtp_pick[kVerify] = {};
+    int32_t mtp_pick[kVerifyMax] = {};
     float* logits_mr = nullptr;
     int32_t* pick_mr = nullptr;
     void mtp_rows(const MtpRow* rows, int T) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
         if (!logits_mr) {
-            logits_mr = dalloc((size_t) kVerify * g.n_vocab);
-            pick_mr = dalloc_t<int32_t>(kVerify);
+            logits_mr = dalloc((size_t) vrows * g.n_vocab);
+            pick_mr = dalloc_t<int32_t>(vrows);
         }
         sess[(size_t) cur].pos = pos;
         CK(cudaStreamSynchronize(st));
         int64_t pmax = 0;
         for (int r = 0; r < T; ++r) {
             hrow[r] = rows[r].tok;
-            hrow[8 + r] = (int32_t) rows[r].cell;
-            hrow[16 + r] = rows[r].slot;
-            hrow[24 + r] = sess[(size_t) rows[r].slot].rdelta;
+            hrow[kRowCell + r] = (int32_t) rows[r].cell;
+            hrow[kRowSlot + r] = rows[r].slot;
+            hrow[kRowDelta + r] = sess[(size_t) rows[r].slot].rdelta;
             pmax = std::max<int64_t>(pmax, rows[r].cell);
             CK(cudaMemcpyAsync(mtp_seed() + (size_t) r * N, rows[r].seed, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         }
         check_ids(hrow, T, "the MTP rows' tokens");
         CK(cudaMemcpyAsync(tok_m, hrow, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_rcell, hrow + 8, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_rslot, hrow + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
-        CK(cudaMemcpyAsync(d_rdelta, hrow + 24, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_rcell, hrow + kRowCell, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_rslot, hrow + kRowSlot, (size_t) T * 4, cudaMemcpyHostToDevice, st));
+        CK(cudaMemcpyAsync(d_rdelta, hrow + kRowDelta, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         mtab_now = nullptr;
         map_on = false;
         rows_mode = true;
@@ -7525,9 +7949,9 @@ struct Engine {
         });
         rows_deferred = false;
         rows_mode = false;
-        CK(cudaMemcpyAsync(hrow + 32, pick_mr, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(hrow + kRowPick, pick_mr, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
-        for (int r = 0; r < T; ++r) mtp_pick[r] = hrow[32 + r];
+        for (int r = 0; r < T; ++r) mtp_pick[r] = hrow[kRowPick + r];
     }
     /// Row r's logits of the last step_rows, on the host.
     void host_logits_row(int r, std::vector<float>& out) {
@@ -7584,7 +8008,7 @@ struct Engine {
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         // --suffix-draft: a lookup window replaces the MTP drafts for THIS round only, and only when the policy says
         // it beats them.  The room is the same clamp the MTP depth just took (a window must not cross a rebalance
-        // boundary, or its rows would mix two slot tables) and the verify graph's ceiling (gv[] stops at kVerify).
+        // boundary, or its rows would mix two slot tables) and the verify graph's ceiling (gv[] stops at kVerifyMax).
         // Decided HERE, before the MTP chain is submitted: a chain that is then thrown away has already cost its
         // drafts.  With the pointer null every line below is skipped and D is what the caller asked for.
         strata::qwen35::SuffixChoice sfx;
@@ -7593,7 +8017,7 @@ struct Engine {
             // A lookup window is still a verify window: it must not cross a rebalance boundary either, or its rows
             // mix two slot tables.  The clamp above already cut D; the room a lookup may ask for is that same cut,
             // not kVerify - 1.
-            int room = std::min(std::max(D, kVerify - 1), kVerify - 1);
+            int room = std::min(std::max(D, vrows - 1), vrows - 1);
             if (main_hybrid)
                 room = std::min(room, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
             sfx = suffix->choose(x_tok, D, std::max(0, room));
@@ -7607,7 +8031,7 @@ struct Engine {
         const bool df2_round = use_df2 && df2_have_drafts_ && !sfx.lookup;
         if (df2_round) {
             D = std::min(std::max(D, df2_pending_n_), df2_pending_n_);
-            D = std::min(D, kVerify - 1);
+            D = std::min(D, vrows - 1);
             if (main_hybrid)
                 D = std::min(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         }
@@ -7825,6 +8249,287 @@ struct Engine {
     /// chunk, a decode step and (with drafts) a speculative step at load do that before the first request; then the
     /// state, the cache position and the hybrid counters are as after load.
     bool warming = false;
+
+    /// STRATA_Q36_WARM_GPU_MS: how long the engine warms the cards at start-up, in milliseconds.  The default is
+    /// 600 ms; 0 turns the warm-up off.  A value that is not a number reads as 0 (off) and a negative one is clamped
+    /// to 0, so only a positive number turns the warm-up on.
+    ///
+    /// WHY IT EXISTS: the engine's own warm-up (one prompt chunk, a decode step, a speculative step) runs the PROMPT
+    /// on the primary alone - a prompt chunk keeps a helper-owned layer local, so the three P104 helpers never see
+    /// it.  Their memory clocks therefore sit at the idle 405 MHz (of 5005) until the first decode reaches them, and
+    /// each card ramps on its own schedule, so the decode waits for the slowest card to come up.  Here the cards are
+    /// warmed TOGETHER: one thread per card, all working to the same deadline.
+    ///
+    /// The warm-up touches no state of the engine - no session, no cache, no counter - and the scratch buffer is
+    /// freed again.  It runs before the service answers, so the first request finds the cards already up.
+    /// --no-warmup skips it with the rest of the warm-up; STRATA_Q36_WARM_GPU_MS=0 keeps the model's warm-up and
+    /// drops the cards' one.
+    static int warm_gpu_ms() {
+        static const int v = [] {
+            const char* e = std::getenv("STRATA_Q36_WARM_GPU_MS");
+            return e ? std::max(0, std::atoi(e)) : 600;
+        }();
+        return v;
+    }
+
+    /// Warm every card the engine uses: the primary and each open helper.  The threads share one deadline, so the
+    /// cards ramp together instead of one after the other.
+    void warmup_gpus() {
+        const int budget = warm_gpu_ms();
+        if (budget <= 0) return;
+        int prim = -1;
+        if (cudaGetDevice(&prim) != cudaSuccess || prim < 0) {
+            // The primary's ordinal is the engine's current device; if it cannot be read, say so instead of warming
+            // a card that may be a helper's.
+            std::fprintf(stderr, "strata-q36: GPU warm-up: skipped (the current CUDA device could not be read)\n");
+            return;
+        }
+        std::vector<int> devs;
+        devs.push_back(prim);
+        for (size_t r = 0; r < helpers.size(); ++r) {
+            if (!helper_on[r]) continue;
+            const int d = helpers[r].device();
+            bool seen = false;
+            for (int e : devs) if (e == d) seen = true;
+            if (!seen) devs.push_back(d);
+        }
+        const auto t0 = Clock::now();
+        const auto deadline = t0 + std::chrono::milliseconds(budget);
+        std::vector<int> warmed(devs.size(), 0);
+        std::vector<std::thread> th;
+        for (size_t i = 0; i < devs.size(); ++i) {
+            th.emplace_back([&warmed, i, dev = devs[i], deadline]() {
+                if (cudaSetDevice(dev) != cudaSuccess) return;
+                cudaStream_t s = nullptr;
+                if (cudaStreamCreate(&s) != cudaSuccess) return;
+                float* buf = nullptr;
+                const size_t bytes = 32u << 20;
+                if (cudaMalloc((void**) &buf, bytes) != cudaSuccess) { cudaStreamDestroy(s); return; }
+                const int n = (int) (bytes / sizeof(float));
+                if (cudaMemsetAsync(buf, 0, bytes, s) != cudaSuccess) {
+                    cudaFree(buf); cudaStreamDestroy(s); return;
+                }
+                bool worked = false;
+                while (Clock::now() < deadline) {
+                    for (int k = 0; k < 8; ++k) k_warm_gpu<<<512, 256, 0, s>>>(buf, n);
+                    // a refused launch leaves the error on the stream; the card did no work, so it is not warmed
+                    if (cudaStreamSynchronize(s) != cudaSuccess) { cudaGetLastError(); break; }
+                    worked = true;
+                }
+                cudaFree(buf);
+                cudaStreamDestroy(s);
+                if (worked) warmed[i] = 1;
+            });
+        }
+        for (std::thread& t : th) t.join();
+        std::string names;
+        for (size_t i = 0; i < devs.size(); ++i) {
+            if (!names.empty()) names += ", ";
+            names += "CUDA" + std::to_string(devs[i]) + (warmed[i] ? "" : " (not warmed)");
+        }
+        std::fprintf(stderr, "strata-q36: GPU warm-up: %.0f ms on %zu card(s): %s\n", ms_since(t0), devs.size(),
+                     names.c_str());
+    }
+
+    /// STRATA_Q36_KEEP_GPU_WARM_MS / _MIB: keep the HELPER cards' clocks up for as long as the engine runs, with a
+    /// burst of _MIB of traffic on each of them every _MS milliseconds.  The defaults are 500 ms and 64 MiB; _MS=0
+    /// turns the keeper off.  ON BY DEFAULT, deliberately: the box owner requires the keeper ("keeper 是一定要的"),
+    /// so this is a change to the default path rather than the opt-in a new feature usually gets.  _MS=0 removes the
+    /// keeper itself - its threads, its traffic and its UP lines - and nothing else: the separate one-shot warm-up
+    /// (STRATA_Q36_WARM_GPU_MS, warmup_gpus() at the end of warmup()) still runs its own burst either way.
+    ///
+    /// WHY IT EXISTS: the P104 helpers drop from their maximum memory clock (5005 MHz) to the idle 405 MHz - 282
+    /// GB/s to 17 GB/s - within a few hundred milliseconds of the last traffic, and a card in that state is slow
+    /// for the whole run: measured on this box 2026-11-04 (logs under .run/decode-timing-*, .run/decode-reset-*), a
+    /// stuck helper cost 1030-1053 us a layer against 226-276 for a healthy one, and the decode (which waits for
+    /// the slowest helper) ran at 60 tok/s instead of 110.  The primary is not in that state - its own prebegin
+    /// wait is identical in a slow and a fast run (205.6 against 203.3) - so the keeper covers the helpers only,
+    /// and the prompt, which runs on the primary alone, is left alone.
+    ///
+    /// The shape is measured, not guessed (.run/clockduty.cu + .run/R-clock-cold-20261104.sh, which cools a card
+    /// to 405 MHz before each pattern and then watches it): 1 MiB every 500 ms DECAYS back to 405 within 6 s;
+    /// 16 MiB every 500 ms does not hold either; 64 MiB every 500 ms holds 5005 for the whole 10 s run, and so
+    /// does 1 MiB every 100 ms - so the period matters more than the volume, and 500 ms needs a burst big enough
+    /// to be seen.  64 MiB is ~450 us of SM time every 500 ms (256 MB/s, 0.09 % of a P104's 282 GB/s); the denser
+    /// alternative, 1 MiB every 100 ms, is ~7 us every 100 ms.  The burst runs on its own non-blocking stream, so it
+    /// does not serialise with the helper's streams; it is not a LOWER priority than them - CUDA's least stream
+    /// priority is the default 0, so this API cannot express that.
+    ///
+    /// A keeper cannot fix a card that is ALREADY stuck: a stuck card ignores this pattern, a 256 MiB hammer at
+    /// 88 % memory utilization for 40 s, a 256 MiB burst every 1 ms, and five minutes of idle, and only
+    /// `nvidia-smi --gpu-reset -i N` (on an idle card) brings it back.  The keeper keeps a healthy card healthy;
+    /// it is not a repair, so a run that starts slow stays slow.  That is why it starts at the TOP of the process
+    /// (run(), before the model is read - see keep_gpus_warm_early) rather than when the helpers open: the load is
+    /// the long quiet stretch in which a card falls, and the fall is the thing to prevent.
+    ///
+    /// The state is static on purpose.  The engine's error paths (CK, and several explicit std::exit calls) leave
+    /// without unwinding `Engine`, and a thread that captured `this` would then read a dead object; these threads
+    /// capture nothing but three ints, and an atexit hook set the stop and joins them, so no joinable std::thread
+    /// is ever destroyed and none outlives the flag it reads.
+    static std::atomic<bool>& keep_stop_flag() {
+        static std::atomic<bool> f{false};
+        return f;
+    }
+    static std::vector<std::thread>& keep_threads() {
+        static std::vector<std::thread> v;
+        return v;
+    }
+    /// An integer from the environment: `dflt` when unset, not a number or out of range, `lo` as the floor and
+    /// `hi` as the ceiling.  A typo is reported rather than silently choosing a different keeper.
+    static int keep_env_int(const char* name, int dflt, int lo, int hi) {
+        const char* e = std::getenv(name);
+        if (!e) return dflt;
+        char* end = nullptr;
+        errno = 0;
+        const long v = std::strtol(e, &end, 10);
+        if (end == e || *end != '\0' || errno == ERANGE) {
+            std::fprintf(stderr, "strata-q36: ignoring %s=%s (not a number); using %d\n", name, e, dflt);
+            return dflt;
+        }
+        return (int) std::min<long>(std::max<long>(v, lo), hi);
+    }
+    static int keep_gpu_warm_ms() {
+        static const int v = keep_env_int("STRATA_Q36_KEEP_GPU_WARM_MS", 500, 0, 60000);
+        return v;
+    }
+    static int keep_gpu_warm_mib() {
+        static const int v = keep_env_int("STRATA_Q36_KEEP_GPU_WARM_MIB", 64, 1, 1024);
+        return v;
+    }
+    /// One keeper thread: hold `dev`'s clocks up by touching `mib` MiB every `period` ms until the flag is set.
+    /// Bursts are scheduled on absolute deadlines (like .run/clockduty.cu): a burst that outlasts `period` makes the
+    /// next one start at once rather than shifting the schedule, so the average rate stays the requested one.  A
+    /// period shorter than a burst therefore cannot be honoured - the achieved period is then the burst time - and
+    /// the wait is sliced at 10 ms so a stop does not wait out a whole period.
+    static void keep_gpus_warm_loop(int dev, int period, int mib) {
+        auto down = [dev](const char* what, cudaError_t e) {
+            std::fprintf(stderr, "strata-q36: keeper DOWN on CUDA%d: %s: %s\n", dev, what, cudaGetErrorString(e));
+        };
+        // Started before the model load, this thread is the FIRST thing to touch the card, and RemoteExperts::preflight
+        // needs its cudaInitDevice(ScheduleSpin | MapHost) to run before that device's primary context exists - it
+        // swallows the error if it does not.  Apply the same flags here, behind the same variable, so starting the
+        // keeper early does not silently hand the helper's waits back to the driver's sleep.  Same preprocessor
+        // guard as preflight: HIP has no cudaInitDevice of its own (its shim also moves the current device), and the
+        // Metal build has none at all.
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+        const char* spin = std::getenv("STRATA_REMOTE_SPIN");
+        if (!(spin && spin[0] == '0')) cudaInitDevice(dev, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
+        cudaGetLastError();
+#endif
+        cudaError_t e = cudaSetDevice(dev);
+        if (e != cudaSuccess) return down("cudaSetDevice", e);
+        cudaStream_t s = nullptr;
+        e = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+        if (e != cudaSuccess) return down("cudaStreamCreateWithFlags", e);
+        float* buf = nullptr;
+        const size_t bytes = (size_t) mib << 20;
+        e = cudaMalloc((void**) &buf, bytes);
+        if (e != cudaSuccess) {
+            down("cudaMalloc", e);
+            cudaStreamDestroy(s);
+            return;
+        }
+        e = cudaMemsetAsync(buf, 0, bytes, s);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+        if (e != cudaSuccess) {
+            down("cudaMemset", e);
+            cudaFree(buf);
+            cudaStreamDestroy(s);
+            return;
+        }
+        const int n = (int) (bytes / sizeof(float));
+        const auto t0 = Clock::now();
+        const auto period_us = std::chrono::microseconds(1000LL * period);
+        for (long long k = 0;; ++k) {
+            if (keep_stop_flag().load(std::memory_order_relaxed)) break;
+            k_warm_gpu<<<512, 256, 0, s>>>(buf, n);
+            e = cudaStreamSynchronize(s);
+            if (e != cudaSuccess) {
+                down("k_warm_gpu", e);
+                break;
+            }
+            if (k == 0)
+                std::fprintf(stderr, "strata-q36: keeper UP on CUDA%d: %d MiB every %d ms\n", dev, mib, period);
+            const auto next = t0 + period_us * (k + 1);
+            while (!keep_stop_flag().load(std::memory_order_relaxed)) {
+                const auto now = Clock::now();
+                if (now >= next) break;
+                const auto left = std::chrono::duration_cast<std::chrono::microseconds>(next - now);
+                std::this_thread::sleep_for(std::min<std::chrono::microseconds>(
+                    left, std::chrono::microseconds(10000)));
+            }
+        }
+        cudaFree(buf);
+        cudaStreamDestroy(s);
+    }
+    /// Spawn one keeper thread per device in `devs`.  Idempotent and cheap to call from anywhere: nothing happens
+    /// for an empty list or when the threads are already running (a restart would drop the clocks for a scheduling
+    /// round for nothing).  Each thread reports itself ("keeper UP" / "keeper DOWN") - this function cannot, it
+    /// returns before they run.
+    static void keep_gpus_warm_devices(const std::vector<int>& devs) {
+        const int period = keep_gpu_warm_ms();
+        if (period <= 0 || devs.empty()) return;
+        const int mib = keep_gpu_warm_mib();
+        std::vector<std::thread>& th = keep_threads();
+        if (!th.empty()) return;
+        keep_stop_flag().store(false);
+        // Register the exit hook BEFORE any thread exists: a throwing emplace_back would otherwise leave a joinable
+        // thread in the static vector with nothing to join it, and a std::thread destructor on a joinable thread
+        // calls std::terminate.
+        static std::once_flag once;
+        std::call_once(once, [] { std::atexit([] { keep_gpus_warm_stop(); }); });
+        for (int dev : devs) {
+            // No capture: the thread must not touch `this` (see the comment above on std::exit).
+            th.emplace_back([dev, period, mib]() { keep_gpus_warm_loop(dev, period, mib); });
+        }
+    }
+    /// Start the keeper from the command line, before the model is read: helper r is CUDA r+1 (the mapping
+    /// open_helpers uses), so the ordinals are known as soon as the arguments are parsed.  The primary is
+    /// deliberately NOT warmed: its memory clock does not drop on this box's P100, and it is the device every
+    /// free-VRAM decision below is made on (the prompt chunk, place_experts' slot count, Engine::init's fit test),
+    /// so a 64 MiB buffer held there could move a placement that has nothing to do with clocks.  The ordinal comes
+    /// from primary_device() rather than a hard-coded 0, so a box that names another card keeps its own primary.
+    ///
+    /// What it MAY cost: RemoteExperts::open sizes an `auto` helper's slots from the free memory it finds, one
+    /// expert-sized step at a time against a 512 MiB reserve, so the 64 MiB held here can take up to ~32 of ~3400
+    /// experts (~1 %) off a helper.  MEASURED on this box 2026-11-04: it takes none - the resident counts are
+    /// identical with and without the keeper (CUDA1 3440, CUDA2 3400, CUDA3 3400).  Either way it is the cheaper
+    /// side of the alternative: a card that falls to 405 MHz doubles the decode's wait.
+    static void keep_gpus_warm_early(const std::array<int, 3>& want) {
+        bool any = false;
+        for (int r = 0; r < 3; ++r) any = any || want[(size_t) r] > 0;
+        if (!any) return;
+        int count = 0;
+        if (const cudaError_t e = cudaGetDeviceCount(&count); e != cudaSuccess) {
+            std::fprintf(stderr, "strata-q36: keeper not started: cudaGetDeviceCount: %s\n", cudaGetErrorString(e));
+            cudaGetLastError();
+            return;
+        }
+        const int primary = strata::core::primary_device();
+        std::vector<int> devs;
+        for (int r = 0; r < 3; ++r) {
+            const int dev = r + 1;
+            if (want[(size_t) r] <= 0 || dev >= count || dev == primary) continue;
+            devs.push_back(dev);
+        }
+        keep_gpus_warm_devices(devs);
+    }
+    /// Start the keeper on the helpers the engine has actually opened.  A fallback for a host that never called
+    /// keep_gpus_warm_early(); on the engine's own path the threads are already running and this does nothing.
+    void keep_gpus_warm_start() {
+        std::vector<int> devs;
+        for (size_t r = 0; r < helpers.size(); ++r)
+            if (helper_on[r]) devs.push_back(helpers[r].device());
+        keep_gpus_warm_devices(devs);
+    }
+    static void keep_gpus_warm_stop() {
+        std::vector<std::thread>& th = keep_threads();
+        keep_stop_flag().store(true);
+        for (std::thread& t : th)
+            if (t.joinable()) t.join();
+        th.clear();
+    }
+
     void warmup() {
         const auto t0 = Clock::now();
         warming = true;
@@ -7856,12 +8561,15 @@ struct Engine {
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
         d_host_layer_ms = 0; d_host_layer_n = 0;
         d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_shared_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
+        d_h_sumc_ms = 0;
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: the GPU-segment accumulators reset with the host ones, or bench
                       // pass 1 would leak into pass 2 and into the AGG aggregate.
         pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason, for the prompt-chunk accumulators
         reset();
         std::fprintf(stderr, "strata-q36: warmed up in %.1f s (one prompt chunk, a decode step%s)\n",
                      ms_since(t0) / 1000.0, mtp_d > 0 ? ", a speculative step" : "");
+        warmup_gpus();
+        keep_gpus_warm_start();
     }
 
     /// --mtp-calibrate (opt-in): forget a throwaway pass's RECURRENT state, so the answer that follows starts from
@@ -7884,6 +8592,7 @@ struct Engine {
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
         d_host_layer_ms = 0; d_host_layer_n = 0;
         d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_shared_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
+        d_h_sumc_ms = 0;
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: same reason as in warmup()
         pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason
         row_ids.clear();
@@ -8038,6 +8747,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             }
             L->n_slots = (int) ne;
         }
+        E.placed_slots = 0;   // every layer's n_slots is ne here, so no layer is hybrid and no arena is ever read
         std::fprintf(stderr, "strata-q36: every routed expert in VRAM (%.2f GiB) in %.1f s\n", (double) total / (1 << 30),
                      ms_since(t0) / 1000.0);
         return true;
@@ -8056,6 +8766,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
     if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
+    // STRATA_Q36_NO_HOST_EXPERTS: a helper's window is at most vrows rows, so a batch of more than that has no
+    // helper to take its entries and falls to the primary's slots + the CPU pool - which reads the arena.  MEASURED
+    // (2026-11-04, warmup's 9-row kGemmT+1 pass): 72 of 72 entries reached the pool on layer 0.  So this band goes
+    // to the streamed prompt path instead, which reads the peers' own weights.  Validation refuses the run when
+    // that path does not exist (no MMQ), because then every batch would need the pool.
+    if (Engine::no_host_experts()) E.hybrid_t = std::min(E.hybrid_t, E.vrows);
     const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
@@ -8101,9 +8817,15 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     for (Layer* L : all)
         if ((!mtp_only || L == &m.mtp) && L->L.gu_type != 1 && L->L.d_type != 1)
             host += L->stride * (size_t) ne + kMmqTail;
+    // STRATA_Q36_NO_HOST_EXPERTS: no arena.  Whether that is SOUND cannot be decided here - the helpers' caches
+    // are opened after this function, and it is their ownership that says every expert has somewhere else to live.
+    // So this drops the arena, and Engine::validate_no_host_experts(), called once the helpers are open and before
+    // any forward runs, refuses the configuration when an expert would have no weights behind it.
+    if (Engine::no_host_experts()) host = 0;
+    E.placed_slots = S;
     uint8_t* arena = nullptr;
-    bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
-    if (!pinned) {
+    bool pinned = host != 0 && cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+    if (!pinned && host != 0) {
         (void) cudaGetLastError();
         arena = (uint8_t*) std::malloc(host);
         if (!arena) {
@@ -8126,8 +8848,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             L.n_slots = (int) ne;
             continue;
         }
-        if (L.L.gu_type == 1 || L.L.d_type == 1) {
+        if (L.L.gu_type == 1 || L.L.d_type == 1 || Engine::no_host_experts()) {
             // the F16 MTP block: no CPU pool (it has no F16 format), so no host copy of its experts either
+            // STRATA_Q36_NO_HOST_EXPERTS: no arena at all; the peers own every expert, or
+            // Engine::validate_no_host_experts() refuses the configuration
             L.hblobs = nullptr;
         } else {
             L.hblobs = arena + off;
@@ -8270,6 +8994,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
                      "%lld in VRAM, the rest on the CPU pool (its drafts only)\n", (double) total_main / (1 << 30), S,
                      (long long) ne);
+    else if (Engine::no_host_experts())
+        std::fprintf(stderr, "strata-q36: no host expert arena (STRATA_Q36_NO_HOST_EXPERTS=1): every expert of every "
+                 "layer claimed by a helper (checked once they are open), %d primary slot(s) a layer, bigger prompt "
+                 "chunks streamed (%.2f GiB staging); %.1f s\n", S, (double) staging / (1 << 30), ms_since(t0) / 1000.0);
     else
     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
                  "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
@@ -8426,6 +9154,8 @@ struct Slot {
     Clock::time_point t0;
     int32_t draft = 0;            // --batch-mtp: the MTP block's proposal for the token after `x`
     bool draft_ready = false;
+    std::vector<int32_t> drafts;   // DFlash2: the drafts this slot verifies (draft_ready says they are current)
+    int ndraft = 0;
     long long offered = 0, accepted = 0;
 };
 
@@ -8468,7 +9198,7 @@ struct Serve {
         }
     }
 
-    /// One decode window with MTP proposals (--batch-mtp): every active slot's next token, and for up to kVerify - S of the
+    /// One decode window with MTP proposals (--batch-mtp): every active slot's next token, and for up to vrows - S of the
     /// slots (the greedy ones, in turn) also the proposal its MTP block made: the window verifies both at once.  A slot whose
     /// proposal the main model confirms moves two tokens in the window.  The proposals for the next window come right after
     /// it, from the hidden states the window just produced (the first one of a slot from the state its prompt left).
@@ -8482,7 +9212,7 @@ struct Serve {
         const int S = (int) act.size();
         if (S == 0) return;
         // who verifies a proposal this window: the greedy slots in turn, as many as fit beside one row per slot
-        const int room = Engine::kVerify - S;
+        const int room = E.vrows - S;
         std::vector<char> cand((size_t) S, 0);
         int nc = 0;
         for (int k = 0; k < S && nc < room; ++k) {
@@ -8593,7 +9323,7 @@ struct Serve {
         if (!nx.empty()) {
             // (more rows than the window holds: the proposals come in two calls)
             for (size_t at = 0, k = 0; at < nx.size();) {
-                size_t take = std::min<size_t>(nx.size() - at, Engine::kVerify);
+                size_t take = std::min<size_t>(nx.size() - at, E.vrows);
                 while (take > 0 && at + take < nx.size() && nx[at + take].slot == nx[at + take - 1].slot) --take;   // a slot's rows together
                 E.mtp_rows(nx.data() + at, (int) take);
                 for (; k < nx_last.size() && (size_t) nx_last[k] < at + take; ++k) {
@@ -8606,14 +9336,192 @@ struct Serve {
         }
     }
 
+#if defined(STRATA_HAVE_DFLASH2)
+    /// One window carrying EVERY active slot's own verify rows (STRATA_Q36_SERVE_DF2).  Each slot contributes
+    /// [x, d1 .. dn] with n = its drafts + 1, the window verifies them together, and each slot keeps the prefix of
+    /// its own picks that agrees with its own drafts.  This is what fills the helper window: one layer now carries
+    /// two to four sessions' rows, so the fixed per-layer terms (prebegin, mixer, combine) are paid once for all of
+    /// them.  Drafting happens per slot AFTER the window - draft() also records that slot's committed rows into its
+    /// own ring, so no separate context() call is needed on the decode path.
+    void window_df2() {
+        poll_control();
+        const int N = (int) E.m->g.n_embd;
+        std::vector<int> act;
+        for (int b = 0; b < E.n_sess; ++b)
+            if (slots[(size_t) b].active) act.push_back(b);
+        if (act.empty()) return;
+        Engine::Group gr[Engine::kVerifyMax];
+        std::vector<int> base(act.size(), -1);
+        std::vector<int64_t> spos(act.size(), 0);
+        int G = 0, T = 0;
+        for (size_t i = 0; i < act.size(); ++i) {
+            Slot& sl = slots[(size_t) act[i]];
+            int n = 1;
+            if (sl.draft_ready && !sl.smp.needs_logits() && sl.ndraft > 0)
+                n = std::min(sl.ndraft, E.vrows - 1) + 1;
+            if (T + n > E.vrows) n = 1;   // no room left: this slot decodes its plain row
+            if (T + n > E.vrows) break;
+            // base/spos are indexed by GROUP: every slot that gets a group is one, in order, so i == G here
+            base[(size_t) G] = T;
+            spos[(size_t) G] = E.sess[(size_t) act[i]].pos;
+            gr[G].slot = act[i];
+            gr[G].n = n;
+            gr[G].tok[0] = sl.x;
+            for (int d = 1; d < n; ++d) gr[G].tok[d] = sl.drafts[(size_t) (d - 1)];
+            ++G;
+            T += n;
+        }
+        if (G == 0) return;
+        // A prompt chunk's context() rows are queued on the drafter's own stream and read the tap buffer this window
+        // is about to overwrite from row 0.  Order the engine stream after them rather than blocking the host.
+        if (!E.df2_tap_ev_) CK(cudaEventCreateWithFlags(&E.df2_tap_ev_, cudaEventDisableTiming));
+        CK(cudaEventRecord(E.df2_tap_ev_, E.df2.stream()));
+        CK(cudaStreamWaitEvent(E.st, E.df2_tap_ev_));
+        // capture this window's residual rows: tap_first_ far below every position keeps tap_row0_ at 0
+        E.tap_on_ = true;
+        E.tap_first_ = std::numeric_limits<int64_t>::min() / 4;
+        int keep[Engine::kVerifyMax] = {};
+        // STRATA_Q36_SERVE_TIMING=1: this window's own share of the cumulative counters, so the prompts' layers
+        // (which run between the windows) stay out of the decode's split.
+        E.serve_window_snap();
+        E.run_rows(gr, G, true);
+        E.serve_window_acc();
+        // Emit, then commit - the same order as window_mtp, because host_logits_row reads the verify window's own
+        // hidden rows and commit_rows overwrites the scratch the GDN layers use.  keep[g] is what was ACTUALLY
+        // emitted: a slot that ends inside its drafts keeps only up to the token that ended it, so the state it
+        // carries forward and its live list agree.
+        for (int g = 0; g < G; ++g) {
+            const int b = gr[g].slot;
+            Slot& sl = slots[(size_t) b];
+            Engine::Sess& ss = E.sess[(size_t) b];
+            const int r0 = base[(size_t) g];
+            // the draft this window confirms is the longest prefix of its own picks that equals its own drafts
+            int a = 0;
+            while (a < gr[g].n - 1 && E.rows_pick[r0 + a] == gr[g].tok[a + 1]) ++a;
+            sl.offered += gr[g].n - 1;   // the drafts this window actually tested (a cut group tests fewer)
+            sl.accepted += a;
+            const char* fin = nullptr;
+            int em = 0;
+            for (int j = 0; j <= a; ++j) {
+                int32_t y;
+                if (j == 0 && sl.smp.needs_logits()) {   // a sampled slot runs a one-row group: the sampler decides
+                    E.host_logits_row(r0, lg);
+                    y = sample(lg, sl.smp, sl.hist, sl.rng);
+                } else {
+                    y = E.rows_pick[r0 + j];
+                }
+                ss.live.push_back(gr[g].tok[j]);   // live holds what the state has SEEN, as window_plain does
+                std::printf("BT %d %d\n", b, y);
+                ++sl.produced;
+                sl.hist.push_back(y);
+                ++em;
+                sl.x = y;
+                if (is_eos(y)) { fin = "stop"; break; }
+                if (sl.stop) { fin = "cancel"; break; }
+                if (sl.produced >= sl.max_new) { fin = "length"; break; }
+                if (ss.pos + j + 1 > E.ctx) { fin = "length"; break; }
+            }
+            keep[g] = em;
+            if (fin != nullptr) {
+                std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms_since(sl.t0));
+                sl.active = false;
+                ss.active = false;
+                sl.draft_ready = false;
+                --n_active;
+            }
+        }
+        E.commit_rows(gr, keep, G);
+        // the per-slot tap regions.  Slot 0's region IS the shared tap buffer and its window base is 0 (it is group
+        // 0 whenever it is active), so it needs no copy; every other active slot's kept rows go into its own region.
+        const int nt = (int) E.df2.tap_layers().size();
+        const size_t per = (size_t) E.m->g.n_embd;
+        for (int g = 0; g < G; ++g) {
+            const size_t s = (size_t) gr[g].slot;
+            if (s == 0) continue;
+            if (E.df2_slot_taps.size() <= s) continue;   // (reported by the draft below, not a reason to skip the others)
+            CK(cudaMemcpyAsync(E.df2_slot_taps[s],
+                               E.tap_dev_ + (size_t) base[(size_t) g] * (size_t) nt * per,
+                               (size_t) keep[g] * (size_t) nt * per * sizeof(float),
+                               cudaMemcpyDeviceToDevice, E.st));
+        }
+        CK(cudaStreamSynchronize(E.st));
+        // Every slot's round is launched first and read after: each drafter is on its own stream, so the rounds run
+        // at the same time instead of one behind another.  (draft() would launch and wait per slot.)
+        std::vector<int> pend;
+        for (int g = 0; g < G; ++g) {
+            const int b = gr[g].slot;
+            Slot& sl = slots[(size_t) b];
+            if (!sl.active) continue;
+            if (sl.smp.needs_logits()) {   // no drafts are trusted under sampling: it decodes one row a window
+                sl.ndraft = 0;
+                sl.draft_ready = false;
+                continue;
+            }
+            // this slot's next drafts, from the window's own taps for the rows it kept.  The buffer is kDrafts wide
+            // because draft_finish() fills all kDrafts entries (zeros past the drafter's own depth), not just n.
+            sl.drafts.assign((size_t) strata::core::Dflash2Drafter::kDrafts, 0);
+            const size_t reg = (size_t) b;
+            std::string e;
+            bool ok = keep[g] > 0 && E.df2_slot_taps.size() > reg;
+            if (!ok) e = "no tap region for this slot";
+            else ok = E.df2_of(b).draft_launch(E.df2_slot_taps[reg], keep[g], spos[(size_t) g], sl.x, e);
+            if (ok) { pend.push_back(g); continue; }
+            sl.ndraft = 0;
+            sl.draft_ready = false;
+            // a failed draft does not fail again on its own: fall back to the plain window for good
+            std::fprintf(stderr, "strata-q36: dflash2 serve slot %d draft failed: %s; falling back\n", b, e.c_str());
+            E.df2_serve = false;
+            E.use_df2 = false;
+        }
+        for (size_t k = 0; k < pend.size() && E.use_df2; ++k) {
+            const int g = pend[k];
+            const int b = gr[g].slot;
+            Slot& sl = slots[(size_t) b];
+            float probs[strata::core::Dflash2Drafter::kDrafts] = {};
+            std::string e;
+            if (!E.df2_of(b).draft_finish(sl.drafts.data(), probs, e)) {
+                sl.ndraft = 0;
+                sl.draft_ready = false;
+                std::fprintf(stderr, "strata-q36: dflash2 serve slot %d draft failed: %s; falling back\n", b, e.c_str());
+                E.df2_serve = false;
+                E.use_df2 = false;
+                break;
+            }
+            // the same confidence trim as the single stream's round (--draft-conf): drop the tail whose chain
+            // probability has fallen below the threshold, rather than offer drafts that are likely to be wasted
+            int nd = E.df2_slot_cap;
+            if (E.df2_conf > 0.0) {
+                double chain = 1.0;
+                int j = 0;
+                for (; j < nd; ++j) {
+                    chain *= (double) probs[j];
+                    if (chain < E.df2_conf) break;
+                }
+                nd = j;
+            }
+            sl.ndraft = nd;
+            sl.draft_ready = nd > 0;
+        }
+        if (!E.use_df2)   // a failed round leaves the slots behind it holding the previous round's drafts
+            for (int g = 0; g < G; ++g) {
+                slots[(size_t) gr[g].slot].ndraft = 0;
+                slots[(size_t) gr[g].slot].draft_ready = false;
+            }
+        std::fflush(stdout);
+    }
+#endif
+
     /// One decode window over every active slot: one token each.
     void window() {
         poll_control();
+#if defined(STRATA_HAVE_DFLASH2)
+        if (E.df2_serve && E.use_df2) { window_df2(); return; }
+#endif
         if (E.bmtp && E.mtp_d > 0) {   // proposals need a row to spare and a slot that decodes greedily
             int act = 0, greedy = 0;
             for (const Slot& sl : slots)
                 if (sl.active) { ++act; greedy += !sl.smp.needs_logits(); }
-            if (greedy > 0 && Engine::kVerify - act > 0) { window_mtp(); return; }
+            if (greedy > 0 && E.vrows - act > 0) { window_mtp(); return; }
         }
         window_plain();
     }
@@ -8798,14 +9706,14 @@ struct Serve {
             ss.imgs.clear();
             if (E.suffix) E.suffix->reset();
 #if defined(STRATA_HAVE_DFLASH2)
-            E.df2_clear_request();
+            E.df2_clear_slot(s);
 #endif
         } else {
 #if defined(STRATA_HAVE_DFLASH2)
             // the drafter's ring only holds committed rows of THIS session: a fresh tail was not fed through it,
             // so the ring is stale - reset it and let the first plain step seed it again
             if (E.use_df2 && ids.size() > reuse) {
-                E.df2_clear_request();
+                E.df2_clear_slot(s);
                 std::fprintf(stderr, "strata serve: session %d: %zu reused: dflash2's ring starts empty\n",
                              s, reuse);
             }
@@ -9132,7 +10040,7 @@ inline std::vector<HelperStripe> helper_layer_stripes(const std::array<int, 3>& 
 /// already computed per layer, so the helper reads exactly the bytes `load()` would have read from the file.
 ///
 /// WHY WHOLE LAYERS (the default).  A helper computes a routed window through `RemoteExperts::begin/finish`, which
-/// keys its output on the entry index it is given (tok * k + j) and takes a window of at most MAXT tokens.  Handing a
+/// keys its output on the entry index it is given (tok * k + j) and takes a window of at most vrows tokens.  Handing a
 /// helper one whole layer makes "which entries are the helper's" a question with one answer - all of them - so the
 /// local grouped kernel is skipped for that layer and no entry can be computed twice or left stale.  Layers are
 /// striped across the helpers in order, which keeps a helper's experts of adjacent layers together.
@@ -9343,7 +10251,7 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
         const int slots = want[(size_t) r] == std::numeric_limits<int>::max() ? (1 << 20) : want[(size_t) r];
         if (!E.helpers[(size_t) r].open(device, slots, hl_layers, g.n_expert, tier.ranked, empty_primary,
                                         E.helper_src, claimed, err, auto_size[(size_t) r], g.n_embd, g.n_ff,
-                                        m.top_k, &layouts)) {
+                                        m.top_k, &layouts, E.vrows)) {
             err = "helper CUDA" + std::to_string(device) + ": " + err;
             return false;
         }
@@ -9392,15 +10300,15 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
         for (const HelperStripe& stripe : stripes)
             for (int64_t l = stripe.lo; l < stripe.hi; ++l) E.helper_of_layer[(size_t) l] = (int8_t) stripe.r;
     }
-    // host staging for the offloaded windows (MAXT tokens: the largest window begin() takes)
-    const size_t T = (size_t) strata::kernels::cpu::MAXT;
+    // host staging for the offloaded windows (vrows tokens: the largest window begin() takes)
+    const size_t T = (size_t) E.vrows;
     CK(cudaHostAlloc((void**) &E.h_helper_ids, T * (size_t) m.top_k * 4, cudaHostAllocDefault));
     CK(cudaHostAlloc((void**) &E.h_helper_x, T * (size_t) g.n_embd * 4, cudaHostAllocDefault));
     // the per-entry mask the masked grouping kernels read, for every tier above: the all-in-VRAM placement never
     // reaches place_experts' hybrid branch, where this is otherwise allocated
     if (E.d_helper_mask == nullptr) CK(cudaMalloc(&E.d_helper_mask, E.tmax * (size_t) m.top_k));
-    // HELPER_SUM: [3][MAXT][N] per-helper T-row sums (disjoint slots for MARSHAL harvest).
-    // Default: one sparse [MAXT*K][N] buffer the helpers scatter into by entry index.
+    // HELPER_SUM: [3][vrows][N] per-helper T-row sums (disjoint slots for MARSHAL harvest).
+    // Default: one sparse [vrows*K][N] buffer the helpers scatter into by entry index.
     if (E.helper_sum()) {
         CK(cudaHostAlloc((void**) &E.helper_out, 3 * T * (size_t) g.n_embd * 4, cudaHostAllocDefault));
         CK(cudaHostAlloc((void**) &E.h_helper_wts, T * (size_t) m.top_k * 4, cudaHostAllocDefault));
@@ -9415,6 +10323,14 @@ bool open_helpers(Model& m, Engine& E, const std::array<int, 3>& want, const std
     // STRATA_Q36_PREFILL_PEERS: the prompt-chunk executors, one per helper that opened, behind the feature's own
     // gates (the variable, the MMQ path this chunk branch needs, and a real two-way P2P copy test per helper).
     // With the variable unset this is one `getenv` and an early return: nothing is allocated, nothing is printed.
+    // The helpers' memory clocks are what the decode's floor is made of (see keep_gpu_warm_ms).  This call is the
+    // FALLBACK: the engine's own path starts the keeper in run(), before the model is even read, so by here the
+    // threads are running and this does nothing.  It still matters for a host that constructs an Engine without
+    // going through run().  It used to be the only start point, and it was late enough to lose: the helpers' last
+    // weight upload lifts their clocks, the 3.9 s warm-up then runs on the primary alone, and two of three cards
+    // fell to 405 MHz in that gap - where traffic no longer lifts them (an arm with the keeper already running
+    // measured 1059 us/layer on a card it could not wake).
+    E.keep_gpus_warm_start();
     if (E.prefill_peers() && E.use_mmq) E.peer_open(m, layouts.data());
     return true;
 }
@@ -9616,6 +10532,11 @@ int strata::qwen35::run(int argc, char** argv) {
         mtp_calib = 0;
     }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
+    // The helper cards' clocks, from the first moment the process is committed to using them: the load below is the
+    // long quiet stretch on those cards, and a card that falls to 405 MHz during it is not lifted again by traffic
+    // (measured 2026-11-04 - see keep_gpu_warm_ms).  Everything the keeper needs is known by now: the ordinals come
+    // from the --expert-cache-deviceN flags, and CUDA_VISIBLE_DEVICES was set before this family's run() was entered.
+    Engine::keep_gpus_warm_early(expert_cache_remote);
     Model m;
     std::string err;
     try {
@@ -9639,7 +10560,7 @@ int strata::qwen35::run(int argc, char** argv) {
     bool df2_loaded = false;
     if (draft_kind == "dflash2" && draft_model.empty())
         std::fprintf(stderr, "strata-q36: --draft dflash2 needs --draft-model PACK; the MTP drafts instead\n");
-    else if (draft_kind == "dflash2" && batch > 0)
+    else if (draft_kind == "dflash2" && batch > 0 && !serve_mode)
         std::fprintf(stderr, "strata-q36: --draft dflash2 is not for --batch in this build; the MTP drafts instead\n");
     else if (draft_kind == "dflash2") {
         if (!E.df2.load(draft_model, 0, d2err)) {
@@ -9737,6 +10658,16 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
     }
+    // STRATA_Q36_NO_HOST_EXPERTS: the arena is already gone (place_experts dropped it); this is the one point where
+    // the helpers' ownership is known and no forward has run, so a configuration that would starve an expert stops
+    // here with the way out instead of computing garbage later.
+    if (Engine::no_host_experts()) {
+        std::string nerr;
+        if (!E.validate_no_host_experts(nerr)) {
+            std::fprintf(stderr, "strata-q36: %s\n", nerr.c_str());
+            return 1;
+        }
+    }
     // STRATA_Q36_HELPER_PARALLEL_MARSHAL=1: the workers that begin and harvest the helpers after the first
     // (see Engine::marshal_loop).  Started here, because the helpers must be open first.
     E.marshal_start();
@@ -9812,6 +10743,34 @@ int strata::qwen35::run(int argc, char** argv) {
                 std::fprintf(stderr, "strata-q36 DFLASH2: %lld rounds, %.3f ms/round drafting (GPU %.3f ms/round), %.0f MiB VRAM\n",
                              (long long) E.df2.rounds, E.df2.ms_draft / (double) E.df2.rounds,
                              E.df2.ms_gpu / (double) E.df2.rounds, E.df2.vram_bytes() / (1024.0 * 1024.0));
+            // STRATA_Q36_SERVE_TIMING=1 + STRATA_Q36_HELPER_TIMING=1: the serve window's own per-layer split.
+            // The numbers are the sum over the decode windows only (the prompts' layers are excluded by the
+            // per-window delta) and are divided by the number of layer() calls those windows made, so they are
+            // directly comparable to the generate path's GEN lines.  The flag-off path prints nothing.
+            if (E.s_taken && E.serve_timing() && E.helper_timing()) {
+                const long long layers = E.s_hln;
+                if (layers > 0) {
+                    const double L = (double) layers;
+                    std::fprintf(stderr,
+                                 "strata-q36 SERVE primary: %.1f us/layer | prebegin_sync=%.1f route_spin=%.1f host_own=%.1f "
+                                 "| mixer=%.1f begin=%.1f local=%.1f shared=%.1f cpu=%.1f finish=%.1f (us/layer)\n",
+                                 1000.0 * E.s_hl / L, 1000.0 * E.s_pre / L, 1000.0 * E.s_spin / L,
+                                 1000.0 * (E.s_hl - E.s_pre) / L,
+                                 1000.0 * E.s_hm / L, 1000.0 * E.s_hb / L, 1000.0 * E.s_hlo / L,
+                                 1000.0 * E.s_hsh / L, 1000.0 * E.s_hcpu / L, 1000.0 * E.s_hf / L);
+                    std::fprintf(stderr, "strata-q36 SERVE primary: finish split: sum_combine=%.1f rest=%.1f (us/layer)\n",
+                                 1000.0 * E.s_hsc / L, 1000.0 * (E.s_hf - E.s_hsc) / L);
+                    for (int r = 0; r < 3; ++r) {
+                        if (!E.helper_on[(size_t) r]) continue;
+                        std::fprintf(stderr,
+                                     "strata-q36 SERVE helper CUDA%d: %.1f us/layer | ms_begin=%.1f ms_wait=%.1f "
+                                     "ms_sync_overhead=%.1f (us/layer)\n",
+                                     r + 1, 1000.0 * (E.s_hb3[r] + E.s_hw3[r]) / L, 1000.0 * E.s_hb3[r] / L,
+                                     1000.0 * E.s_hw3[r] / L, 1000.0 * E.s_ho3[r] / L);
+                    }
+                    std::fprintf(stderr, "strata-q36 SERVE: %lld layers\n", layers);
+                }
+            }
 #endif
             if (!E.m->hybrid) return;
             if (E.helpers_enabled())
@@ -9832,10 +10791,13 @@ int strata::qwen35::run(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
     // the drafter's pack was loaded early (before the engine's init and expert placement, so the expert cache's
     // free-VRAM reading sees it and gives back rather than the drafter's cudaMalloc failing here); now bind its
-    // tap staging, which needs the engine sized (chunk, kVerify) but not the experts placed.
+    // tap staging, which needs the engine sized (chunk, vrows) but not the experts placed.
     if (df2_loaded) {
         if (!E.df2_bind(d2err)) {
             std::fprintf(stderr, "strata-q36: dflash2 bind failed: %s; the MTP drafts instead\n", d2err.c_str());
+            E.use_df2 = false;
+        } else if (!E.df2_bind_slots(E.n_sess, d2err)) {
+            std::fprintf(stderr, "strata-q36: dflash2 serve bind failed: %s; DFlash2 off\n", d2err.c_str());
             E.use_df2 = false;
         } else {
             std::fprintf(stderr, "strata-q36: DFlash2 drafter on (%s, D=%d, tap staging %d rows, graphs captured in %.0f ms)\n",
@@ -10134,9 +11096,9 @@ int strata::qwen35::run(int argc, char** argv) {
                         (double) toks.size() / (pp_ms / 1000.0), bench_tg,
                         bench_tg > 0 ? (double) bench_tg / (tg_ms / 1000.0) : 0.0);
             // STRATA_Q36_MIXER_GRAPH=1: what the flag did, so a run that shows no speed-up can say why.
-            if (E.mixer_graph_flag())
-                std::fprintf(stderr, "strata-q36: STRATA_Q36_MIXER_GRAPH: %d layer graphs captured, %d captures "
-                             "refused by the driver\n", E.mixer_ge_captured, E.mixer_ge_failed);
+            if (E.mixer_graph_flag() || E.mixer_graph_v_flag())
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_MIXER_GRAPH: flags: %s| %d layer graphs captured, %d captures "
+                             "refused by the driver\n", E.mixer_graph_flags().c_str(), E.mixer_ge_captured, E.mixer_ge_failed);
             if (helper_timing && bench_tg > 0)
                 for (int r = 0; r < 3; ++r) {
                     if (E.helpers[(size_t) r].resident() <= 0) continue;
@@ -10609,13 +11571,13 @@ int strata::qwen35::run(int argc, char** argv) {
         // The gate is the same exact-"1" test Engine::helper_timing() applies, so with the flag unset not one
         // statement of this block runs and the default path is byte-identical.
         const bool df2_timing = Engine::helper_timing();
-        double t_pre0 = 0, t_spin0 = 0, t_hl0 = 0, t_hm0 = 0, t_hb0 = 0, t_hlo0 = 0, t_hsh0 = 0, t_hcpu0 = 0, t_hf0 = 0;
+        double t_pre0 = 0, t_spin0 = 0, t_hl0 = 0, t_hm0 = 0, t_hb0 = 0, t_hlo0 = 0, t_hsh0 = 0, t_hcpu0 = 0, t_hf0 = 0, t_hsc0 = 0;
         long long t_pn0 = 0, t_sn0 = 0, t_hln0 = 0;
         double t_hb[3] = {}, t_hw[3] = {}, t_ho[3] = {};
         if (df2_timing) {
             t_pre0 = E.d_prebegin_ms; t_spin0 = E.d_route_spin_ms; t_hl0 = E.d_host_layer_ms;
             t_hm0 = E.d_h_mixer_ms; t_hb0 = E.d_h_begin_ms; t_hlo0 = E.d_h_local_ms;
-            t_hsh0 = E.d_h_shared_ms; t_hcpu0 = E.d_h_cpu_ms; t_hf0 = E.d_h_finish_ms;
+            t_hsh0 = E.d_h_shared_ms; t_hcpu0 = E.d_h_cpu_ms; t_hf0 = E.d_h_finish_ms; t_hsc0 = E.d_h_sumc_ms;
             t_pn0 = E.d_prebegin_n; t_sn0 = E.d_route_spin_n; t_hln0 = E.d_host_layer_n;
             for (int r = 0; r < 3; ++r) {
                 t_hb[r] = E.helpers[(size_t) r].ms_begin();
@@ -10717,6 +11679,9 @@ int strata::qwen35::run(int argc, char** argv) {
                              1000.0 * (E.d_h_mixer_ms - t_hm0) / L, 1000.0 * (E.d_h_begin_ms - t_hb0) / L,
                              1000.0 * (E.d_h_local_ms - t_hlo0) / L, 1000.0 * (E.d_h_shared_ms - t_hsh0) / L,
                              1000.0 * (E.d_h_cpu_ms - t_hcpu0) / L, 1000.0 * (E.d_h_finish_ms - t_hf0) / L);
+                std::fprintf(stderr, "strata-q36 GEN primary: finish split: sum_combine=%.1f rest=%.1f (us/layer)\n",
+                             1000.0 * (E.d_h_sumc_ms - t_hsc0) / L,
+                             1000.0 * (E.d_h_finish_ms - t_hf0 - (E.d_h_sumc_ms - t_hsc0)) / L);
                 for (int r = 0; r < 3; ++r) {
                     if (!E.helper_on[(size_t) r]) continue;
                     const double hb = E.helpers[(size_t) r].ms_begin() - t_hb[r];

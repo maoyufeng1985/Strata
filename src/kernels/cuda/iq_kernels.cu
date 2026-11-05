@@ -4403,7 +4403,12 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 #define STRATA_DOWN_WS_BUILT 0
 #endif
 #if STRATA_DOWN_WS_BUILT
-#define STRATA_DWS_VMAD(r, a, sa, b, sb) asm("vmad.s32.s32.s32 %0, %1.b" #sa ", %2.b" #sb ", %0;" : "+r"(r) : "r"(a), "r"(b))
+// Early clobber ("+&r") for the same reason as strata_dp4a in dp4a.hpp: with plain "+r" NVCC may give the
+// accumulator the same register as a or b, so the value carried into the next expansion is lost (upstream #4274).
+// One expansion is a single instruction and cannot alias with itself; the chain that matters is dws_iq4_apply /
+// dws_q2_apply, which issue eight of these on one accumulator, are force-inlined into a kernel declared
+// __launch_bounds__(256, 4), and are read by the compiler as eight separate asm statements it may interleave.
+#define STRATA_DWS_VMAD(r, a, sa, b, sb) asm("vmad.s32.s32.s32 %0, %1.b" #sa ", %2.b" #sb ", %0;" : "+&r"(r) : "r"(a), "r"(b))
 
 __device__ __forceinline__ uint32_t dws_prmt(uint32_t a, uint32_t b, uint32_t c) {
     uint32_t d;
