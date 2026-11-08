@@ -1735,6 +1735,270 @@ __global__ void __launch_bounds__(512) k_gdn_chunked(float* state, const float* 
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * row_stride] = sv[r];
 }
+/// STRATA_Q36_GDN_WY=1: the GDN recurrence as TWO phases, which is the shape tqLLM runs and the reason its chunked
+/// scan is 4.15x on GB10 (src/models/qwen/qwen4exp/gdn_seq_fast.cuh + fn_gdn_wy_k).  k_gdn_chunked above is the same
+/// arithmetic arranged badly: it does the (I+M)^-1 substitution INSIDE the scan, so the chunk costs one barrier a
+/// token - the chain length of the kernel it was meant to replace - and that is the whole of its measured 12% loss.
+/// Here the inverse is formed once per (head, chunk) in a phase that runs all chunks at once, and the sequential
+/// phase is left with an affine recurrence and a handful of barriers a chunk.
+///
+/// BOTH KERNELS MUST FIT IN 48 KiB OF SHARED MEMORY.  That is the ceiling on sm_60/sm_61 (P100/P104) for ANY block,
+/// opt-in included - the 64 KiB opt-in starts at Volta.  An earlier version of this code asked for 58 KiB and 97 KiB
+/// and could therefore never have run on the only hardware this tree targets.  So the panels are budgeted, not
+/// staged: phase 1 keeps K and Q and reads V straight from global (coalesced across d, one pass), phase 2 keeps W
+/// and the state slab and reads Q and K from global.  If a measurement says the global reads cost, add the panel
+/// back only after checking the total again.
+///
+/// The arithmetic is checked to 3.25e-12 against the sequential recurrence in fp64 at the real shape by
+/// tools/q36_gdn_wy_check.py, which also carries the two traps: Q36's `gate` is ALREADY log g (tqLLM's is exp'ed,
+/// which is why its kernel calls logf), and a test whose gate has mean zero is not a test at all - the recurrence
+/// amplifies and overflows fp64 before any comparison can mean anything.
+
+/// phase 1: everything a chunk can compute without knowing the incoming state.  grid (HV, chunks), block 256.
+/// Writes, per (head, chunk): U and W (C x 128 each, the chunk's affine response), Mg (C x C, the q.k weights the
+/// scan's output sum needs) and lg (C, the inclusive log-decay).  No barrier after the load: the C x C block that
+/// forms A and Mg is already one thread an entry, and the inverse is one lane a column.
+constexpr int kWyChunk = 32;   // C: tqLLM's 32 at this shape; the Gram work grows as C and the chunk count falls as 1/C
+__global__ void __launch_bounds__(256) k_gdn_wy(float* __restrict__ U, float* __restrict__ W, float* __restrict__ Mg,
+                                                float* __restrict__ lgo, const float* __restrict__ h,
+                                                const float* __restrict__ gate, const float* __restrict__ beta,
+                                                int hs, int h_k, int h_v, int T) {
+    constexpr int D = 128, C = kWyChunk, P = D + 1, CP = C + 1;
+    // 2 x C x P + 2 x C x CP + 2 x C = 10432 floats = 41,728 B, static: under the 48 KiB ceiling with room to
+    // spare.  The padding on P is what keeps the Gram block below conflict-free - there consecutive threads hold
+    // consecutive j, i.e. different rows, so an unpadded stride would put every lane on one bank.
+    __shared__ float sK[C * P];
+    __shared__ float sQ[C * P];   // holds Q for the Gram, then V for the U sum - Q is dead after the Gram
+    // A and its inverse are separate panels: the substitution reads A while it writes T, so they cannot share.
+    __shared__ float sA[C * CP];
+    __shared__ float sT[C * CP];
+    __shared__ float slg[C], sbe[C];
+    const int head = blockIdx.x, chunk = blockIdx.y, t0 = chunk * kWyChunk;
+    const int n = (T - t0 < C) ? T - t0 : C;
+    const int qh = head % h_k, tid = threadIdx.x;
+    for (int i = tid; i < C * D; i += 256) {
+        const int t = i / D, d = i - t * D;
+        const bool in = t < n;
+        // hs, NOT C: the hidden state's row is ssm_conv_channels wide (10240 for Q36), and striding it by the chunk
+        // length reads a different token's row - no fault, just the wrong recurrence.
+        const float* ht = h + (size_t) (t0 + (in ? t : 0)) * hs;
+        sK[(t) * P + (d)] = in ? ht[h_k * D + qh * D + d] : 0.0f;
+        sQ[(t) * P + (d)] = in ? ht[qh * D + d] : 0.0f;
+    }
+    if (tid < C) {   // one lane a token, inclusive scan of the log decay
+        const bool in = tid < n;
+        const float x = in ? gate[(size_t) (t0 + tid) * h_v + head] : 0.0f;
+        float acc = x;
+#pragma unroll
+        for (int o = 1; o < C; o <<= 1) {
+            const float y = __shfl_up_sync(0xffffffffu, acc, o);
+            if (tid >= o) acc += y;
+        }
+        slg[tid] = acc;
+        sbe[tid] = in ? beta[(size_t) (t0 + tid) * h_v + head] : 0.0f;
+    }
+    __syncthreads();
+    // A and Mg at once: thread i is the pair (t, j).  A is strictly lower triangular; Mg keeps the diagonal.
+    float* Mo = Mg + (int64_t) (head * gridDim.y + chunk) * C * C;
+    for (int i = tid; i < C * C; i += 256) {
+        const int t = i / C, j = i - t * C;
+        float a = 0.0f, m = 0.0f;
+        if (j <= t && t < n) {
+            float kk = 0.0f, qk = 0.0f;
+            for (int d = 0; d < D; ++d) {
+                kk = fmaf(sK[(t) * P + (d)], sK[(j) * P + (d)], kk);
+                qk = fmaf(sQ[(t) * P + (d)], sK[(j) * P + (d)], qk);
+            }
+            const float ratio = __expf(slg[t] - slg[j]);   // prod_{u=j+1..t} g_u.  NOT slg[t]/slg[j]: that is D_t/D_j,
+                                                           // which carries g_0 at j == 0 and is the D_t trap.
+            if (j < t) a = sbe[t] * ratio * kk;
+            m = ratio * qk;
+        }
+        sA[(t) * CP + (j)] = a;
+        Mo[i] = m;
+    }
+    __syncthreads();
+    // (I + A)^-1 by forward substitution, one lane a COLUMN: the C columns are independent, so this is C lanes
+    // working at once and no barrier inside - which is the entire difference from k_gdn_chunked, where the same
+    // substitution is a per-token barrier because its right-hand side is not known until the previous token is.
+    // In the same interval, and with no extra barrier, the other threads pull V into the panel Q has just released:
+    // U is V's only consumer and it runs after the barrier below, and the two touch disjoint panels.
+    if (tid < C) {
+        const int c = tid;
+        for (int t = 0; t < C; ++t) sT[(t) * CP + (c)] = (t == c) ? 1.0f : 0.0f;
+        for (int t = c + 1; t < C; ++t) {
+            float acc = 0.0f;
+            for (int j = c; j < t; ++j) acc = fmaf(sA[(t) * CP + (j)], sT[(j) * CP + (c)], acc);
+            sT[(t) * CP + (c)] = -acc;
+        }
+    }
+    for (int i = tid; i < C * D; i += 256) {
+        const int t = i / D, d = i - t * D;
+        const bool in = t < n;
+        const float* ht = h + (size_t) (t0 + (in ? t : 0)) * hs;
+        sQ[(t) * P + (d)] = in ? ht[2 * h_k * D + head * D + d] : 0.0f;
+    }
+    __syncthreads();
+    float* Uo = U + (int64_t) (head * gridDim.y + chunk) * C * D;
+    float* Wo = W + (int64_t) (head * gridDim.y + chunk) * C * D;
+    for (int i = tid; i < C * D; i += 256) {
+        const int t = i / D, d = i - t * D;
+        float u = 0.0f, w = 0.0f;
+        for (int j = 0; j <= t; ++j) {
+            const float tb = sT[(t) * CP + (j)] * sbe[j];
+            u = fmaf(tb, sQ[(j) * P + (d)], u);          // sQ is V here
+            w = fmaf(tb * __expf(slg[j]), sK[(j) * P + (d)], w);
+        }
+        Uo[i] = u;
+        Wo[i] = w;
+    }
+    if (tid < C) lgo[(int64_t) (head * gridDim.y + chunk) * C + tid] = slg[tid];
+}
+
+/// phase 2 of STRATA_Q36_GDN_WY: the chunks in order, five barriers each (load, srg, E corrected, next chunk's
+/// panels).  grid (HV, D / kWyVS), block 256; one block owns kWyVS value
+/// columns of one head and keeps that slab of the state in shared memory, TRANSPOSED to (key row, value column).
+/// The transposition is what makes the rank-32 state update a run of float4 FMAs down contiguous memory instead of
+/// a stride-128 walk, and it is half of why tqLLM's version moves: its state panel is (D, VS).
+///
+/// VS IS 32, NOT 64, AND THE THREAD COUNT IS WHY.  The block is 256 threads and every thread holds four value
+/// columns of one token (et = tid >> 3, ev = (tid & 7) << 2), so 256 threads cover 32 tokens x 32 columns exactly.
+/// At VS = 64 the same mapping covers half of it: tokens 16..31 would never have E corrected or an output written,
+/// and value columns 32..63 would never be updated.  tqLLM runs 512 threads at its VS = 64 for the same reason;
+/// the thread count and the slab width are one decision, not two.  VS = 32 also keeps the panels under 48 KiB.
+constexpr int kWyVS = 32;   // value columns a block owns; 128 / 32 = 4 blocks a head, 48 heads = 192 blocks
+// 1 / sqrt(128), the scale k_gdn_seq_cols applies before it writes o_raw (:1584).  Spelled the same way here so the
+// two paths' o_raw mean the same thing; k_gdn_chunked does the same (:1722).
+constexpr float kWyInvSqrtD = 0.08838834764831845f;
+/// Opt-in, and it must stay that way: the two phases sum in a different order from k_gdn_seq_cols, so the default
+/// path's byte-identical text is the property that keeps this switch honest.
+static bool gdn_wy_on() {
+    static const bool on = std::getenv("STRATA_Q36_GDN_WY") != nullptr;
+    return on;
+}
+/// hs is the hidden state's ROW STRIDE (ssm_conv_channels, 10240 for Q36), not the chunk length.  The first version
+/// of both kernels used C = 32 for it and read a different token's q/k/v on every step - no fault, no bad pointer,
+/// just the wrong recurrence, which is the kind of defect a byte-comparison cannot localise.
+__global__ void __launch_bounds__(256) k_gdn_seq_wy(float* __restrict__ state, const float* __restrict__ U,
+                                                    const float* __restrict__ W, const float* __restrict__ Mg,
+                                                    const float* __restrict__ lgi, const float* __restrict__ h,
+                                                    float* __restrict__ o_raw, int hs, int h_k, int h_v, int T) {
+    constexpr int D = 128, C = kWyChunk, P = D + 1, VS = kWyVS, ST = VS + 4;
+    // 128*36 + 32*129 + 32*36 + 32*32 + 2*32 = 10,976 floats = 43,904 B: static, no attribute, no opt-in.
+    __shared__ float sS[D * ST];     // the state slab, key row major
+    __shared__ float sW[C * P];
+    __shared__ float sE[C * ST];
+    __shared__ float sM[C * C];
+    __shared__ float seg[C], srg[C];
+    const int head = blockIdx.x, v0 = blockIdx.y * VS;
+    const int qh = head % h_k, tid = threadIdx.x;
+    const int chunks = (T + C - 1) / C;
+    // the engine's state is [key][head][value] - see k_gdn_seq_cols:1547 - so the key row is the outer index and the
+    // value column the inner one.  Writing it the other way round is invisible on a zero state and corrupts decode.
+    for (int i = tid; i < D * VS; i += 256) {
+        const int d = i / VS, v = i - d * VS;
+        sS[d * ST + v] = state[(size_t) (d * h_v + head) * D + v0 + v];
+    }
+    // one thread a token holds the outputs of that token's 4 value columns (32 threads x 4 = the 32 of the slab)
+    const int et = tid >> 3, ev = (tid & 7) << 2;
+    // the state update: thread tid owns key rows d4*4..d4*4+3 across value columns v4*4..v4*4+3
+    const int d4 = tid & 31, v4 = tid >> 5;
+    __syncthreads();
+    for (int c = 0; c < chunks; ++c) {
+        const int t0 = c * C, n = (T - t0 < C) ? T - t0 : C;
+        const int64_t pc = (int64_t) (head * chunks + c);
+        if (tid < C) {
+            const float* l = lgi + pc * C;
+            // D_t for a real token, and the last token's D for the padding lanes (they are read by nobody, but
+            // reading an unwritten lane would be worse than a wasted exp)
+            seg[tid] = __expf(l[tid < n ? tid : n - 1]);
+            srg[tid] = (tid < n) ? __expf(l[n - 1] - l[tid]) : 0.0f;
+        }
+        __syncthreads();   // srg is read below by threads that did not write it
+        for (int i = tid; i < C * D; i += 256) sW[i / D * P + i % D] = W[pc * C * D + i];
+        for (int i = tid; i < C * VS; i += 256) {
+            const int t = i / VS, v = i - t * VS;
+            sE[t * ST + v] = (t < n) ? U[pc * C * D + t * D + v0 + v] : 0.0f;
+        }
+        for (int i = tid; i < C * C; i += 256) sM[i] = Mg[pc * C * C + i];
+        __syncthreads();
+        // E = U - W S: the chunk's own deltas, which is all the state contributes to this chunk.  Q is read from
+        // global rather than staged: the panel is gone to stay under 48 KiB, and this row is L2-resident because
+        // phase 1 has just read it and the four blocks of one head read the same row.
+        float ws[4], qs[4];
+        {
+            const float* hq = h + (size_t) (t0 + (et < n ? et : 0)) * hs + qh * D;
+            const bool in = et < n;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) { ws[k] = 0.0f; qs[k] = 0.0f; }
+            for (int d = 0; d < D; ++d) {
+                const float w = sW[et * P + d];
+                const float q = in ? hq[d] : 0.0f;
+                const float4 s4 = *reinterpret_cast<const float4*>(sS + d * ST + ev);
+                ws[0] = fmaf(w, s4.x, ws[0]); qs[0] = fmaf(q, s4.x, qs[0]);
+                ws[1] = fmaf(w, s4.y, ws[1]); qs[1] = fmaf(q, s4.y, qs[1]);
+                ws[2] = fmaf(w, s4.z, ws[2]); qs[2] = fmaf(q, s4.z, qs[2]);
+                ws[3] = fmaf(w, s4.w, ws[3]); qs[3] = fmaf(q, s4.w, qs[3]);
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) sE[et * ST + ev + k] -= ws[k];
+        __syncthreads();
+        // o_t = D_t (q_t S) + sum_{j<=t} Mg[t][j] e_j, written straight to the (T, HV*D) image the norm reads
+        if (et < n) {
+            float o[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) o[k] = seg[et] * qs[k];
+            for (int j = 0; j <= et; ++j) {
+                const float m = sM[et * C + j];
+                const float4 e4 = *reinterpret_cast<const float4*>(sE + j * ST + ev);
+                o[0] = fmaf(m, e4.x, o[0]); o[1] = fmaf(m, e4.y, o[1]);
+                o[2] = fmaf(m, e4.z, o[2]); o[3] = fmaf(m, e4.w, o[3]);
+            }
+            float* dst = o_raw + ((size_t) (t0 + et) * h_v + head) * D + v0 + ev;
+            const float4 o4 = make_float4(o[0] * kWyInvSqrtD, o[1] * kWyInvSqrtD,
+                                          o[2] * kWyInvSqrtD, o[3] * kWyInvSqrtD);
+            *reinterpret_cast<float4*>(dst) = o4;   // (t*h_v + head)*D + v0 + ev is a multiple of 4, so 16 B aligned
+        }
+        __syncthreads();
+        // S' = D_{n-1} S + sum_j k'_j e_j^T, with k' already carrying (D_{n-1}/D_j).  Thread tid owns four key rows
+        // by four value columns, so every read is a float4 and every row is contiguous.  k comes from global: its
+        // slice of h starts at a 128-float boundary, so d4*4 is 16-byte aligned and a warp reads 128 contiguous
+        // floats - fully coalesced, and the same line for the eight v4 groups.
+        const float gc = seg[n - 1];
+        float acc[4][4];
+#pragma unroll
+        for (int dd = 0; dd < 4; ++dd) {
+            const float4 s4 = *reinterpret_cast<const float4*>(sS + (d4 * 4 + dd) * ST + v4 * 4);
+            acc[dd][0] = gc * s4.x; acc[dd][1] = gc * s4.y; acc[dd][2] = gc * s4.z; acc[dd][3] = gc * s4.w;
+        }
+        for (int j = 0; j < n; ++j) {
+            const float* hk = h + (size_t) (t0 + j) * hs + h_k * D + qh * D;
+            const float4 e4 = *reinterpret_cast<const float4*>(sE + j * ST + v4 * 4);
+            const float4 k4g = *reinterpret_cast<const float4*>(hk + d4 * 4);
+            const float rj = srg[j];
+            const float k0 = k4g.x * rj, k1 = k4g.y * rj, k2 = k4g.z * rj, k3 = k4g.w * rj;
+            acc[0][0] = fmaf(k0, e4.x, acc[0][0]); acc[0][1] = fmaf(k0, e4.y, acc[0][1]);
+            acc[0][2] = fmaf(k0, e4.z, acc[0][2]); acc[0][3] = fmaf(k0, e4.w, acc[0][3]);
+            acc[1][0] = fmaf(k1, e4.x, acc[1][0]); acc[1][1] = fmaf(k1, e4.y, acc[1][1]);
+            acc[1][2] = fmaf(k1, e4.z, acc[1][2]); acc[1][3] = fmaf(k1, e4.w, acc[1][3]);
+            acc[2][0] = fmaf(k2, e4.x, acc[2][0]); acc[2][1] = fmaf(k2, e4.y, acc[2][1]);
+            acc[2][2] = fmaf(k2, e4.z, acc[2][2]); acc[2][3] = fmaf(k2, e4.w, acc[2][3]);
+            acc[3][0] = fmaf(k3, e4.x, acc[3][0]); acc[3][1] = fmaf(k3, e4.y, acc[3][1]);
+            acc[3][2] = fmaf(k3, e4.z, acc[3][2]); acc[3][3] = fmaf(k3, e4.w, acc[3][3]);
+        }
+#pragma unroll
+        for (int dd = 0; dd < 4; ++dd)
+            *reinterpret_cast<float4*>(sS + (d4 * 4 + dd) * ST + v4 * 4) =
+                make_float4(acc[dd][0], acc[dd][1], acc[dd][2], acc[dd][3]);
+        __syncthreads();   // sW, sE, sM, seg, srg are all rewritten by the next chunk
+    }
+    for (int i = tid; i < D * VS; i += 256) {
+        const int d = i / VS, v = i - d * VS;
+        state[(size_t) (d * h_v + head) * D + v0 + v] = sS[d * ST + v];
+    }
+}
+
 /// y = rms(o) * gamma * SiLU(z) per (token, V head): grid (HV, T), block 128.
 __global__ void __launch_bounds__(128) k_gdn_norm(const float* o_raw, const float* z, const float* gamma, float eps,
                                                   float* y, int h_v) {
@@ -2183,6 +2447,9 @@ struct Engine {
     float *x, *h, *y, *qkv, *hc, *z, *alpha, *beta, *gdn_y, *qg, *kx, *vx, *q, *gate, *att, *logits_r, *eparts, *moe_out,
         *sg, *su, *shh, *sy, *sgate, *ewts, *logits;
     float* hmain = nullptr;   // [tmax][N] the main model's final normed hidden of each row (the MTP seeds)
+    // STRATA_Q36_GDN_WY=1: U, W, Mg and lg for the two-phase recurrence, laid out per (head, chunk).  One set for
+    // every layer; see the allocation in place_experts for the size and why it is not per forward.
+    float* gdn_wy_work = nullptr;
     // STRATA_Q36_PEER_F16=1: the staging for the helpers' packed rows on their way back.  One helper's rows live
     // here at a time (the wait loop hands the buffer over helper by helper), so it is sized for one helper's share of
     // a window: cap_entries rows of N halves.  Allocated only when the flag is on.
@@ -4208,6 +4475,14 @@ struct Engine {
                 v_beta.push_back(dalloc((size_t) vrows * g.ssm_v_heads));
             }
         }
+        // STRATA_Q36_GDN_WY=1: the two-phase recurrence's per-chunk buffers.  One set, reused by every layer and every
+        // prompt chunk: U and W are C x 128 a (head, chunk), Mg is C x C, lg is C.  At T = 1024, 48 heads and C = 32
+        // that is 56.8 MB, which is why it is allocated once here and not per forward.
+        if (gdn_wy_on()) {
+            const size_t chunks = (size_t) (tmax + kWyChunk - 1) / kWyChunk;
+            const size_t per = (size_t) g.ssm_v_heads * chunks;
+            gdn_wy_work = dalloc(per * kWyChunk * 128 * 2 + per * kWyChunk * kWyChunk + per * kWyChunk);
+        }
         sess.resize((size_t) n_sess);
         gsets.resize((size_t) n_sess);
         {   // the sessions' caches: said before they fail (a slot's K / V at the context, fp32, for the attention layers and
@@ -5040,7 +5315,27 @@ struct Engine {
                         CK(cudaEventRecord(ge0, st));
                     }
                     static const bool gdn_chunked = std::getenv("STRATA_Q36_GDN_CHUNKED") != nullptr;
-                    if (gdn_chunked)
+                    if (gdn_wy_on() && (C % 4) == 0) {   // the float4 reads of h need a 16 B aligned row stride
+                        const int chunks = (T + kWyChunk - 1) / kWyChunk;
+                        const size_t per = (size_t) HV * (size_t) chunks;
+                        float* U = gdn_wy_work;
+                        float* W = U + per * (size_t) kWyChunk * 128;
+                        float* Mg = W + per * (size_t) kWyChunk * 128;
+                        float* lg = Mg + per * (size_t) kWyChunk * kWyChunk;
+                        // Both kernels declare their panels __shared__ now, so there is no dynamic allocation, no
+                        // cudaFuncSetAttribute and no opt-in - none of which Pascal would grant above 48 KiB.
+                        k_gdn_wy<<<dim3(HV, chunks), 256, 0, st>>>(U, W, Mg, lg, hc_b, al_b, be_b, (int) C, HK, HV, T);
+                        k_gdn_seq_wy<<<dim3(HV, 128 / kWyVS), 256, 0, st>>>(
+                            S[li], U, W, Mg, lg, hc_b, gdn_y, (int) C, HK, HV, T);
+                        // SAY SO ONCE.  Without this line an A/B cannot tell "the WY path ran and agreed" from
+                        // "the WY path never ran": both produce the same text and an rc of 0.
+                        static bool wy_said = false;
+                        if (!wy_said) {
+                            std::fprintf(stderr, "strata-q36 GDN_WY: the two-phase recurrence ran (T=%d, %d chunks, "
+                                         "%d heads)\n", T, chunks, HV);
+                            wy_said = true;
+                        }
+                    } else if (gdn_chunked)
                         k_gdn_chunked<<<dim3(HV, kGdnColGroups), dim3(16, 32), 0, st>>>(S[li], hc_b, C, al_b, be_b,
                                                                                        gdn_y, HK, HV, T);
                     else
