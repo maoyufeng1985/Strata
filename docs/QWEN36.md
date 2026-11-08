@@ -388,12 +388,22 @@ The cost stays linear as the count rises, so the trade can be priced at any poin
 Each extra window costs 37-39 ms of prompt time and returns 4.6-5.1 tokens (both slots together) at every one of
 those steps, so a fair half-time share can be computed as `chunk ms / 38`.
 
-The useful range is the low end, and it is worth knowing the price before raising the count: at a chunk of 512 one
-window per boundary costs 6% of the read, two cost 12%, three cost 18%, and eight - a half-time share - cost 45%.
-Against a 3,500-token read the default of 1 keeps each decoding session almost frozen (11 tokens each), while 2 or 3
-keeps them moving for a sixth to a fifth more waiting on the part of the request that is not interactive. Those are
-the settings to use; there is nothing to gain from making the window itself cheaper, because a window already
-delivers tokens at 86% of the rate the same slots reach when nothing else is running.
+The useful range is the low end, and it is worth knowing the price before raising the count. Measured on the same
+box, two decoding slots, a 3,500-token read at chunk 512:
+
+| `READ_WINDOWS` | prompt read | cost vs no windows | tokens the two slots produced |
+| ---: | ---: | ---: | ---: |
+| 0 | 4,142 ms | - | 0 |
+| 1 (default) | 4,395 ms | 6% | 22 |
+| 2 | 4,597 ms | 11% | **50** |
+| 3 | 4,829 ms | 17% | 75 |
+| 8 | 5,996 ms | 45% | 216 |
+
+**Two is the setting to use.** It doubles what a read gives the decoding sessions for 4.6% more waiting on the part of
+the request that is not interactive. Three is the next step if the decoding sessions matter more than the reader.
+There is nothing to gain from making the window itself cheaper: a window already delivers tokens at 86% of the rate
+the same slots reach when nothing else is running, so at most 14% is available from the mechanism - while the default
+is an order of magnitude below the useful range.
 
 **The two decoders above were given the same prompt**, which makes them produce identical tokens and take identical
 draft paths. Two *different* prompts behave better at no extra cost:
