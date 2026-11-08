@@ -1615,3 +1615,138 @@ And the cost is identical across fixtures, which is what makes the benefit compa
 For a *cost* figure, 37-39 ms/window stands, measured the same way in both fixtures. For a *benefit* figure at S=2 the
 honest statement is **+16% over cloned decoders at useful window counts (and +27% at the default of 1)**, and cloned
 decoders should be named as a lower bound rather than used as the headline.
+
+## CORRECTION (2026-11-08, later the same night): the time-budget port is not a performance lever
+
+The section above treats the missing `STRATA_Q36_DECODE_SHARE` as a capability gap worth closing. **That framing was
+wrong**, and the measurement in this document is what shows it.
+
+A fixed count and a time budget are **linearly equivalent** here, because the window cost is a constant:
+
+- fixed `N` windows costs `N * 38 ms` of prompt time;
+- a `share` budget costs `share * chunk_ms`, and since the chunk also costs a constant per token, `share * chunk_ms`
+  is `share * chunk_ms / 38` windows - the same line, parameterised differently.
+
+The per-window cost measured linearly across `rw` 1, 8, 16, 32 (38.0 / 37.2 / 38.8 ms). There is no chunk size in
+this range where the two forms diverge, and `--chunk` is fixed at deployment, so the one thing a share buys -
+rescaling when the chunk size changes - buys nothing in practice.
+
+What a share *does* buy is expressiveness for a caller who does not know the chunk duration in advance. That is a
+portability improvement, not a speed one, and it does not justify touching the engine. The recommendation is
+downgraded accordingly.
+
+**The same correction applies to the second half of the caveat throughout this document.** I described the window
+cost as "added, not hidden, because `run_rows()` is host-blocking". The conclusion (costs add) is what the arms show
+and it stands, but the mechanism was stated wrong: the block is at `run_rows()`'s **entry**
+(`q36_engine.cu:7949`, `cudaStreamSynchronize(st)` waiting for the previous window's launch queue), and `forward()`
+itself is launched asynchronously. The prompt branch is the part that is strictly serial - it synchronises once per
+chunk at `:7858`. So "host-blocking" is true of the prompt read and of the window's entry, not of the decode
+compute. That distinction is what makes the dual-stream question non-trivial, and it is why the next section was
+rewritten.
+
+## Dual streams: the binding constraint is the link, not the stream
+
+The proposal worth taking seriously is not "do what vLLM does". It is the narrower engineering question: the host
+launches `forward()` asynchronously and then blocks at the next `run_rows()` entry, so there is a window in which a
+second stream could carry work. Whether that window is worth filling depends on what the work would contend for.
+
+**Link arithmetic at the pinned configuration.** A decode window at S=2 greedy depth 2 costs 38.0-38.8 ms (measured
+above) for two slots' rows. Each layer moves roughly 2.2 MB of activations per chunk to the helpers
+(`q36-prefill-last-gap-is-link`), over 40 layers that is ~88 MB per window, so the window alone demands
+`88 MB / 38 ms = 2.3 GB/s`. The box's measured single-link throughput is **0.81 GB/s per hop, with no GPU-to-GPU P2P
+at all** (`q36-no-p2p-host-staging-only`: every pair is PHB and one-way peer tests fail; direct 313 tok/s against
+1867 tok/s staged, a 6x penalty). Prefill and decode therefore draw from the same saturated link.
+
+That is the reason a dual stream cannot help here, and it is a hardware reason rather than a software one. Adding a
+stream does not add link capacity; it only changes which work is queued. The only way a second stream pays is if the
+work it carries does not need the link - and at the point where the host is blocked (waiting on a launch queue that
+is itself waiting on helper results), essentially all outstanding work does.
+
+**What would change this verdict:** a configuration where decode rows are served from the primary's own VRAM with no
+helper round trip. `q36-primary-expert-slots` measured that inserting the primary into the decode is worth +3.0% with
+byte-identical output - but only with `PRIMARY_RES=1` and `PEER_KEEP_RESIDENT=0`, and it does not remove the helper
+traffic for the experts that stay remote. Until the expert traffic on the link falls, the dual-stream idea has no
+headroom to exploit, and it should not be implemented.
+
+## Where the optimisation actually lands
+
+Given all of the above, the efficient frontier of this knob is already reached and the remaining work is choosing a
+point on it, not moving the line.
+
+The window yields 4.62-5.05 tokens per 37-39 ms at S=2. The steady-state rate for the same configuration is
+141.8 tok/s for two slots, i.e. 7.06 ms/token. A window's own rate is `38.0 / 4.62 = 8.23 ms/token`, so **a window
+delivers tokens at 86% of the steady-state rate**. There is at most 14% to recover by making windows cheaper, and the
+helper-idle work already established that the helper's idle 55-59% is spent waiting on the primary's mixer
+(`q36-helper-idle-is-the-real-idle`) - it is not recoverable.
+
+So the landing point is the setting, not the implementation:
+
+| `READ_WINDOWS` | prompt cost at chunk 512 | decode tokens during a 3.5K read (2 slots) |
+|---:|---:|---:|
+| 1 (default) | +0.26 s (+6%) | 22 |
+| 2 | ~+0.52 s (+12%) | ~44 |
+| 3 | ~+0.78 s (+18%) | ~66 |
+| 8 | +1.85 s (+45%) | 216 |
+
+The first three rows are the usable range. Eight windows buys the most decoding but makes the prompting user wait
+45% longer for a 3.5K prompt; that is a defensible choice only when the decoders are interactive and the reader is
+not. `rw` 2-3 is the range where the reader pays a sixth to a fifth more and the decoders keep moving, and it needs
+no code change at all.
+
+### The 14% ceiling, worked out
+
+The steady-state rate for the pinned configuration is 141.8 tok/s across two slots, i.e. **7.05 ms per token**
+(counting both slots' tokens together, which is the unit the window measurement also uses). A window costs 38.0 ms
+and returns 4.62 tokens, i.e. **8.23 ms per token**. So:
+
+- a window delivers tokens at `7.05 / 8.23` = **85.7%** of the steady-state rate;
+- a window that matched steady state would return `38.0 / 7.05` = **5.39 tokens** instead of 4.62.
+
+The gap is **14%**, and it is the entire upside available from making the interleave mechanism itself more efficient.
+Everything downstream of that - a cheaper window, a smarter grant, a second stream - competes for that same 14%, and
+the helper-idle work has already shown the largest apparent slack (the helper sitting idle 55-59% of a layer) is
+waiting on the primary's mixer rather than being free capacity (`q36-helper-idle-is-the-real-idle`).
+
+That is the quantitative reason the recommendation is "pick a setting" rather than "optimise the mechanism": the
+mechanism is within 14% of doing at least as well as it possibly could, and the setting is currently an order of
+magnitude away from the useful range.
+
+### The landing measurement: `rw` 1 / 2 / 3, the range that is actually usable
+
+`.backup/s2_interleave_landing.py`, same harness and same fixtures, three arms in one session so the box cannot
+drift between them.
+
+| `rw` | prompt ms | prompt tok/s | slot 0 | slot 1 | both | vs `rw=1` |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 (default) | 4,395 | 796 | 11 | 11 | 22 | - |
+| 2 | 4,597 | 761 | 25 | 25 | **50** | **+202 ms (+4.6%), tokens x2.3** |
+| 3 | 4,829 | 725 | 37 | 38 | **75** | +434 ms (+9.9%), tokens x3.4 |
+
+`RESULT PASS: every arm ran and both controls held` - `long_pp = 7` in all three, both slots symmetric to within one
+token (11/11, 25/25, 37/38), no decoder stopping inside a read, and the three P104s at 5005 MHz throughout.
+
+Against `rw=0` (4,142 ms, 0 tokens) the prompt cost is 6.1%, 11.0% and 16.6% at `rw` 1, 2, 3 - so the ladder is
+cheap exactly where it is most useful.
+
+`rw=1` reproduced the earlier session's value (4,395 ms against 4,401 ms, 22 tokens both times), so the box is stable
+across sessions and these numbers are comparable with the 8/16/32 ladder.
+
+The marginal costs now cover the low end as well, and they agree with the high end:
+
+| pair | extra windows | extra ms | ms/window | tokens/window |
+|---|---:|---:|---:|---:|
+| `rw=1` -> `rw=2` | +6 | +202 | 33.7 | 4.67 |
+| `rw=2` -> `rw=3` | +6 | +232 | 38.7 | 4.17 |
+| `rw=3` -> `rw=8` | +30 | +1,167 | 38.9 | 4.70 |
+| `rw=1` -> `rw=8` | +42 | +1,601 | 38.1 | 4.62 |
+| `rw=8` -> `rw=16` | +48 | +1,785 | 37.2 | 4.58 |
+
+Five intervals spanning 6 to 96 windows: **37-39 ms per window on four of them**, and the first one is slightly
+cheaper at 33.7 ms because the first window after a read pays a fixed cost the later ones do not. Yield is flat at
+4.17-4.70 tokens per window across all of them, with no trend - the variation is acceptance noise, not a mechanism
+changing shape.
+
+**So the recommendation is `rw=2`.** It doubles the decode tokens a read grants (22 -> 50 for two slots) for 4.6% more
+waiting on the prompt, and it is the cheapest step on the ladder per token gained. `rw=3` is the next step (x3.4
+tokens for 9.9% more waiting) if the decoders matter more than the reader. `rw=8` costs 45% and is the half-time
+share - defensible only when the prompting request is not interactive at all.

@@ -388,6 +388,13 @@ The cost stays linear as the count rises, so the trade can be priced at any poin
 Each extra window costs 37-39 ms of prompt time and returns 4.6-5.1 tokens (both slots together) at every one of
 those steps, so a fair half-time share can be computed as `chunk ms / 38`.
 
+The useful range is the low end, and it is worth knowing the price before raising the count: at a chunk of 512 one
+window per boundary costs 6% of the read, two cost 12%, three cost 18%, and eight - a half-time share - cost 45%.
+Against a 3,500-token read the default of 1 keeps each decoding session almost frozen (11 tokens each), while 2 or 3
+keeps them moving for a sixth to a fifth more waiting on the part of the request that is not interactive. Those are
+the settings to use; there is nothing to gain from making the window itself cheaper, because a window already
+delivers tokens at 86% of the rate the same slots reach when nothing else is running.
+
 **The two decoders above were given the same prompt**, which makes them produce identical tokens and take identical
 draft paths. Two *different* prompts behave better at no extra cost:
 
