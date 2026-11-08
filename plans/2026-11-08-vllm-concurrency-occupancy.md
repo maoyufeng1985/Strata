@@ -1750,3 +1750,305 @@ changing shape.
 waiting on the prompt, and it is the cheapest step on the ladder per token gained. `rw=3` is the next step (x3.4
 tokens for 9.9% more waiting) if the decoders matter more than the reader. `rw=8` costs 45% and is the half-time
 share - defensible only when the prompting request is not interactive at all.
+
+---
+
+## The real coding task, at the pinned shape (pp20k / tg1k / S=2 / MTP on)
+
+Everything above measured the interleave with fixtures: 24-token decoder prompts, a 3,500-token reader, and a
+clone of the same prompt in both slots. The task the user set next is the shape they actually care about - a real
+coding prompt of 20,000 tokens, 1,000 generated tokens, two sessions at once, MTP on, with the cards' power
+watched - so this section re-measures on that shape rather than extrapolating to it.
+
+### The prompt had to be rebuilt, and the reason is the point
+
+The first attempt tiled 340 real-code ids out to 20,000 tokens. That keeps the token distribution but repeats the
+content eight times, and the user rejected it: **"prompt不能重复"**. They are right - a prompt that is one paragraph
+copy-pasted is not a coding task, and a number measured on it cannot be quoted as one.
+
+The obstacle was real: the box has no tokenizer (`transformers`, `tokenizers` and `sentencepiece` are all absent),
+no network, and the engine has no encode subcommand - only `--tokens` and `--tokens-file`, which take ids.
+
+**The obstacle was not real after all, twice over.** Two independent findings:
+
+1. The model file carries the whole tokenizer in its metadata - `tokenizer.ggml.model = 'gpt2'`, `pre = 'qwen35'`,
+   248,320 tokens, 247,587 merges - so a byte-level BPE can be rebuilt from the weights file alone.
+2. **This repository already has that tokenizer.** `tools/strata_tokenizer.py` is a pure-Python implementation
+   that reads the GGUF directly; it is on the box at `/home/Strata/src-rebase/tools/strata_tokenizer.py`. The
+   original tiling script's own header even said so ("tokenized by the engine's own tokenizer
+   (tools/strata_tokenizer.py, from the GGUF)").
+
+So the prompt is encoded on the box, by the reference implementation, from the box's own checkout.
+
+### What the two prompts are
+
+`pp20k_real_code.py` walks `src/`, `include/`, `serve/` and `strata_cli/` (406 + 209 + 128 + 37 files of real C++,
+CUDA and Python), takes files in a shuffled-but-fixed order, caps each at 2,200 tokens (cut at a line boundary),
+and stops at exactly 20,000. `--two` splits the file list so the two sessions get **different** code - two people
+working at once are not asking about the same file, and the mixed-prompt measurement above showed cloned prompts
+understate throughput by ~16%.
+
+| prompt | files | distinct ids | specials | repeated 64-token blocks |
+|---|---:|---:|---:|---:|
+| session 0 | 12 | 2,324 (11.6%) | 0 | **0** |
+| session 1 | 11 | 2,933 (14.7%) | 7 | **0** |
+
+The builder asserts, before any ids are written, that the length is exact, that the ids re-encode to themselves,
+that no 64-token block repeats, and that no `[PAD...]` placeholder appears. The specials in session 1 are genuine:
+this tree's own source writes `<|image_pad|>` inside comments and string literals, so a real 20k slice of it
+contains a handful.
+
+The tokenizer was checked against a second, independent implementation as well: the HuggingFace `tokenizers` build
+from the same GGUF vocabulary (with the `qwen35` regex transcribed from `third_party/llama.cpp/src/llama-vocab.cpp:396`)
+agreed with `strata_tokenizer.py` on 11 of 11 strings covering tabs, indentation, C syntax, quotes, CJK, emoji and
+combining marks.
+
+### What the engine does with two 20k prompts, and why "2 concurrent" means what it means
+
+This is the finding that governs how the numbers may be read. The serve loop (`q36_engine.cu:10359-10367`) pops one
+request, calls `request()`, and only then calls `window()`. Inside `request()`, `E.process(...)` reads the whole
+prompt **synchronously** (`:10127-10147`). So:
+
+| phase | who is doing what |
+|---|---|
+| slot 0's 20k read | only slot 0. Slot 1's `BGEN` has not been popped yet. |
+| slot 1's 20k read | slot 0 decodes between chunk boundaries, `read_windows` windows per boundary |
+| both generating | the only phase in which both sessions decode at once |
+
+There is no design in which both prompts are read at the same time. `READ_WINDOWS` is exactly the mechanism that
+makes the middle phase overlap, and the 2 sessions are genuinely concurrent for the whole generation phase - 1,000
+tokens each is ~30 s at the rates measured here, against ~20 s of reads.
+
+So the honest description is **2 sessions, sequentially admitted, concurrently generating**, with the interleave
+covering the second read. That is the engine's concurrency model, and this measurement does not change it; it only
+says what it costs and yields at this shape.
+
+### Arms and controls
+
+Two arms, identical but for MTP: `mtp0` (`--mtp 0`) and `mtp1` (`--mtp 1 --batch-mtp`, depth 2), so "开mtp" is
+answered as a comparison rather than assumed. Both: 2 sessions, `--chunk 512`, `--kv int8`, greedy, the shipped
+decode environment from the previous night (`STRATA_Q36_MTP_VRAM=1`, `VERIFY_ROWS=8`, `NO_HOST_EXPERTS=1`,
+`READ_WINDOWS=2`), the box's four cards reset and warmed before each arm.
+
+Controls, each of which fails the arm rather than being reported around:
+- both sessions admitted (`BADM <slot> 1` **twice**) - otherwise the arm is a single-session run;
+- both admissions are 20,000 tokens, straight from the engine's own `taken a prompt of N tokens` line;
+- the two sessions produce within a 2:1 split of each other - a starved slot is not a pair;
+- no CUDA error and no non-finite value in stderr.
+
+### Power is sampled, not bookended
+
+The 20k prefill is a ~20 s window inside a ~1 minute run, so a reading before and a reading after would average it
+away. `nvidia-smi --query-gpu=power.draw` is sampled every 250 ms for the whole arm, and the per-card figure
+reported is max and mean over all samples. Max is the prefill peak; mean is what the card did overall.
+
+### The sequential read is not a q36 deficiency, and vLLM confirms it
+
+It is tempting to read the phase table above as "q36 reads prompts one at a time and that is why concurrency is
+weak". It is the same in vLLM, and for the same reason: a model forward is one GPU operation with a dependency
+chain through every layer, so two prompts cannot be read by the same card at the same time at all.
+
+`vllm/v1/worker/gpu_model_runner.py:4001` `execute_model` runs one step synchronously; the async work vLLM does is
+host-side scheduling (build the next batch while the GPU runs the current one), and its batch is a mix of decode
+and prefill **tokens of different requests in one forward** - which is exactly what q36's chunked read plus the
+`read_windows` interleave does, one layer down. The difference that remains is that vLLM's per-step batch admits
+the next request's prefill as soon as a token budget frees, while q36's `request()` blocks until the whole prompt
+is read.
+
+That is a real difference, and it is the one a port could remove: **a 20k prompt occupies the card for 26 seconds
+in q36 before the second request is even looked at.** But the fix is not "a separate prefill thread" (there is
+nothing for a second thread to compute on a busy card); it is **admitting the prompt in pieces across steps**,
+which is what `--chunk` does inside one request and what would need to happen *between* requests. Recorded as the
+next thing worth measuring, not as something this run demonstrates.
+
+### The result: real code, 20k in, 1k out, two sessions
+
+Box `root@192.168.1.98`, four cards reset and warmed before each arm, `--batch 2`, `--chunk 512`, `--kv int8`,
+`READ_WINDOWS=2`, greedy. Raw logs kept at `.backup/pp20k-run/`.
+
+| arm | prompt (both reads) | prompt tok/s | generated | gen wall | aggregate | per session | MTP accepted |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `mtp0` (`--mtp 0`) | 60,130 ms | 665.2 | 1,183 | 34,809 ms | **34.0 tok/s** | 17.0 | - |
+| `mtp1` (`--mtp 1 --batch-mtp`, depth 2) | 65,326 ms | 612.3 | 1,183 | 27,058 ms | **43.7 tok/s** | 21.9 | **782/809 = 96.7%** |
+
+**MTP on is worth +28.6% on the generation phase** at this shape, at the cost of +8.6% on the reads. That is the
+largest MTP gain measured on this box so far, and the reason is the prompt: 96.7% acceptance is far above the
+47-62% the earlier fixture runs saw, because 20,000 tokens of real contiguous source makes the next token nearly
+deterministic in a way 24 random ids never did. **The acceptance rate is a property of the traffic, not of the
+drafter** - a fixture with random prompts systematically understates MTP.
+
+**One session stopped on its own.** `slot 0` produced 183 tokens and printed `finish = stop` (end of text) in both
+arms - identically 183, so the model wrote a complete answer and stopped. `slot 1` ran to the 1,000-token cap.
+So "tg1k" was granted, not always consumed: 1,183 generated against 2,000 requested. The aggregate rate is
+therefore over unequal sessions and is quoted as a property of this task, not as a throughput ceiling.
+
+### What this shape says about concurrency, and one thing it does not
+
+`BDONE` for slot 0 lands **after** slot 1's read finishes (34,809 ms against a 31,242 ms read), so the interleave
+did grant slot 0 windows during slot 1's read - `BT 0` rows appear between slot 1's `PP` chunk boundaries in the raw
+log. That is `READ_WINDOWS` doing exactly what it was measured to do.
+
+What is *not* concurrent, and cannot be with this engine: the two 20k reads. Together they are 60 seconds of the
+run; the generation is 35. On this task the prompt is 63% of the wall clock, and no decode-side setting changes
+that. **The cost of a 20k prompt is the thing to attack, not the interleave.**
+
+### The prompt is now reproducible
+
+`pp20k_real_code.py` is the builder: it reads `src/`, `include/`, `serve/`, `strata_cli/`, caps each file at 2,200
+tokens, stops at exactly 20,000, splits the file list in two for the two sessions, and refuses to write anything
+unless the length is exact, the ids re-encode to themselves, no 64-token block repeats and no PAD id appears.
+Anyone can rerun it against the same checkout and get the same two prompts.
+
+---
+
+## Project Maya: what it is, and the one mechanism that ports
+
+### Maya is Strata's downstream, not its upstream
+
+`third_party/project-maya/NOTICE.md:5`: **"Project Maya is itself built on Strata."** The relationship runs the
+other way from what the name suggests: Strata ported Maya's DeepSeek-V4.1 engine into `src/dsv41/` (30,594 lines,
+plus 4,846 in `vendor/`), not the reverse.
+
+### There is no Q36 path in Maya, and no way to add one
+
+`tools/dsv41/pack_gguf.py:510` is a hard gate:
+
+```python
+raise SystemExit("%s: not a DeepSeek-V4.1 GGUF (architecture %r)" % (model, arch))
+```
+
+Its predicate is a single equality, `general.architecture == "deepseek41"` (`:386`). Q36's GGUF declares
+`qwen35moe`, so it is refused before anything else runs. All eight occurrences of "qwen" across `src/dsv41/`,
+`include/strata/dsv41/`, `tools/dsv41/` and `tests/dsv41/` are comments or a tokenizer default
+(`smoke.py:40`'s `tcfg.get("pre") or "qwen35"` is DeepSeek's own vocabulary sharing the tokenizer family, not
+model support).
+
+Nor could the gate be bypassed: `ds4_model.cu:565` reads `qk_rope_head_dim` (MLA), and `n_head_kv` appears **zero**
+times in the whole file, while q36 is GQA. The shapes differ everywhere except the layer count (40).
+
+| | DeepSeek-V4.1 | Q36 |
+|---|---|---|
+| layers | 40 | 40 |
+| experts/layer | 384 (6 used) | 256 (8 used) |
+| attention | MLA | GQA |
+| extra | 203 GB Engram n-gram table | none |
+
+### The one portable mechanism, measured on this box
+
+`src/dsv41/ds4_ring_link.hpp` (35 lines) sizes a prompt's staging ring from the device's **measured** host link:
+
+```cpp
+want = stride/link >= 1 ms ? 1 : link * 10 ms / stride;    // ring_slots(), kRingBatchS=10ms, kRingSlowS=1ms
+```
+
+It depends on four numbers - link bytes/s, expert stride, VRAM room, batch parts - and none of them are
+model-specific, so this is the one piece that crosses over.
+
+Maya's own plotter is `link_h2d` (`ds4_model.cu:3902`): 32 MB from pinned memory, best of three, **on the legacy
+stream**. Its comment records the trap: timed on a stream of their own, the copies left decode ~20% slower for the
+whole run on PCIe Gen2 boxes. That is why the probe below keeps the legacy stream.
+
+**Measured 2026-11-08 on this box** (`.backup/link_probe.cu`, two runs identical, four cards idle):
+
+| card | pinned H2D | pageable H2D | pin D2H | ms per 2.0 MB expert | ring slots | per batch |
+|---|---:|---:|---:|---:|---:|---:|
+| P100 (nvidia-smi 0) | **6.11 GB/s** | 4.15 | 6.58 | 0.34 | 116 | 29 |
+| P104 (1) | **1.63 GB/s** | 1.61 | 1.67 | 1.29 | 4 | 1 |
+| P104 (2) | **1.63 GB/s** | 1.61 | 1.67 | 1.29 | 4 | 1 |
+| P104 (3) | **1.59 GB/s** | 1.57 | 1.67 | 1.32 | 4 | 1 |
+
+The q36 expert stride is real, read off the GGUF: `ffn_down_exps` is `[512, 2048, 256]` type 13 (Q5_K) =
+**2.000 MB per expert**.
+
+**The formula is not uniform on this box.** The threshold is `stride/link >= 1 ms`, i.e. `link <= 2.10 GB/s`:
+- the three **P104 helpers at 1.6 GB/s** sit just under it -> **one expert per batch**, which is Maya's declared
+  *minimum*, not an optimisation;
+- the **P100 primary at 6.1 GB/s** is 5x over it -> 29 per batch, a 240 MB ring.
+
+So porting `ring_slots()` would tell the helpers to do exactly what they already do. It is a correct rule that
+buys nothing here, and that is worth knowing before writing it.
+
+### And it corrects a number this project has been quoting
+
+`q36_peer_prefill.cu:95` and the plan notes say the helpers' link is **0.58 GB/s**, and a memory
+(`q36-prefill-last-gap-is-link`, corrected 2026-11-04) says 0.81 GB/s is the ceiling because the window makes *two*
+PCIe hops. Today's isolated probe gets **1.63 GB/s** on the same cards.
+
+Both numbers are real; they measure different things.
+- **1.63 GB/s** is one hop's *capacity*, idle, best-of-three, pinned, 32 MB.
+- **0.58-0.81 GB/s** is the *effective* throughput the prompt path achieves when the copy is one step in a
+  dependency chain that also runs the mixer, the plan and the helper's GEMMs.
+
+So the remaining prompt gap is **not** link capacity - half of it is provably unused. It is what happens to the
+copy while everything else runs. That reframes the next measurement: not "buy a faster link", but "why does a
+1.63 GB/s link deliver 0.81".
+
+## The copy path is 4.5% of the layer, and the premise was wrong (2026-11-08, MEASURED)
+
+That measurement has now been made, and it does not answer the question as posed - it retires it. **The copy
+path is not where the prompt time goes, at any bandwidth.**
+
+`.backup/link_gap_probe.py`, run on 192.168.1.98 against `--bench-pp 512` with `STRATA_Q36_PROMPT_TIMING=1`,
+two arms differing only in `STRATA_Q36_STAGE_ASYNC`, three passes each. The arms agree pass to pass to within
+0.07%, so the numbers below are not noise:
+
+| per layer (ms) | `STAGE_ASYNC=0` | `STAGE_ASYNC=1` | share of forward |
+|---|---:|---:|---:|
+| post_combine | 4.812 | 4.775 | 47.5% |
+| mixer | 3.743 | 3.744 | 37.1% |
+| plan | 0.636 | 0.608 | 6.1% |
+| helper_wait | 0.395 | 0.391 | 3.9% |
+| router_route | 0.151 | 0.152 | 1.6% |
+| combine | 0.105 | 0.105 | 1.0% |
+| route_d2h | 0.018 | 0.016 | 0.2% |
+| primary_work | 0.017 | 0.017 | 0.2% |
+| **forward** | **10.132** | **10.061** | |
+
+Host wall (overlaps the GPU spans, not additive): `sync3022` 8.24 / 0.23, `peer_plan` 1.01, `stage` 0.035,
+`prep_d2h` 0.008, `prep_sync` 0.007, `ppwait` 0.10.
+
+**The control that settles it.** `stage` is the window's D2H out of the primary. With `STAGE_ASYNC=1` the host
+only *enqueues* it, so `stage` would be an issue cost, not a wall clock - which is exactly why the second arm
+exists. With `STAGE_ASYNC=0` the host **blocks** on that copy, and `stage` is **0.035 ms**, the same as the
+async arm's 0.033. The copy is that cheap either way. It is not being hidden; it is not there.
+
+Every copy-bearing span, summed: `stage` 0.035 + `helper_wait` 0.391 + `route_d2h` 0.018 + `prep_d2h` 0.008 =
+**0.45 ms of 10.07 = 4.5%**. `helper_wait` already contains the helpers' own up-leg H2D - the comment at the P2
+record site says so: "the wait for the helpers' rows to land plus the up-leg H2D".
+
+**The byte account agrees, and kills the old two-hop story.** Per layer the up leg moves 512 q8 rows x 2880 B =
+1.47 MB plus 0.04 MB of ids and weights; the down leg moves 3 helpers x 512 tokens x 2640 B int8 = 4.06 MB. Every
+span that contains a copy, added together, is 0.45 ms - so 5.56 MB is carried in at most 0.45 ms, and the copies
+demonstrably overlap the compute rather than sitting in front of it. The up and down legs are also **different
+physical links** (primary D2H 6.11 GB/s, helper H2D 1.63 GB/s) plus 3 helpers running in parallel, not one link
+used twice. The earlier note that "two hops turn 1.63 into 0.81" compared a capacity against a throughput that
+was never governed by that capacity. (0.45 ms is an upper bound: the spans holding the copies also contain the
+helpers' compute, so the copies' own share can only be smaller.)
+
+**Retired:** `q36-prefill-last-gap-is-link`'s conclusion that the last 6.8% is the helper activation upload and
+that "this is where the copy efficiency can be moved". There is no copy lever here.
+
+**What the time is actually spent on:** `post_combine` (47.5%) is the gap from a layer's P3 to the next layer's
+P0, i.e. per-layer host bookkeeping plus the next layer's mixer start. `mixer` (37.1%) is the primary's own
+attention + GDN arithmetic. Together 85%. `sync3022` is the primary's one mandatory
+`cudaStreamSynchronize(st)` per layer (to bring `rmax` back and size the MMQ); it overlaps the GPU spans rather
+than adding to them, which is why it can read 8.24 in one run and 0.23 in another with an unchanged `forward`.
+
+**A caliber trap worth keeping.** `--bench-pp 512` reads 10.14 ms/layer, but the real 20k prompt from the same
+session's run reads 20000 tok / 28888 ms over 40 layers and 39.1 chunks = **18.49 ms/layer**, 1.82x more. The
+difference is expert residency and chunk-to-chunk routing, not the link. So `--bench-pp` absolute numbers are
+not throughput numbers (`q36-prefill-two-instruments` said this already). The conclusion above does not depend
+on them: `stage` is measured *inside each arm*, and the `STAGE_ASYNC` comparison is arm against arm.
+
+**Not usable for attribution:** `STRATA_Q36_MIXER_SPLIT=1` prints 240 calls for attention (3 passes x 8 decode
+tokens x 10 attention layers) - it reports the **decode** mixer, whose accumulators were reset after the prompt.
+It cannot explain the prompt's 3.74 ms of `mixer`.
+
+### What Maya does differently, and why it is not a port
+
+Project Maya moves MoE activations with a **kernel** writing host-mapped pinned memory and a flag spun
+in-kernel (`ds4_kernels.cu:1743-1779`), one stream per device, the whole `T*D*4` row in one put with no fixed
+split cap, and **no `cudaStreamSynchronize` on the hot path** - completion is carried by the flag that the next
+device's already-queued kernel spins on. q36 instead takes one blocking stream sync per layer. That is a
+difference in *synchronisation model*, not in copy speed - and since copies are 4.5%, porting Maya's transport
+would not move the number that matters.

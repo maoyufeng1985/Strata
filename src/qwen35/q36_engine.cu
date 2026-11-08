@@ -3586,6 +3586,25 @@ struct Engine {
     }
     double sr_entry_ms = 0, sr_exit_ms = 0;
     long long sr_calls = 0;
+    // STRATA_Q36_REBAL_PROF=1: what rebalance() costs, split into the part that is its own work (the sort, the
+    // victim scan, the pageable-host staging of the H2D uploads) and the part that is the trailing
+    // cudaStreamSynchronize, which has to wait for the whole stream because slot_of's host copy is pageable.
+    // NOTE what 'work' holds: a pageable source is staged through the driver's pinned buffer INSIDE the
+    // cudaMemcpyAsync call, so that staging is charged to work and only the DMA completion to the sync.
+    // TWO POPULATIONS, TWO SETS OF COUNTERS.  rebalance() is called with 2048 allowed swaps at a prompt boundary
+    // and with 8 every 32 decode windows, so one pooled average would describe neither: a single prompt call
+    // (hundreds of expert blobs) dominates a dozen decode calls (at most 8 blobs each) and the "per call" figure
+    // would be the prompt's.  `prompt` says which set to charge.  Off by default: no clock is read.
+    static bool rebal_prof() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_REBAL_PROF");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    // [0] the prompt's calls, [1] the decode's
+    double rb_work_ms[2] = {0, 0}, rb_sync_ms[2] = {0, 0};
+    long long rb_calls[2] = {0, 0}, rb_swaps[2] = {0, 0};
     // STRATA_Q36_HELPER_TIMING=1 only: the part of the finish window spent in HELPER_SUM's result upload + the two
     // mask kernels, so `finish - sumc` is the rest of moe_helpers_wait (the drains, their host scatters and the
     // finish_window bookkeeping) rather than one undivided number.  Accumulated on the HELPER_ASYNC path only; the
@@ -7967,9 +7986,13 @@ struct Engine {
 
     /// The slots to the experts the routing used most (the counts halved each time): at most max_swaps replacements
     /// over all layers, between forwards (the copies are on the engine's stream).
-    void rebalance(int max_swaps) {
+    void rebalance(int max_swaps, bool prompt = false) {
         static const bool off = std::getenv("STRATA_Q36_FIXED_SLOTS") != nullptr;   // the slots as placed (tests)
         if (!m->hybrid || off || warming) return;
+        const bool rp = rebal_prof();
+        const int pi = rp && prompt ? 0 : 1;   // the probe's population: 0 the prompt's calls, 1 the decode's
+        const auto t_rb = rp ? Clock::now() : Clock::time_point{};
+        const long long sw_before = hy_swaps;
         const int64_t ne = m->g.n_expert;
         int left = max_swaps;
         for (size_t li = 0; li < hy.size() && left > 0; ++li) {
@@ -8015,7 +8038,15 @@ struct Engine {
                 CK(cudaMemcpyAsync(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice, st));
             for (double& v : H.score) v *= 0.5;
         }
+        const auto t_sync = rp ? Clock::now() : Clock::time_point{};
         CK(cudaStreamSynchronize(st));   // slot_of's host copy is pageable: the upload is done before it changes
+        if (rp) {
+            const double sync_ms = ms_since(t_sync);
+            rb_calls[pi] += 1;
+            rb_swaps[pi] += hy_swaps - sw_before;
+            rb_work_ms[pi] += ms_since(t_rb) - sync_ms;
+            rb_sync_ms[pi] += sync_ms;
+        }
     }
 
     void shrink_att(size_t floats) {
@@ -8205,14 +8236,14 @@ struct Engine {
 #if defined(STRATA_HAVE_DFLASH2)
                 if (use_df2) tap_on_ = false;
 #endif
-                if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+                if (m->hybrid) rebalance(hybrid_swaps_after_prompt, true);
                 return i + T;
             }
         }
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2) tap_on_ = false;
 #endif
-        if (m->hybrid) rebalance(hybrid_swaps_after_prompt);
+        if (m->hybrid) rebalance(hybrid_swaps_after_prompt, true);
         return n;
     }
 
@@ -9031,6 +9062,7 @@ struct Engine {
         warming = false;
         for (Hy& H : hy) std::fill(H.score.begin(), H.score.end(), 0.0);
         hy_cpu = hy_gpu = hy_swaps = 0;
+        for (int k = 0; k < 2; ++k) rb_work_ms[k] = rb_sync_ms[k] = 0, rb_calls[k] = rb_swaps[k] = 0;
         hy_helper = 0;   // the warmup's helper work is not part of the batch counts
         hy_cpu_ms = 0;
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
@@ -9063,6 +9095,7 @@ struct Engine {
     /// as warmup() does for its own throw-away passes.
     void discard_pass() {
         hy_cpu = hy_gpu = hy_swaps = 0;
+        for (int k = 0; k < 2; ++k) rb_work_ms[k] = rb_sync_ms[k] = 0, rb_calls[k] = rb_swaps[k] = 0;
         hy_helper = 0;
         hy_cpu_ms = 0;
         d_prebegin_ms = 0; d_prebegin_n = 0; d_route_spin_ms = 0; d_route_spin_n = 0;
@@ -11532,6 +11565,13 @@ int strata::qwen35::run(int argc, char** argv) {
             std::fprintf(stderr, "strata-q36: hybrid experts: %lld of %lld batch entries on the GPU (%.1f%%), %lld on the "
                          "CPU pool in %.0f ms, %lld slot replacements\n", E.hy_gpu, n, n ? 100.0 * E.hy_gpu / n : 0.0,
                          E.hy_cpu, E.hy_cpu_ms, E.hy_swaps);
+            if (E.rebal_prof())   // rebalance()'s cost, printed apart because one average would describe neither path
+                for (int k = 0; k < 2; ++k)
+                    std::fprintf(stderr, "strata-q36 REBAL %s: %lld calls, %lld swaps, work %.3f ms, trailing sync "
+                                 "%.3f ms (per call: work %.3f, sync %.3f)\n", k ? "decode" : "prompt", E.rb_calls[k],
+                                 E.rb_swaps[k], E.rb_work_ms[k], E.rb_sync_ms[k],
+                                 E.rb_calls[k] ? E.rb_work_ms[k] / (double) E.rb_calls[k] : 0.0,
+                                 E.rb_calls[k] ? E.rb_sync_ms[k] / (double) E.rb_calls[k] : 0.0);
         }
     } report{E};
     E.reset();
