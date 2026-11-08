@@ -1813,6 +1813,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(qwen35_sampling_test PRIVATE include)
   add_test(NAME qwen35_sampling_test COMMAND qwen35_sampling_test)
 
+  # the q36 hybrid placement's slot arithmetic, extracted from place_experts(); header-only, CPU
+  add_executable(qwen35_expert_plan_test src/qwen35/expert_plan_test.cpp)
+  target_include_directories(qwen35_expert_plan_test PRIVATE include)
+  add_test(NAME qwen35_expert_plan_test COMMAND qwen35_expert_plan_test)
+
   # The GPU test runs ON THE TARGET PC. `--selftest` allocates
   # and writes real VRAM, so a machine without a device fails this test rather than skipping it silently -
   # which is correct: an engine that targets one GPU should not report a pass for having no GPU.

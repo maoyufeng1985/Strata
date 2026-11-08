@@ -36,6 +36,7 @@
 
 #include "ggml.h"
 #include "strata/qwen35/engine.hpp"
+#include "strata/qwen35/expert_plan.hpp"
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
 // STRATA_Q36_PREFILL_PEERS: a prompt chunk's routed experts on the helper GPUs.  The header is the frozen contract
@@ -8954,26 +8955,31 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // that path does not exist (no MMQ), because then every batch would need the pool.
     if (Engine::no_host_experts()) E.hybrid_t = std::min(E.hybrid_t, E.vrows);
     const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
-    size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
-    if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
-    // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
-    int S = slots > 0 ? (int) std::min<int64_t>(ne, slots) : (int) std::min<size_t>((size_t) ne, slot_bytes / per_slot);
+    // --expert-slots: that many per layer (tests: the same split with and without the MTP block).
     // STRATA_Q36_MTP_VRAM=1: the MTP block's layer keeps every expert in the primary's VRAM, so the main layers
     // get what is left of the same budget.  (The other way to give that layer experts is
     // STRATA_Q36_MTP_HELPER=1, which puts them on the helpers - but the helpers' caches are full, so that
     // trade comes out of the MAIN layers' experts.)
-    // the F16 MTP block: its experts have no CPU-pool format (the pool has no F16), so they all stay in VRAM
-    const bool mtp_vram = m.has_mtp && !mtp_only && (E.mtp_vram_flag() || m.mtp_f16);
-    if (mtp_vram) {
-        const size_t mtp_bytes = m.mtp.stride * (size_t) ne;
-        const size_t main_per_slot = per_slot > m.mtp.stride ? per_slot - m.mtp.stride : 0;
-        const size_t left = slot_bytes > mtp_bytes ? slot_bytes - mtp_bytes : 0;
-        S = (int) std::min<size_t>((size_t) ne, main_per_slot ? left / main_per_slot : 0);
-    }
-    if (mtp_only) {   // the main layers all, the MTP block what is left
-        const size_t left = budget2 > total_main ? budget2 - total_main : 0;
-        S = (int) std::min<size_t>((size_t) ne, left / m.mtp.stride);
-    }
+    // The F16 MTP block: its experts have no CPU-pool format (the pool has no F16), so they all stay in VRAM.
+    // The arithmetic itself is in expert_plan.hpp, where it has a unit test and needs no card.
+    strata::qwen35::SlotBudget pb;
+    pb.experts = ne;
+    pb.override_slots = slots;
+    pb.budget = budget2;
+    pb.free_bytes = fr;
+    pb.staging = staging;
+    pb.per_slot = per_slot;
+    pb.has_mtp = m.has_mtp;
+    pb.mtp_f16 = m.mtp_f16;
+    pb.mtp_vram_flag = E.mtp_vram_flag();
+    pb.mtp_stride = m.has_mtp ? m.mtp.stride : 0;
+    pb.mtp_only = mtp_only;
+    pb.total_main = total_main;
+    const strata::qwen35::SlotPlan plan = strata::qwen35::plan_expert_slots(pb);
+    // the block whole, or the same count as the main layers - the one place the two callers below read it from
+    auto slots_of = [&](const Layer& L) {
+        return strata::qwen35::layer_slots(plan, &L == &m.mtp, m.mtp_f16);
+    };
     {   // what the hybrid mode allocates next (the staging pair, the CPU part's outputs, the slots) against the VRAM the
         // sessions and the context left: said with the numbers instead of a cudaMalloc failure (8 slots on a 12 GB card)
         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
@@ -8981,7 +8987,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         for (Layer* L : all) {
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
             else {
-                const int ns = ((mtp_vram || m.mtp_f16) && L == &m.mtp) ? (int) ne : S;
+                const int ns = slots_of(*L);
                 need += (ns > 0 ? (size_t) ns * L->stride + kMmqTail : 0);
             }
         }
@@ -9003,7 +9009,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     // So this drops the arena, and Engine::validate_no_host_experts(), called once the helpers are open and before
     // any forward runs, refuses the configuration when an expert would have no weights behind it.
     if (Engine::no_host_experts()) host = 0;
-    E.placed_slots = S;
+    E.placed_slots = plan.slots;
     uint8_t* arena = nullptr;
     bool pinned = host != 0 && cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
     if (!pinned && host != 0) {
@@ -9041,7 +9047,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
         }
         // the F16 MTP block: every expert in VRAM (the CPU pool cannot take F16), so it is never hybrid
-        const int ns = ((mtp_vram || m.mtp_f16) && &L == &m.mtp) ? (int) ne : S;
+        const int ns = slots_of(L);
         L.n_slots = ns;
         if (ns > 0) {
             CK(cudaMalloc(&L.blobs, L.stride * (size_t) ns + kMmqTail));
@@ -9183,16 +9189,18 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     CK(cudaDeviceSynchronize());
     if (mtp_only)
         std::fprintf(stderr, "strata-q36: every main layer's routed experts in VRAM (%.2f GiB); the MTP block's: %d of "
-                     "%lld in VRAM, the rest on the CPU pool (its drafts only)\n", (double) total_main / (1 << 30), S,
-                     (long long) ne);
+                     "%lld in VRAM, the rest on the CPU pool (its drafts only)\n", (double) total_main / (1 << 30),
+                     plan.slots, (long long) ne);
     else if (Engine::no_host_experts())
         std::fprintf(stderr, "strata-q36: no host expert arena (STRATA_Q36_NO_HOST_EXPERTS=1): every expert of every "
                  "layer claimed by a helper (checked once they are open), %d primary slot(s) a layer, bigger prompt "
-                 "chunks streamed (%.2f GiB staging); %.1f s\n", S, (double) staging / (1 << 30), ms_since(t0) / 1000.0);
+                 "chunks streamed (%.2f GiB staging); %.1f s\n", plan.slots, (double) staging / (1 << 30),
+                 ms_since(t0) / 1000.0);
     else
     std::fprintf(stderr, "strata-q36: hybrid experts: %d of %lld per layer in VRAM (%.2f GiB), all %.2f GiB in %s host "
                  "memory, the rest of a batch of <= %d rows on %d CPU threads, bigger prompt chunks streamed (%.2f GiB "
-                 "staging); %.1f s\n", S, (long long) ne, (double) S * per_slot / (1 << 30), (double) host / (1 << 30),
+                 "staging); %.1f s\n", plan.slots, (long long) ne, (double) plan.slots * per_slot / (1 << 30),
+                 (double) host / (1 << 30),
                  pinned ? "pinned" : "pageable", E.hybrid_t, E.pool->workers() + (E.pool->host_works() ? 1 : 0),
                  (double) staging / (1 << 30), ms_since(t0) / 1000.0);
     return true;
