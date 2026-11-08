@@ -133,7 +133,10 @@ conversation continues in the slot that holds its start, or the engine copies th
 A request that runs alone (the solo path, with its MTP drafts) moves into a batch slot when another arrives, and back
 when it is alone again, and gives the same text either way.
 `STRATA_Q36_READ_WINDOWS=4` lets the decoding slots produce more tokens during a long prompt read, at the cost of a
-slower read. The default is one decode window per chunk.
+slower read. The default is one decode window per chunk. A window costs 24 ms of the read with one decoding slot
+and 38 ms with two, and buys about two tokens per slot, so the number to ask for depends on how long the chunk is:
+at a chunk of 512 a half-time share is about 15 windows, and one window is far below that. See
+[Prompt read beside decoding slots](#prompt-read-beside-decoding-slots) for the measurement.
 
 **MTP drafts.** A request that has the engine to itself keeps its MTP drafts. With several requests the batch window has
 no drafts unless `--batch-mtp` is in the config's `args` (opt-in). Each slot's window then also carries the proposal its
@@ -158,6 +161,38 @@ In the hybrid mode the text of a request can differ a little between running alo
 experts that sit on the GPU or on the CPU change with the routing of all the requests, and the two compute with
 different rounding. With the slot tables fixed (`STRATA_Q36_FIXED_SLOTS=1`, a test setting) every slot equals its solo
 run there too.
+
+### What the slots are worth here (measured 2026-11-06)
+
+On a hybrid box the slots buy **speed**: the aggregate goes up with every slot, because a slot's row rides in a
+window whose fixed cost is already paid. The measurements below are one P100 and three P104 cards, four graphics cards
+each holding a third of the experts, `--kv int8`, a context of 2048, and eight conversations decoding at once with no
+drafts (`--batch 8`, this page's `--batch-mtp` off):
+
+| Conversations | Drafts | Total tok/s |
+| ---: | --- | ---: |
+| 2 | MTP (the solo path's) | 135.5 |
+| 2 | none | 102.9 |
+| 4 | none | 149.4 |
+| 6 | none | 166.4 |
+| 8 | none | **188.6** |
+
+Eight plain conversations beat two with drafts by 39 %. Below two conversations the drafts win; the two curves cross
+between two and four. The reason is a window's cost, measured over four counts: about 10.5 ms that every window pays
+whether it carries one row or eight, plus about 3.9 ms for each row. The fixed part is why more slots help, and the
+per-row part is why the help shrinks: ten conversations would give about 197 tok/s and twelve about 205, so eight is
+the last count worth asking for.
+
+**Nothing above is a default.** The engine keeps one session unless you ask for more, and a hybrid box's setup
+recommends the count its VRAM carries, not eight. To get these numbers, ask for the count yourself:
+
+```sh
+strata launch --family qwen --model q2_0 --parallel 8 --save-preset qwen36-eight
+```
+
+`--save-preset` keeps the choice, so the next `strata launch --preset qwen36-eight` needs no flags. Each slot takes its
+own cache in VRAM (0.14 GiB at a context of 2048; 1.5 GB at 32K, above), and the engine refuses a count that does not
+fit, with the numbers.
 
 ## Prompt chunk
 
@@ -301,6 +336,71 @@ solo run there too, with and without `--batch-mtp`.
 
 A 3,008-token prompt was read in 0.95 s (3,200 tok/s, 6 chunks). Each decoding slot paused at most 160 ms (one chunk)
 and produced 20 tokens meanwhile. With `STRATA_Q36_READ_WINDOWS=4` they produced 65 tokens during a 1.14 s read.
+
+> **Measured on:** 192.168.1.98, P100 + three P104s, `STRATA_Q36_NO_HOST_EXPERTS=1` (no 18.75 GiB host arena), a
+> 3,500-token prompt, one decoding slot, `--mtp 1 --batch-mtp`, `STRATA_Q36_MTP_DEPTH=2`, `STRATA_Q36_VERIFY_ROWS=8`,
+> one run per arm, the three P104s reset and at 5005 MHz, a warm-up request discarded before each arm.
+
+| `--chunk` | `READ_WINDOWS` | chunks | prompt read | prompt tok/s | tokens the other slot produced during the read |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 | 0 | 2 | 3,723 ms | 940 | 0 |
+| 2048 | 1 (default) | 2 | 3,750 ms | 933 | 3 |
+| 2048 | 8 | 2 | 3,913 ms | 894 | 15 |
+| 512 | 1 (default) | 7 | 4,316 ms | 811 | 11 |
+| 512 | 8 | 7 | 5,423 ms | 645 | 108 |
+
+Two numbers come out of this that the R9700 line above cannot give. **A granted window costs about 24 ms of prompt
+time**: +163 ms for the 7 extra windows at chunk 2048 and +1,107 ms for the 42 extra at chunk 512, which is 23.3 and
+26.4 ms, two different chunk sizes agreeing to 12%. And **a window buys 1.8-2.25 tokens**, which is the MTP acceptance
+rate (47-62% of proposals accepted in these arms) and not a property of the chunk.
+
+The read is not slowed by the windows alone. At `READ_WINDOWS=1` chunk 512 already costs 593 ms more than chunk 2048
+does (4,316 against 3,723 ms) because a smaller chunk streams every layer's expert rows over PCIe more times.
+
+A larger `READ_WINDOWS` therefore does not make the engine faster: the window time is added to the read, not hidden
+inside it, so this trades the prompting request's wait for the decoding request's. What it buys is that a decoding
+request is not frozen for the whole read - at the default it produced 0-11 tokens during a 1.6-3.7 s read.
+The default of one window per chunk is roughly 15x below a half-time share at chunk 512.
+
+> **Measured on:** the same box, this time with **two** decoding slots - the shape the pinned setup runs. Two greedy
+> decoders and one 3,500-token prompt, `--chunk 512`, every arm reset and warmed up, the three P104s at 5005 MHz.
+
+| `READ_WINDOWS` | prompt read | prompt tok/s | slot 0 | slot 1 | both |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 4,142 ms | 845 | 0 | 0 | 0 |
+| 1 (default) | 4,401 ms | 795 | 11 | 11 | 22 |
+| 8 | 5,996 ms | 584 | 108 | 108 | **216** |
+
+Two things differ from the one-slot table. A window now costs **38 ms** instead of 26 (+1,595 ms for 42 windows),
+because it carries two slots' rows rather than one. But a window also serves **both** decoders, so each millisecond
+of prompt time buys 39% more decode tokens than the same setting does at one slot: 0.122 against 0.088 tokens/ms.
+And the per-slot yield does not fall - 108 tokens per slot over 48 windows is exactly what one slot got on its own,
+so a second decoder does not shrink the first one's share at S=2.
+
+The cost stays linear as the count rises, so the trade can be priced at any point rather than only at one:
+
+| `READ_WINDOWS` | windows | prompt read | prompt tok/s | both slots |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 48 | 5,996 ms | 584 | 216 |
+| 16 | 96 | 7,781 ms | 450 | 436 |
+| 32 | 192 | 11,505 ms | 304 | 921 |
+
+Each extra window costs 37-39 ms of prompt time and returns 4.6-5.1 tokens (both slots together) at every one of
+those steps, so a fair half-time share can be computed as `chunk ms / 38`.
+
+**The two decoders above were given the same prompt**, which makes them produce identical tokens and take identical
+draft paths. Two *different* prompts behave better at no extra cost:
+
+| `READ_WINDOWS` | two different prompts | two identical prompts | prompt cost |
+| ---: | ---: | ---: | ---: |
+| 1 | 28 | 22 | -0.5% |
+| 8 | 251 | 216 | +0.2% |
+| 16 | 505 | 436 | +1.2% |
+
+The slot whose prompt did not change produced exactly the same number of tokens either way (11, 108 and 218 at the
+three settings), so the extra tokens all belong to the second slot and none were taken from the first.
+
+The trade is unchanged in kind: at `READ_WINDOWS=8` the prompt is 45% slower, and that time is added, not hidden.
 
 ### Speed work in 0.1.45
 
