@@ -3276,6 +3276,48 @@ struct Engine {
         }
         s_taken = true;
     }
+    // ---- STRATA_Q36_WIN_OUTSIDE_TIMING=1 (opt-in): the wall clock a decode window spends OUTSIDE forward(), split
+    // into the segments that also run GPU work and the remainder that does not.  The SERVE line's us/layer is
+    // forward() only (d_host_layer_n++ at :6044), so a window's own wall minus that is unaccounted - MEASURED on
+    // 192.168.1.98: s4d1v8's window is 45.1 ms while its 40 layers are 36.6 ms, i.e. 8.5 ms (18.8%) outside forward().
+    // That gap is mostly NOT idle: mtp_rows() runs a whole MTP block layer + the head matmul + two argmaxes
+    // (:7999-8000), and commit_rows() reruns the conv and GDN kernels of every non-attention layer (:7941-7945),
+    // each under a full cudaStreamSynchronize.  MEASURED, same box, s4d1v8: mtp_rows 3.92 + commit_rows 2.05 of the
+    // 8.5, leaving 3.05 of `other` - which is itself a mix, so this counter decomposes `other` too (see the second
+    // print).  Off by default: no clock is read.
+    // The `forward` column needs STRATA_Q36_SERVE_TIMING=1 and STRATA_Q36_HELPER_TIMING=1 as well (d_host_layer_ms is
+    // only accumulated under them); without those it prints 0 and `other` absorbs the forward time.
+    static bool win_outside_timing() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_WIN_OUTSIDE_TIMING");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    double so_mtp_ms = 0, so_commit_ms = 0, so_wall_ms = 0;   // summed over the decode windows
+    double so_fwd_ms = 0;   // the same windows' forward() share, i.e. the SERVE delta (helper_timing only)
+    // The `other` remainder decomposed, so the print can say which part is host work and which is a drain.  `rows` is
+    // the whole run_rows() call, so `rows - forward` is what the row path costs BESIDE the layer loop: the entry
+    // cudaStreamSynchronize (:7869) that picks up the previous window's pending chain copies, the staging fills, the
+    // launch, and the pick D2H + its sync.  `pick` is the per-slot loop that samples and prints (host_logits_row,
+    // sample, the BT/BDONE printf).  `poll` is the control-line read at the top of the window.
+    double so_rows_ms = 0, so_pick_ms = 0, so_poll_ms = 0;
+    long long so_windows = 0;
+    // ---- STRATA_Q36_ROWS_SYNC_TIMING=1 (opt-in): the two full drains inside run_rows(), measured separately.
+    // rows_extra above is 2.95 of `other`'s 3.06 ms - essentially all of it - but that bracket spans the whole
+    // call, so it cannot say whether the cost is the ENTRY drain (:7876, which waits for the previous window's
+    // chain copies) or the EXIT one (:7920, which waits for this window's forward).  An exit drain may be pure
+    // pipeline tail and unmovable; an entry drain that waits on host-posted copies would be real idle.  This
+    // separates them.  Off by default: no clock is read, and the brackets are the only change to run_rows().
+    static bool rows_sync_timing() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_ROWS_SYNC_TIMING");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    double sr_entry_ms = 0, sr_exit_ms = 0;
+    long long sr_calls = 0;
     // STRATA_Q36_HELPER_TIMING=1 only: the part of the finish window spent in HELPER_SUM's result upload + the two
     // mask kernels, so `finish - sumc` is the rest of moe_helpers_wait (the drains, their host scatters and the
     // finish_window bookkeeping) rather than one undivided number.  Accumulated on the HELPER_ASYNC path only; the
@@ -3630,6 +3672,38 @@ struct Engine {
     bool mx_timing = false;
     double mx_attn_ms = 0, mx_gdn_ms = 0, mx_merge_ms = 0;
     long long mx_attn_n = 0, mx_gdn_n = 0, mx_merge_n = 0;
+    // STRATA_Q36_GDNDEC=1: the DECODE's GDN costs, which GDNPROF cannot see (it only times the prompt branch).
+    // The two kernels of the rows-mode GDN branch are timed apart, so "how much of the primary's 247.5 us
+    // prebegin_sync is the recurrence" becomes a number instead of an inference.
+    //
+    // The events are a RING and are created once.  A single set cannot work without a per-layer drain: a set
+    // recorded for layer N is still in flight when layer N+1 wants to record, so reading it there would need a
+    // cudaEventSynchronize - which turns the primary's launch queue into 30 serial round trips a window and
+    // moves the very thing being measured.  kGdnDecRing sets make the one being read several layers old, i.e.
+    // long finished; the read is then a host call on complete events and never waits.
+    static constexpr int kGdnDecRing = 8;
+    cudaEvent_t de0[kGdnDecRing] = {}, de1[kGdnDecRing] = {}, de2[kGdnDecRing] = {};
+    bool gdn_dec_on = false;
+    int gdn_dec_slot = 0;           // the set the NEXT record uses
+    int gdn_dec_pending[kGdnDecRing] = {};   // per set: 1 = recorded, not yet read
+    double d_conv_ms = 0, d_gdn_ms = 0;
+    long long d_gdn_n = 0;
+    long long d_gdn_dropped = 0;    // samples the ring overwrote before they could be read (see below)
+    /// Read every pending GDN sample whose events have completed.  Never waits: cudaEventQuery is cheap and a
+    /// sample that is not ready yet stays pending.
+    void gdn_dec_read() {
+        if (!gdn_dec_on) return;
+        for (int i = 0; i < kGdnDecRing; ++i) {
+            if (!gdn_dec_pending[i]) continue;
+            if (cudaEventQuery(de2[i]) != cudaSuccess) continue;   // still in flight: keep it
+            float mc = 0, mg = 0;
+            if (cudaEventElapsedTime(&mc, de0[i], de1[i]) == cudaSuccess &&
+                cudaEventElapsedTime(&mg, de1[i], de2[i]) == cudaSuccess) {
+                d_conv_ms += mc; d_gdn_ms += mg; ++d_gdn_n;
+            }
+            gdn_dec_pending[i] = 0;
+        }
+    }
     bool gpu_timing_open = false; // the events of one layer() call are still being recorded (do not read them yet)
     bool gpu_open_this_forward = false;  // forward() arms exactly one layer (the last) to carry the tile
     bool gpu_timing_hold = false; // a graph is being captured (event records are legal, readings are not)
@@ -4479,11 +4553,14 @@ struct Engine {
         }
         k_add_rms<<<T, kThreads, 0, st>>>(xh, yh, L.post_norm, hh, N, m->eps);
     }
-    /// The shared expert's gate + up + SwiGLU + q8_1 image (into q8) for T <= 4 rows in one launch (q36k::k_sh_gu), else false.
+    /// The shared expert's gate + up + SwiGLU + q8_1 image (into q8) for T <= 6 rows in one launch (q36k::k_sh_gu), else false.
+    /// 6 is the last count that stays inside __launch_bounds__(1024)'s 64-register budget with no spill (ptxas, sm_60:
+    /// NC 5 and 6 use 64 registers with 0 spill; NC 7 spills 4 bytes and NC 8 spills 56).  It is also the width the
+    /// pinned serve config runs: vrows 8, 2 sessions, MTP depth 2 -> T = 6.  A wider window (vrows 10) falls back.
     bool shared_gu(const Layer& L, int T) {
         const int FS = (int) m->g.n_ff_shexp;
         const Mat &a = L.sh_gate, &b = L.sh_up;
-        if (!fast_k || T < 1 || T > 4 || a.type != 8 || b.type != 8 || a.n_in != b.n_in || a.n_out != FS || b.n_out != FS ||
+        if (!fast_k || T < 1 || T > 6 || a.type != 8 || b.type != 8 || a.n_in != b.n_in || a.n_out != FS || b.n_out != FS ||
             a.n_in % 32 != 0 || a.n_in / 32 > 64 || a.n_in / 32 <= 32 || FS % 32 != 0 ||
             (K::native_q8_0_packed_eligible(a.n_in, a.n_out) && K::native_q8_0_packed_enabled()))
             return false;
@@ -4503,7 +4580,7 @@ struct Engine {
             q36k::k_sh_gu<NCV, 2, false><<<grid, 1024, 0, st>>>(wa, nullptr, wb, nullptr, (const q36k::QB*) xq, \
                                                                 (q36k::QB*) q8, nb, FS);                     \
         break;
-        switch (T) { Q36_SH(1) Q36_SH(2) Q36_SH(3) Q36_SH(4) }
+        switch (T) { Q36_SH(1) Q36_SH(2) Q36_SH(3) Q36_SH(4) Q36_SH(5) Q36_SH(6) }
 #undef Q36_SH
         if (verify_k) {
             if (!vbuf) CK(cudaMalloc((void**) &vbuf, (size_t) kVerifyMax * 16384 * 4));
@@ -4830,10 +4907,17 @@ struct Engine {
                 apply(L.sh_gate, xq, sg + (size_t) ro * FS, T);
                 apply(L.sh_up, xq, su + (size_t) ro * FS, T);
                 // STRATA_Q36_PREFILL_SPLIT=2: the q8_1 image lands at `q8 + ro * qb` so mmq below reads the
-                // half's own rows.  The byte offset is one q8_1 row of width FS.
+                // half's own rows.  The byte offset is one q8_1 row of width FS.  A batch-rows window wider
+                // than eight rows (STRATA_Q36_VERIFY_ROWS) is chunked like mmq: the kernel is per-row SwiGLU
+                // plus a row-wise quantize, so one 8-row pass per chunk is the one-pass result's own bytes.
                 const size_t qb_fs = K::native_q8_1_bytes(FS, 1);
-                K::native_swiglu_quantize_q8_1(sg + (size_t) ro * FS, su + (size_t) ro * FS,
-                                                (uint8_t*) q8 + (size_t) ro * qb_fs, FS, T, st);
+                const float* sgh = sg + (size_t) ro * FS, * suh = su + (size_t) ro * FS;
+                uint8_t* qh = (uint8_t*) q8 + (size_t) ro * qb_fs;
+                for (int c0 = 0; c0 < T; c0 += 8) {
+                    const int nc = std::min(8, T - c0);
+                    K::native_swiglu_quantize_q8_1(sgh + (size_t) c0 * FS, suh + (size_t) c0 * FS,
+                                                    qh + (size_t) c0 * qb_fs, FS, nc, st);
+                }
             }
             // mmq reads `q8 + c0 * qb` where c0 is the call's local row index; for the half, the call's
             // local row 0 is the chunk's row `ro`, so pass `q8` moved by `ro * qb`.
@@ -4908,11 +4992,32 @@ struct Engine {
                 k_gdn_gb<<<grid1((int64_t) HV * T), kThreads, 0, st>>>(al_b, L.dt, L.ssm_a, be_b, HV, T);
             }
             if (rows_mode) {   // batch rows: a slot's rows (one, or a verify window's two) in sequence on its own state
+                // STRATA_Q36_GDNDEC=1: the decode's own GDN costs, timed apart.  GDNPROF below only covers the
+                // PROMPT branch (chunk(T) && !verify), so the decode's recurrence - the one that runs 30 times a
+                // layer on the critical path - has never been timed at all.
+                //
+                // NO SYNCHRONIZE HERE.  An earlier draft drained the stream every GDN layer to read the events,
+                // which turns the primary's asynchronous launch queue into 30 serial round trips a window and
+                // moves the very thing being measured.  The events are recorded on the running stream and read
+                // later, at the window's own drain, so the layer path keeps its shape: record, do not wait.
+                gdn_dec_read();   // harvest whatever has completed; never waits
+                const int ds = gdn_dec_slot;
+                // A slot still pending here means the ring came back round before it was harvested; that sample
+                // is lost rather than mis-read (its events are about to be re-recorded).  Counted so the report
+                // can say the numbers are a subset, never silently.
+                if (gdn_dec_on && gdn_dec_pending[ds]) { ++d_gdn_dropped; gdn_dec_pending[ds] = 0; }
+                if (gdn_dec_on) CK(cudaEventRecord(de0[ds], st));
                 k_conv_seq<<<dim3(C / 128, rows_G), 128, 0, st>>>(nullptr, qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, 1,
                                                                   !verify, d_conv_tab + li * n_sess, d_gslot, d_grow0, d_gcnt);
+                if (gdn_dec_on) CK(cudaEventRecord(de1[ds], st));
                 k_gdn_seq<<<dim3(HV, rows_G), dim3(128, 4), 0, st>>>(nullptr, hc_b, C, al_b, be_b, z, L.ssm_norm, m->eps,
                                                                      gdn_y, HK, HV, 1, !verify, d_S_tab + li * n_sess,
                                                                      d_gslot, d_grow0, d_gcnt);
+                if (gdn_dec_on) {
+                    CK(cudaEventRecord(de2[ds], st));
+                    gdn_dec_pending[ds] = 1;
+                    gdn_dec_slot = (ds + 1) % kGdnDecRing;
+                }
             } else {
                 // one token, a window or a chunk: the same kernels (every token in one launch each), so a decode step and a
                 // verify window compute bitwise the same rows and the MTP's greedy text is the plain greedy text.  (Strata's
@@ -7758,6 +7863,24 @@ struct Engine {
             chunk_pictures(pos, T);
             const int64_t p0 = pos;
             forward(T, pos, i + T == n ? 1 : 0, false, false);
+            // STRATA_Q36_CHUNK_DUMP=<dir>: this chunk's last-layer rows (hmain, T*N floats), so a chunked
+            // prompt can be compared against the whole one chunk by chunk.  Diagnostic only.
+            if (const char* cdd = std::getenv("STRATA_Q36_CHUNK_DUMP")) {
+                if (*cdd != '\0') {
+                    CK(cudaStreamSynchronize(st));
+                    std::vector<float> ch((size_t) T * (size_t) N);
+                    CK(cudaMemcpy(ch.data(), hmain, ch.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                    char cfn[512];
+                    std::snprintf(cfn, sizeof cfn, "%s/chunk_p%05lld_t%d.bin", cdd, (long long) p0, T);
+                    if (std::FILE* cf = std::fopen(cfn, "wb")) {
+                        if (std::fwrite(ch.data(), sizeof(float), ch.size(), cf) != ch.size())
+                            std::fprintf(stderr, "strata-q36: chunk dump: short write to %s\n", cfn);
+                        std::fclose(cf);
+                    } else {
+                        std::fprintf(stderr, "strata-q36: chunk dump: cannot open %s\n", cfn);
+                    }
+                }
+            }
             if (m->has_mtp && mtp_d > 0) {
                 // seeds: h_{q-1} for each row q: hlast, then this chunk's rows 0 .. T - 2 (in `y`, free here)
                 CK(cudaMemcpyAsync(mtp_seed(), hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
@@ -7821,7 +7944,10 @@ struct Engine {
     /// row's logits in `logits`.  Without verify the sessions' positions advance by their rows.
     void run_rows(const Group* gr, int G, bool verify) {
         sess[(size_t) cur].pos = pos;
+        const bool rst = rows_sync_timing();
+        const auto t_entry = rst ? Clock::now() : Clock::time_point{};
         CK(cudaStreamSynchronize(st));   // the pinned staging is free again
+        if (rst) sr_entry_ms += ms_since(t_entry);
         int64_t pmax = 0;
         int T = 0;
         for (int g = 0; g < G; ++g) {
@@ -7857,7 +7983,12 @@ struct Engine {
         rows_deferred = false;
         rows_mode = false;
         CK(cudaMemcpyAsync(hrow + kRowPick, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
+        const auto t_exit = rst ? Clock::now() : Clock::time_point{};
         CK(cudaStreamSynchronize(st));
+        // STRATA_Q36_GDNDEC=1: the window is drained here, so the last GDN layer's events are readable now and
+        // this read adds no wait.  It has to happen before the next window records over the same events.
+        gdn_dec_read();
+        if (rst) { sr_exit_ms += ms_since(t_exit); ++sr_calls; }
         for (int r = 0; r < T; ++r) rows_pick[r] = hrow[kRowPick + r];
         if (!verify)
             for (int g = 0; g < G; ++g) sess[(size_t) gr[g].slot].pos += gr[g].n;
@@ -7953,6 +8084,54 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         for (int r = 0; r < T; ++r) mtp_pick[r] = hrow[kRowPick + r];
     }
+    /// STRATA_Q36_MTP_DEPTH=d (1..4): how many proposals the MTP block chains for one slot.  Depth 1 is the
+    /// single proposal this path has always made.  Depth d costs d sequential block passes (each step feeds the
+    /// previous step's pick back as its token), so it only pays where the fixed per-window cost dominates - a
+    /// narrow window, one or two sessions.  The chain stops early at an EOS so a slot never verifies past it.
+    ///
+    /// MEASURED (S=2, 2 x 48 tokens, `s2_analyze_live.py` on the q36-analyze2 metric, 2026-11-08): depth 1 is
+    /// +13% over the plain path on SAMPLED traffic (102.2-103.2 vs 89.9-91.2 tok/s, 4 runs each, no overlap),
+    /// and depth 2 is -7% (83.9-84.6).  Depth 2 wins on GREEDY traffic instead (141.8 / 70.9, the pinned
+    /// record).  The difference is acceptance: an argmax draft is accepted at p(draft), which is ~91% greedy
+    /// but 74% sampled at depth 1 and 47% at depth 2 - the second draft's marginal acceptance is the weak one.
+    int mtp_depth() const {
+        static const int d = [] {
+            const char* v = std::getenv("STRATA_Q36_MTP_DEPTH");
+            const int n = v ? std::atoi(v) : 1;
+            return n < 1 ? 1 : n > 4 ? 4 : n;   // 1 .. 4: 4 drafts + the slot's own row is 5, well inside kVerifyMax
+        }();
+        return d;
+    }
+    /// One seed row per slot, for the chained proposals: mtp_rows writes the block's output hidden into `hmtp`,
+    /// and one call covers several slots' rows, so each slot's last row output must be copied out before the next
+    /// mtp_rows call re-uses that row.  Allocated lazily, sized by the session count.
+    ///
+    /// The seed of a chained step is the BLOCK's hidden for the row it was just fed, not the main model's.  The
+    /// single-stream chain sets the precedent: its first call seeds from hlast/hmain over the rows it re-reads,
+    /// then every chained step copies `hmtp + last_row * N` forward.  Feeding hmain here instead was wrong:
+    /// hmain holds the MAIN model's hidden for the row at `cell` - 1, while the proposal being fed sat one cell
+    /// further on, so every chained proposal was made from a hidden one token behind its own input.
+    float* mtp_cseed = nullptr;
+    float* alloc_q36_cseed() { return dalloc((size_t) n_sess * (size_t) m->g.n_embd); }
+    /// STRATA_Q36_MTP_SAMPLED=1: let a request that samples (temperature > 0, or any penalty) verify MTP proposals
+    /// instead of decoding one row a window.  Off by default: a sampled slot then keeps the one-row path it has
+    /// always had, and every greedy arm is byte-identical.
+    ///
+    /// No rejection sampler is needed and the draft head does not have to report a probability.  A draft here is an
+    /// ARGMAX, i.e. a delta distribution with q(d) = 1, so the acceptance test `min(1, p(d)/q(d))` of spec decoding
+    /// collapses to `p(d)` and the recovery distribution after a rejection is `p` with `d` removed and renormalised.
+    /// Drawing one token from `p` and keeping the prefix that equals the drafts has exactly that distribution - so
+    /// "sample once, compare the prefix" IS the rejection sampler in this case, at zero extra cost.
+    static bool mtp_sampled() {
+        static const bool on = [] {
+            const char* v = std::getenv("STRATA_Q36_MTP_SAMPLED");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        return on;
+    }
+    /// A slot may verify a proposal: greedy always does, and a sampling slot does once mtp_sampled() is on.
+    bool mtp_cand(const strata::qwen35::Sampling& s) const { return !s.needs_logits() || mtp_sampled(); }
+
     /// Row r's logits of the last step_rows, on the host.
     void host_logits_row(int r, std::vector<float>& out) {
         out.resize((size_t) m->g.n_vocab);
@@ -8562,6 +8741,7 @@ struct Engine {
         d_host_layer_ms = 0; d_host_layer_n = 0;
         d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_shared_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
         d_h_sumc_ms = 0;
+        d_conv_ms = 0; d_gdn_ms = 0; d_gdn_n = 0; d_gdn_dropped = 0;   // STRATA_Q36_GDNDEC=1: not the warmup's
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: the GPU-segment accumulators reset with the host ones, or bench
                       // pass 1 would leak into pass 2 and into the AGG aggregate.
         pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason, for the prompt-chunk accumulators
@@ -8593,6 +8773,7 @@ struct Engine {
         d_host_layer_ms = 0; d_host_layer_n = 0;
         d_h_mixer_ms = 0; d_h_begin_ms = 0; d_h_local_ms = 0; d_h_shared_ms = 0; d_h_cpu_ms = 0; d_h_finish_ms = 0;
         d_h_sumc_ms = 0;
+        d_conv_ms = 0; d_gdn_ms = 0; d_gdn_n = 0; d_gdn_dropped = 0;   // STRATA_Q36_GDNDEC=1: same reason as warmup()
         gp_reset();   // STRATA_Q36_HELPER_TIMING=1: same reason as in warmup()
         pp_reset();   // STRATA_Q36_PROMPT_TIMING=1: same reason
         row_ids.clear();
@@ -8930,6 +9111,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             E.gpu_timing = true;
         }
     }
+    // STRATA_Q36_GDNDEC=1: the decode GDN probe's three events, created once here (the layer path only records).
+    {
+        const char* gd = std::getenv("STRATA_Q36_GDNDEC");
+        if (gd && gd[0] == '1' && gd[1] == '\0') {
+            for (int i = 0; i < Engine::kGdnDecRing; ++i) {
+                CK(cudaEventCreate(&E.de0[i])); CK(cudaEventCreate(&E.de1[i])); CK(cudaEventCreate(&E.de2[i]));
+            }
+            E.gdn_dec_on = true;
+        }
+    }
     // STRATA_Q36_QUEST_TIMING=1: the Quest kernels' own events (four per layer).  Created only under that gate, so
     // a flag-off run allocates and records nothing it did not have before.
     {
@@ -9154,6 +9345,11 @@ struct Slot {
     Clock::time_point t0;
     int32_t draft = 0;            // --batch-mtp: the MTP block's proposal for the token after `x`
     bool draft_ready = false;
+    // --batch-mtp depth: the proposals the block chained, `mdepth` of them (1 unless STRATA_Q36_MTP_DEPTH says
+    // otherwise).  draft/draft_ready stay the first proposal and its validity, so a depth of 1 with the variable
+    // unset is the path this slot has always taken.
+    std::vector<int32_t> mchain;
+    int mdepth = 0;
     std::vector<int32_t> drafts;   // DFlash2: the drafts this slot verifies (draft_ready says they are current)
     int ndraft = 0;
     long long offered = 0, accepted = 0;
@@ -9204,20 +9400,35 @@ struct Serve {
     /// it, from the hidden states the window just produced (the first one of a slot from the state its prompt left).
     int mtp_turn = 0;
     void window_mtp() {
-        poll_control();
+        const bool wot = E.win_outside_timing();
+        const auto t_win = wot ? Clock::now() : Clock::time_point{};
+        double wo_mtp = 0, wo_commit = 0, wo_rows = 0, wo_pick = 0, wo_poll = 0;
+        {
+            const auto t_poll = wot ? Clock::now() : Clock::time_point{};
+            poll_control();
+            if (wot) wo_poll = ms_since(t_poll);
+        }
         const int N = (int) E.m->g.n_embd;
         std::vector<int> act;
         for (int b = 0; b < E.n_sess; ++b)
             if (slots[(size_t) b].active) act.push_back(b);
         const int S = (int) act.size();
         if (S == 0) return;
+        // STRATA_Q36_SERVE_TIMING=1: the same per-window snapshot window_plain takes at :9563, so an MTP window
+        // reports the SERVE split too.  Without it s_taken stays false here and the report never prints a
+        // per-layer line for any --batch-mtp arm.  NOTE: the interval also covers every mtp_rows() call (the
+        // refresh, plus one per chain step when STRATA_Q36_MTP_DEPTH > 1), which do NOT pass through forward()
+        // and so do not raise d_host_layer_n.  Their shared/finish time lands in the window delta while the
+        // us/layer denominator does not grow, so the finish/shared columns read slightly high on this path and
+        // are not directly comparable with the plain and df2 arms.
+        E.serve_window_snap();
         // who verifies a proposal this window: the greedy slots in turn, as many as fit beside one row per slot
         const int room = E.vrows - S;
         std::vector<char> cand((size_t) S, 0);
         int nc = 0;
         for (int k = 0; k < S && nc < room; ++k) {
             const int i = (mtp_turn + k) % S;
-            if (!slots[(size_t) act[(size_t) i]].smp.needs_logits()) { cand[(size_t) i] = 1; ++nc; }
+            if (E.mtp_cand(slots[(size_t) act[(size_t) i]].smp)) { cand[(size_t) i] = 1; ++nc; }
         }
         ++mtp_turn;
         // a candidate without a proposal gets its first one from the state its last row left
@@ -9232,7 +9443,9 @@ struct Serve {
             }
         }
         if (!first.empty()) {
+            const auto t_mtp = wot ? Clock::now() : Clock::time_point{};
             E.mtp_rows(first.data(), (int) first.size());
+            if (wot) wo_mtp += ms_since(t_mtp);
             for (size_t k = 0; k < first.size(); ++k) {
                 Slot& sl = slots[(size_t) act[(size_t) first_of[k]]];
                 sl.draft = E.mtp_pick[k];
@@ -9241,39 +9454,103 @@ struct Serve {
         }
         std::vector<Engine::Group> gr((size_t) S);
         std::vector<int> row0((size_t) S);
+        // STRATA_Q36_MTP_DEPTH>1: hand out the rows in two passes so a deeper chain never takes a row another
+        // slot's FIRST proposal needs.  Pass 1 gives every candidate its 2 rows (the depth-1 shape), pass 2
+        // spends what is left on the chained proposals in slot order.  A one-pass "as many as still fit" let a
+        // 4-slot window starve its last two slots down to a single row - they lost the one draft they always
+        // had, which is a throughput loss, not a gain.  With the variable unset `mdepth` is 0, pass 2 is empty,
+        // and every group is the 2-row (or 1-row non-candidate) group this window has always built.
+        std::vector<int> nrow((size_t) S, 1);
+        for (int i = 0; i < S; ++i) nrow[(size_t) i] = cand[(size_t) i] ? 2 : 1;
+        int used = 0;
+        for (int i = 0; i < S; ++i) used += nrow[(size_t) i];
+        if (used > E.vrows) {   // more candidates than the window holds: one row each, as the old build did
+            for (int i = 0; i < S; ++i) nrow[(size_t) i] = 1;
+            used = S;
+        }
+        for (int i = 0; i < S && used < E.vrows; ++i) {
+            const Slot& sl = slots[(size_t) act[(size_t) i]];
+            if (!cand[(size_t) i] || sl.mdepth <= 1) continue;
+            const int extra = std::min<int>(sl.mdepth - 1, E.vrows - used);
+            nrow[(size_t) i] += extra;
+            used += extra;
+        }
         int T = 0;
         for (int i = 0; i < S; ++i) {
             const Slot& sl = slots[(size_t) act[(size_t) i]];
-            gr[(size_t) i] = {act[(size_t) i], cand[(size_t) i] ? 2 : 1, {sl.x, sl.draft}};
+            const int n = nrow[(size_t) i];
+            gr[(size_t) i] = {act[(size_t) i], n, {}};
+            gr[(size_t) i].tok[0] = sl.x;
+            // A chained slot's mchain[0] is the proposal the refresh of LAST window made and this one verifies
+            // (the refresh above only fills slots without a proposal).  n > 2 implies mdepth > 1, which implies
+            // mchain was built; the fallback to sl.draft covers the depth-1 shape and any slot the clearing loop
+            // emptied, and keeps tok[1] the same single proposal this path has always fed.
+            for (int d = 1; d < n; ++d)
+                gr[(size_t) i].tok[d] = (size_t) (d - 1) < sl.mchain.size() ? sl.mchain[(size_t) (d - 1)] : sl.draft;
             row0[(size_t) i] = T;
             T += gr[(size_t) i].n;
         }
-        E.run_rows(gr.data(), S, true);
+        {
+            const auto t_rows = wot ? Clock::now() : Clock::time_point{};
+            E.run_rows(gr.data(), S, true);
+            if (wot) wo_rows = ms_since(t_rows);
+        }
+        const auto t_pick = wot ? Clock::now() : Clock::time_point{};
         // the picks: emit, decide how many rows each slot keeps
         std::vector<int> keep((size_t) S, 1);
         std::vector<int32_t> last((size_t) S, 0);
         std::vector<char> alive((size_t) S, 0);
+        std::vector<float> lgn;   // STRATA_Q36_MTP_SAMPLED: the whole group's logit rows, one D2H
+        std::vector<int32_t> tok_row((size_t) Engine::kVerifyMax, 0);   // what the group's rows emit: picks or samples
         for (int i = 0; i < S; ++i) {
             const int b = act[(size_t) i];
             Slot& sl = slots[(size_t) b];
             Engine::Sess& ss = E.sess[(size_t) b];
             const int n = gr[(size_t) i].n, r0 = row0[(size_t) i];
-            int y0 = E.rows_pick[r0];
+            // The token each row of this group emits.  Greedy: the argmax pick the device already wrote.  Sampling
+            // (STRATA_Q36_MTP_SAMPLED): a draw from that row's logits, and the draw is what the prefix test below
+            // compares - which is exactly the acceptance rule of spec decoding when the draft is an argmax, i.e. a
+            // delta with q(draft) = 1 (see mtp_sampled()).  One D2H carries every row of the group, so this costs
+            // the single sync the sampled path already paid.
+            for (int j = 0; j < n; ++j) tok_row[(size_t) j] = E.rows_pick[r0 + j];
             if (sl.smp.needs_logits()) {
-                E.host_logits_row(r0, lg);
-                y0 = sample(lg, sl.smp, sl.hist, sl.rng);
+                const size_t V = (size_t) E.m->g.n_vocab;
+                lgn.resize((size_t) n * V);
+                CK(cudaMemcpyAsync(lgn.data(), E.logits + (size_t) r0 * V, (size_t) n * V * 4,
+                                   cudaMemcpyDeviceToHost, E.st));
+                CK(cudaStreamSynchronize(E.st));
+                // The history grows with every accepted draft, because row j's distribution is conditioned on the
+                // tokens the rows before it emit - the same history a one-row-at-a-time decode would keep.
+                std::vector<int32_t> hist = sl.hist;
+                std::vector<float> row(V);
+                for (int j = 0; j < n; ++j) {
+                    std::memcpy(row.data(), lgn.data() + (size_t) j * V, V * 4);
+                    tok_row[(size_t) j] = (int32_t) sample(row, sl.smp, hist, sl.rng);
+                    hist.push_back(tok_row[(size_t) j]);
+                }
             }
-            bool two = n == 2 && y0 == sl.draft && !is_eos(y0) && !sl.stop && sl.produced + 2 <= sl.max_new &&
-                       ss.pos + 3 <= E.ctx;   // (ss.pos: the position of the slot's next token: the window did not move it)
-            if (n == 2) { ++sl.offered; if (two) ++sl.accepted; }
-            const int rows_kept = two ? 2 : 1;
+            const int y0 = tok_row[0];
+            // How many of this slot's proposals the window confirms: the longest prefix whose rows emit the drafts
+            // that were fed.  `n == 2` is exactly the old "two" test (one draft, one pick), so the depth-1 greedy
+            // path decides bit for bit as it did.  The guards below are the old ones applied per row.
+            int a = 0;
+            if (n > 1 && !is_eos(y0) && !sl.stop && sl.produced < sl.max_new && ss.pos + 2 <= E.ctx) {
+                while (a < n - 1 && tok_row[(size_t) a] == gr[(size_t) i].tok[a + 1]) {
+                    // the row `a + 1` may itself hit a limit: stop the prefix there rather than emit past it
+                    if (sl.produced + (int64_t) a + 2 > sl.max_new) break;
+                    if (ss.pos + (int64_t) a + 3 > E.ctx) break;
+                    if (is_eos(tok_row[(size_t) a])) break;
+                    ++a;
+                }
+            }
+            if (n > 1) { sl.offered += n - 1; sl.accepted += a; }
+            const int rows_kept = 1 + a;
             keep[(size_t) i] = rows_kept;
-            const int32_t fed[2] = {sl.x, sl.draft};
             bool done = false;
             int y = y0;
             for (int j = 0; j < rows_kept; ++j) {
-                if (j == 1) y = E.rows_pick[r0 + 1];
-                ss.live.push_back(fed[j]);
+                if (j >= 1) y = tok_row[(size_t) j];
+                ss.live.push_back(gr[(size_t) i].tok[j]);
                 std::printf("BT %d %d\n", b, y);
                 ++sl.produced;
                 sl.hist.push_back(y);
@@ -9295,7 +9572,12 @@ struct Serve {
             alive[(size_t) i] = !done;
             if (!done) sl.x = y;
         }
-        E.commit_rows(gr.data(), keep.data(), S);
+        if (wot) wo_pick = ms_since(t_pick);
+        {
+            const auto t_commit = wot ? Clock::now() : Clock::time_point{};
+            E.commit_rows(gr.data(), keep.data(), S);
+            if (wot) wo_commit += ms_since(t_commit);
+        }
         // the hidden state after each slot's last kept row (the seed of a later first proposal), and the next proposals
         std::vector<Engine::MtpRow> nx;
         std::vector<int> nx_of, nx_last;
@@ -9309,9 +9591,15 @@ struct Serve {
             sl.draft_ready = false;
             if (!alive[(size_t) i] || !cand[(size_t) i]) continue;
             const int64_t p_new = ss.pos;   // commit_rows moved it: the cell of the token the next window feeds
-            if (keep[(size_t) i] == 2) {
-                nx.push_back({b, sl.draft, p_new - 1, E.hmain + (size_t) r0 * N});
-                nx.push_back({b, last[(size_t) i], p_new, E.hmain + (size_t) (r0 + 1) * N});
+            const int kept = keep[(size_t) i];
+            if (kept >= 2) {
+                // The block must see, in order, every row the window kept.  Row j of the window was fed at cell
+                // p_new - kept + j with the hidden of the row before it as its seed; the last emitted token goes
+                // one cell on.  For kept == 2 this is exactly the two rows this path has always pushed
+                // ({draft, p_new-1, hmain[r0]}, {last, p_new, hmain[r0+1]}).
+                for (int j = 1; j < kept; ++j)
+                    nx.push_back({b, gr[(size_t) i].tok[j], p_new - kept + j, E.hmain + (size_t) (r0 + j - 1) * N});
+                nx.push_back({b, last[(size_t) i], p_new, E.hmain + (size_t) (r0 + kept - 1) * N});
                 nx_last.push_back((int) nx.size() - 1);
             } else {
                 nx.push_back({b, last[(size_t) i], p_new, E.hmain + (size_t) r0 * N});
@@ -9321,18 +9609,127 @@ struct Serve {
         }
         std::fflush(stdout);
         if (!nx.empty()) {
+            // A deeper chain only pays where the window has rows left for it: at S=4 the 8-row window is exactly
+            // full, so the chain's proposals could never be verified and the block passes would be pure loss.
+            // slack is what pass 2 of the group build had to spend.
+            int slack = E.vrows - S;
+            for (int i = 0; i < S; ++i) slack -= cand[(size_t) i] ? 1 : 0;   // the first proposal's spare row
+            const int want = slack > 0 ? E.mtp_depth() : 1;
+            // A chained step's seed is the block's own output for the row before it, and that output lives in
+            // hmtp only until the next mtp_rows call.  So the last row's output per slot is copied out of hmtp
+            // HERE, before this loop advances to another call, into a per-slot staging row.
+            if (want > 1 && !E.mtp_cseed) E.mtp_cseed = E.alloc_q36_cseed();
             // (more rows than the window holds: the proposals come in two calls)
             for (size_t at = 0, k = 0; at < nx.size();) {
                 size_t take = std::min<size_t>(nx.size() - at, E.vrows);
                 while (take > 0 && at + take < nx.size() && nx[at + take].slot == nx[at + take - 1].slot) --take;   // a slot's rows together
-                E.mtp_rows(nx.data() + at, (int) take);
+                {
+                    const auto t_mtp = wot ? Clock::now() : Clock::time_point{};
+                    E.mtp_rows(nx.data() + at, (int) take);
+                    if (wot) wo_mtp += ms_since(t_mtp);
+                }
+                const size_t end_k = k;
                 for (; k < nx_last.size() && (size_t) nx_last[k] < at + take; ++k) {
                     Slot& sl = slots[(size_t) act[(size_t) nx_of[k]]];
                     sl.draft = E.mtp_pick[(size_t) nx_last[k] - at];
                     sl.draft_ready = true;
                 }
+                if (want > 1) {
+                    for (size_t kk = end_k; kk < k; ++kk) {
+                        const int i = nx_of[kk];
+                        Slot& sl = slots[(size_t) act[(size_t) i]];
+                        sl.mdepth = 0;
+                        sl.mchain.clear();
+                        CK(cudaMemcpyAsync(E.mtp_cseed + (size_t) i * N,
+                                           E.hmtp + (size_t) (nx_last[kk] - at) * N, (size_t) N * 4,
+                                           cudaMemcpyDeviceToDevice, E.st));
+                    }
+                }
                 at += take;
             }
+            // A slot's chain is only valid for the window that built it, so clear every slot this window will
+            // NOT extend - unconditionally, including when want == 1.  A window with no slack (S = vrows/2 and
+            // every slot a candidate) runs no chain, and if its slots kept last window's mdepth the next group
+            // build would read a stale mchain and size rows for proposals that no longer exist.  Depth 1 never
+            // writes mchain, so this loop is a no-op on the default path.
+            for (int i = 0; i < S; ++i) {
+                Slot& sl = slots[(size_t) act[(size_t) i]];
+                const bool chained = want > 1 && alive[(size_t) i] && cand[(size_t) i];
+                if (!chained) { sl.mchain.clear(); sl.mdepth = 0; }
+            }
+            // STRATA_Q36_MTP_DEPTH>1: chain the remaining proposals past the first one the refresh above just
+            // made.  Done after the shared refresh so the block's K/V already holds every kept row - chaining
+            // inside the loop above would propose from a cell the block had not seen yet.
+            if (want > 1) {
+                // The chain is STEP-major, not slot-major: every slot's step d runs in one mtp_rows call.  A
+                // per-slot chain costs `mtp_rows` once per slot per step, and each call brackets a full
+                // cudaStreamSynchronize on both ends (:7944, :7978) - so S slots at depth d drained the stream
+                // S*d times a window and the GPUs idled through every one.  Step-major is the same arithmetic
+                // (row r of the call is a different slot, and `mtp_seed()` / hmtp are per-row), with d drains.
+                // MEASURED on 192.168.1.98 (same script, same power session): S=4 depth=2 went 139.0 tok/s
+                // slot-major -> 152.6 step-major, against 165.8 at depth 1.  So the drains were about half of
+                // that loss; what is left is T=10 itself, and depth 2 still loses at S=4.
+                std::vector<int> ci;        // the slots chaining this window, in the order their rows are fed
+                std::vector<int32_t> ccur;  // each one's next token
+                std::vector<int64_t> ccell;
+                for (size_t k = 0; k < nx_last.size(); ++k) {
+                    const int i = nx_of[k];
+                    Slot& sl = slots[(size_t) act[(size_t) i]];
+                    if (!alive[(size_t) i] || !cand[(size_t) i] || !sl.draft_ready) continue;
+                    Engine::Sess& ss = E.sess[(size_t) act[(size_t) i]];
+                    // sl.draft is the block's proposal after the last kept row, i.e. the token for cell ss.pos + 1;
+                    // the chain extends it one cell at a time from there, seeded by the block's own output for
+                    // that last kept row (copied out of hmtp above, before any later mtp_rows overwrote it).
+                    sl.mchain.assign(1, sl.draft);
+                    ci.push_back(i);
+                    ccur.push_back(sl.draft);
+                    ccell.push_back(ss.pos + 1);
+                }
+                for (int d = 1; d < want && !ci.empty(); ++d) {
+                    std::vector<Engine::MtpRow> mr;
+                    std::vector<size_t> mrof;   // ci index per fed row
+                    for (size_t q = 0; q < ci.size(); ++q) {
+                        if (is_eos(ccur[q])) continue;   // an ended chain stops proposing
+                        mr.push_back({act[(size_t) ci[q]], ccur[q], ccell[q], E.mtp_cseed + (size_t) ci[q] * N});
+                        mrof.push_back(q);
+                    }
+                    if (mr.empty()) break;
+                    {
+                        const auto t_mtp = wot ? Clock::now() : Clock::time_point{};
+                        E.mtp_rows(mr.data(), (int) mr.size());
+                        if (wot) wo_mtp += ms_since(t_mtp);
+                    }
+                    for (size_t q = 0; q < mrof.size(); ++q) {
+                        const size_t w = mrof[q];
+                        Slot& sl = slots[(size_t) act[(size_t) ci[w]]];
+                        ccur[w] = E.mtp_pick[q];
+                        sl.mchain.push_back(ccur[w]);
+                        ++ccell[w];
+                        // the next step reads the block's own output for the row it was just fed
+                        CK(cudaMemcpyAsync(E.mtp_cseed + (size_t) ci[w] * N, E.hmtp + (size_t) q * N,
+                                           (size_t) N * 4, cudaMemcpyDeviceToDevice, E.st));
+                    }
+                }
+                for (size_t q = 0; q < ci.size(); ++q)
+                    slots[(size_t) act[(size_t) ci[q]]].mdepth = (int) slots[(size_t) act[(size_t) ci[q]]].mchain.size();
+            }
+        }
+        // The snapshot was taken at the top, so this delta is exactly this window's forward() time.  The guard is
+        // serve_window_acc's own (:3266): a discard_pass zeroes the counters under the window, and the delta would
+        // then come out negative.
+        const double wo_fwd = wot && E.serve_timing() && E.helper_timing() && E.d_host_layer_n >= E.w_hln
+                                  ? E.d_host_layer_ms - E.w_hl
+                                  : 0.0;
+        E.serve_window_acc();
+        if (wot) {
+            E.so_wall_ms += ms_since(t_win);
+            E.so_mtp_ms += wo_mtp;
+            E.so_commit_ms += wo_commit;
+            E.so_fwd_ms += wo_fwd;
+            E.so_rows_ms += wo_rows;
+            E.so_pick_ms += wo_pick;
+            E.so_poll_ms += wo_poll;
+            ++E.so_windows;
         }
     }
 
@@ -9517,10 +9914,10 @@ struct Serve {
 #if defined(STRATA_HAVE_DFLASH2)
         if (E.df2_serve && E.use_df2) { window_df2(); return; }
 #endif
-        if (E.bmtp && E.mtp_d > 0) {   // proposals need a row to spare and a slot that decodes greedily
+        if (E.bmtp && E.mtp_d > 0) {   // proposals need a row to spare and a slot that can verify one
             int act = 0, greedy = 0;
             for (const Slot& sl : slots)
-                if (sl.active) { ++act; greedy += !sl.smp.needs_logits(); }
+                if (sl.active) { ++act; greedy += E.mtp_cand(sl.smp); }
             if (greedy > 0 && E.vrows - act > 0) { window_mtp(); return; }
         }
         window_plain();
@@ -9532,7 +9929,12 @@ struct Serve {
         for (int b = 0; b < E.n_sess; ++b)
             if (slots[(size_t) b].active) rows.push_back({b, slots[(size_t) b].x});
         if (rows.empty()) return;
+        // STRATA_Q36_SERVE_TIMING=1: the same per-window snapshot window_df2 takes at :9411, so a plain N-session
+        // window reports the SERVE split too.  Without it the report's `E.s_taken` stays false on the plain path
+        // and the per-layer numbers are never printed for the shape that N=8 actually runs.
+        E.serve_window_snap();
         E.step_rows(rows.data(), (int) rows.size());
+        E.serve_window_acc();
         const size_t Nb = (size_t) E.m->g.n_embd * 4;
         for (size_t r = 0; r < rows.size(); ++r) {
             const int b = rows[r].slot;
@@ -10769,7 +11171,54 @@ int strata::qwen35::run(int argc, char** argv) {
                                      1000.0 * E.s_hw3[r] / L, 1000.0 * E.s_ho3[r] / L);
                     }
                     std::fprintf(stderr, "strata-q36 SERVE: %lld layers\n", layers);
+                    // STRATA_Q36_GDNDEC=1: the decode's GDN branch, both kernels, per GDN LAYER (d_gdn_n counts
+                    // only the layers that took the rows-mode GDN branch, not every layer).  The share is of the
+                    // whole layer's wall clock: (conv + gdn_seq) summed over the GDN layers, against s_hl over all.
+                    if (E.d_gdn_n > 0) {
+                        const double n = (double) E.d_gdn_n;
+                        std::fprintf(stderr, "strata-q36 SERVE gdn: conv=%.1f gdn_seq=%.1f (us/GDN-layer, %.1f%% of the layer wall)"
+                                     " over %lld samples%s\n",
+                                     1000.0 * E.d_conv_ms / n, 1000.0 * E.d_gdn_ms / n,
+                                     100.0 * (E.d_conv_ms + E.d_gdn_ms) / std::max(1e-12, E.s_hl),
+                                     (long long) E.d_gdn_n,
+                                     E.d_gdn_dropped ? " (SOME DROPPED, see d_gdn_dropped)" : "");
+                    }
                 }
+            }
+            // STRATA_Q36_WIN_OUTSIDE_TIMING=1: where a window's wall clock goes besides forward().  Per window, since
+            // the point is the shape of one window, not a total.  `forward` is the SERVE delta over the same windows,
+            // so `wall - forward - mtp - commit` is everything else; the second line splits that remainder into the
+            // row path, the sampling/printf loop and the control-line poll, and calls what is left `rest` (the group
+            // build, the chain assembly, the hidden-state copies, the scheduling BETWEEN windows).  Every one of these
+            // still contains drains - run_rows() opens with a full cudaStreamSynchronize (:7876) - so none of them is
+            // pure host time; do not quote any as host idle.
+            if (E.so_windows > 0 && E.win_outside_timing()) {
+                const double W = (double) E.so_windows;
+                std::fprintf(stderr,
+                             "strata-q36 WINDOW outside forward: %.2f ms/window | forward=%.2f mtp_rows=%.2f "
+                             "commit_rows=%.2f other=%.2f (over %lld windows)\n",
+                             E.so_wall_ms / W, E.so_fwd_ms / W, E.so_mtp_ms / W, E.so_commit_ms / W,
+                             (E.so_wall_ms - E.so_fwd_ms - E.so_mtp_ms - E.so_commit_ms) / W, E.so_windows);
+                // The decomposition of the line above's `other`.  `rows` is the WHOLE run_rows() call (it contains
+                // forward, hence the separate rows_extra); the pieces that add up to `other` are
+                // rows_extra + pick + poll + rest.  rows_extra is run_rows() minus forward() - the entry drain and
+                // the staging/launch/pick-sync around the layer loop.  pick is the sampling + printf loop.  rest is
+                // what is left: the group build, the chain assembly, the per-slot hidden copies and the scheduling.
+                std::fprintf(stderr,
+                             "strata-q36 WINDOW breakdown: rows=%.2f (rows_extra=%.2f) pick=%.2f poll=%.2f "
+                             "rest=%.2f ms/window\n",
+                             E.so_rows_ms / W, (E.so_rows_ms - E.so_fwd_ms) / W, E.so_pick_ms / W,
+                             E.so_poll_ms / W,
+                             (E.so_wall_ms - E.so_rows_ms - E.so_mtp_ms - E.so_commit_ms - E.so_pick_ms -
+                              E.so_poll_ms) / W);
+            }
+            // STRATA_Q36_ROWS_SYNC_TIMING=1: run_rows()'s two drains per call.  An entry drain that really waits
+            // is idle the host could have filled; an exit drain is the window's own pipeline tail.
+            if (E.sr_calls > 0 && E.rows_sync_timing()) {
+                const double C = (double) E.sr_calls;
+                std::fprintf(stderr,
+                             "strata-q36 ROWS sync: entry=%.3f exit=%.3f ms/call (over %lld calls)\n",
+                             E.sr_entry_ms / C, E.sr_exit_ms / C, E.sr_calls);
             }
 #endif
             if (!E.m->hybrid) return;
